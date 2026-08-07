@@ -200,6 +200,15 @@ jobs:
             org.opencontainers.image.description=Scheduled rule engine over a ChirpStack event store
             org.opencontainers.image.licenses=AGPL-3.0-or-later
             org.opencontainers.image.vendor=Intelligent Farming Foundation
+          # Annotations are NOT derived from `labels` above — left alone, the action fills
+          # them from GitHub's repo metadata, whose licence detector reports plain
+          # "AGPL-3.0". That would put a different licence on the manifest than on the image
+          # config, and this repo is specifically AGPL-3.0-or-later. State them explicitly.
+          annotations: |
+            org.opencontainers.image.title=leadsman
+            org.opencontainers.image.description=Scheduled rule engine over a ChirpStack event store
+            org.opencontainers.image.licenses=AGPL-3.0-or-later
+            org.opencontainers.image.vendor=Intelligent Farming Foundation
 
       # Single-arch first, loaded into the local daemon so it can actually be run.
       # A multi-platform build cannot be `load`ed, hence two steps — the second is
@@ -220,18 +229,43 @@ jobs:
         # Without dist/ in git, a broken build step would otherwise ship silently.
         run: |
           set -euo pipefail
-          docker run --rm leadsman:smoke help | grep -q 'Usage: leadsman'
-          docker run --rm leadsman:smoke list | grep -q 'checks available'
+
+          # Deliberately never `docker run ... | grep -q`. grep -q exits at its first match
+          # and closes the pipe; the docker CLI is still writing, takes EPIPE, prints
+          # "write /dev/stdout: broken pipe" and exits non-zero — and `pipefail` then fails
+          # the step even though the assertion itself passed. It is a race against the pipe
+          # buffer, so it passes locally and fails on a runner. Capture first, match second.
+          assert_out() { # <needle> <description> <docker args...>
+            local needle="$1" what="$2"; shift 2
+            local out; out=$(docker run --rm "$@" 2>&1) || true
+            if ! grep -qi -- "$needle" <<<"$out"; then
+              echo "::error::$what — expected to find '$needle' in:"; echo "$out"; exit 1
+            fi
+            echo "  $what ✓"
+          }
+
+          assert_out 'Usage: leadsman' 'help'  leadsman:smoke help
+          assert_out 'checks available' 'list' leadsman:smoke list
+
+          # Migrations are copied into the runtime stage and the CLI must find them. This
+          # invocation exits non-zero *by design* (no LEADSMAN_MIGRATE_URL), which is the
+          # other reason the old pipeline was wrong: pipefail saw that expected failure and
+          # the `||` branch reported it as "migrate did not reach its config check".
+          assert_out 'LEADSMAN_MIGRATE_URL' 'migrate reaches its config check' \
+            leadsman:smoke migrate
+
           # Every check must be present in the image, not just on a developer's machine.
-          count=$(docker run --rm leadsman:smoke list --json | node -e \
-            'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>console.log(JSON.parse(d).length))')
-          echo "checks in image: $count"
+          json=$(docker run --rm leadsman:smoke list --json)
+          count=$(node -e 'console.log(JSON.parse(require("fs").readFileSync(0,"utf8")).length)' <<<"$json")
+          echo "  checks in image: $count (need >= 18)"
           test "$count" -ge 18
-          # Migrations are copied into the runtime stage and the CLI must find them.
-          docker run --rm leadsman:smoke migrate 2>&1 | grep -qi 'LEADSMAN_MIGRATE_URL' \
-            || { echo "migrate did not reach its config check"; exit 1; }
+
           # Confirm it does not run as root.
-          test "$(docker run --rm --entrypoint id leadsman:smoke -un)" = "node"
+          user=$(docker run --rm --entrypoint id leadsman:smoke -un)
+          echo "  runs as: $user"
+          test "$user" = "node"
+
+          echo "smoke: ok"
 
       - name: Build and push multi-arch image
         id: push
@@ -242,6 +276,7 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: mode=max
