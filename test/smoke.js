@@ -541,6 +541,103 @@ test('parseConfig reads the webhook token from the environment, never the file',
   }
 });
 
+// ── notify: environment overrides ─────────────────────────────────────────────
+// Where alerts go is a property of the host, so an orchestrator must be able to set it
+// without rewriting a mounted config file. These pin that contract, including the
+// empty-string case: `LEADSMAN_WEBHOOK_URL=` in a .env arrives as "", and treating it
+// as a value would fail URL validation and take the engine down over a blank line.
+
+/** Run fn with the given env vars set, restoring whatever was there before. */
+function withEnv(vars, fn) {
+  const prev = {};
+  for (const [k, v] of Object.entries(vars)) {
+    prev[k] = process.env[k];
+    if (v === undefined) delete process.env[k];
+    else process.env[k] = v;
+  }
+  try {
+    return fn();
+  } finally {
+    for (const [k, v] of Object.entries(prev)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+}
+
+test('LEADSMAN_WEBHOOK_URL creates the notify block when the file has none', () => {
+  withEnv({ LEADSMAN_WEBHOOK_URL: 'https://from-env.test/hook' }, () => {
+    const cfg = parseConfig({ checks: [] });
+    assert.equal(cfg.notify.webhookUrl, 'https://from-env.test/hook');
+    // Default auth is unchanged by the env path.
+    assert.equal(cfg.notify.webhookAuth, 'bearer');
+  });
+});
+
+test('LEADSMAN_WEBHOOK_URL wins over the config file', () => {
+  withEnv({ LEADSMAN_WEBHOOK_URL: 'https://env.test/hook' }, () => {
+    const cfg = parseConfig({
+      checks: [],
+      notify: { webhookUrl: 'https://file.test/hook', webhookAuth: 'hmac' },
+    });
+    assert.equal(cfg.notify.webhookUrl, 'https://env.test/hook');
+    // Only the URL was overridden — the file's auth mode survives.
+    assert.equal(cfg.notify.webhookAuth, 'hmac');
+  });
+});
+
+test('an empty LEADSMAN_WEBHOOK_URL is unset, not a value', () => {
+  withEnv({ LEADSMAN_WEBHOOK_URL: '' }, () => {
+    // No notify block in the file either — the empty var must not conjure one.
+    const bare = parseConfig({ checks: [] });
+    assert.equal(bare.notify, undefined);
+    // And it must not clobber a URL the file did set.
+    const cfg = parseConfig({ checks: [], notify: { webhookUrl: 'https://file.test/h' } });
+    assert.equal(cfg.notify.webhookUrl, 'https://file.test/h');
+  });
+});
+
+test('whitespace-only webhook env vars are treated as unset', () => {
+  withEnv({ LEADSMAN_WEBHOOK_URL: '   ', LEADSMAN_WEBHOOK_TOKEN: '  ' }, () => {
+    const cfg = parseConfig({ checks: [], notify: { webhookUrl: 'https://file.test/h' } });
+    assert.equal(cfg.notify.webhookUrl, 'https://file.test/h');
+    assert.equal(cfg.notify.webhookToken, null);
+  });
+});
+
+test('LEADSMAN_WEBHOOK_AUTH overrides the auth mode, and is validated', () => {
+  withEnv({ LEADSMAN_WEBHOOK_AUTH: 'hmac' }, () => {
+    const cfg = parseConfig({ checks: [], notify: { webhookUrl: 'https://x.test/h' } });
+    assert.equal(cfg.notify.webhookAuth, 'hmac');
+  });
+  withEnv({ LEADSMAN_WEBHOOK_AUTH: 'basic' }, () => {
+    assert.throws(
+      () => parseConfig({ checks: [], notify: { webhookUrl: 'https://x.test/h' } }),
+      // The message must name the env var, not a config path the operator never edited.
+      (err) => err instanceof ConfigError && /LEADSMAN_WEBHOOK_AUTH/.test(err.message),
+    );
+  });
+});
+
+test('an invalid LEADSMAN_WEBHOOK_URL blames the env var, not the file', () => {
+  withEnv({ LEADSMAN_WEBHOOK_URL: 'not-a-url' }, () => {
+    assert.throws(
+      () => parseConfig({ checks: [] }),
+      (err) => err instanceof ConfigError && /LEADSMAN_WEBHOOK_URL/.test(err.message),
+    );
+  });
+});
+
+test('LEADSMAN_WEBHOOK_TOKEN_HEADER overrides the header for token auth', () => {
+  withEnv({ LEADSMAN_WEBHOOK_TOKEN_HEADER: 'x-gitlab-token' }, () => {
+    const cfg = parseConfig({
+      checks: [],
+      notify: { webhookUrl: 'https://x.test/h', webhookAuth: 'token' },
+    });
+    assert.equal(cfg.notify.webhookTokenHeader, 'x-gitlab-token');
+  });
+});
+
 test('the Makerfabs config parses and references only real rules and params', () => {
   const rules = loadRules();
   const cfg = parseConfig(require('../config/makerfabs-agrosense.example.json'));

@@ -5,9 +5,19 @@
  * Config file loading and validation.
  *
  * The config selects which checks run and with what parameters — it is the
- * "pick from the menu" surface. It deliberately holds no credentials: the database
- * URL comes from LEADSMAN_DATABASE_URL and the webhook token from
- * LEADSMAN_WEBHOOK_TOKEN, so the config file is safe to commit and diff.
+ * "pick from the menu" surface. It deliberately holds no credentials, and nothing
+ * host-specific: the database URL comes from LEADSMAN_DATABASE_URL, and every part of
+ * the notification seam can come from the environment too —
+ *
+ *   LEADSMAN_WEBHOOK_URL           overrides notify.webhookUrl
+ *   LEADSMAN_WEBHOOK_AUTH          overrides notify.webhookAuth  (hmac|token|bearer)
+ *   LEADSMAN_WEBHOOK_TOKEN_HEADER  overrides notify.webhookTokenHeader
+ *   LEADSMAN_WEBHOOK_TOKEN         the secret — env only, never the file
+ *
+ * Env wins over the file. That split is what keeps the config file identical across
+ * every install and safe to commit and diff: it describes *what* to watch, while where
+ * alerts go is a property of the host it runs on. An empty environment variable counts
+ * as unset, so a blank `VAR=` in a .env is not mistaken for a value.
  */
 
 import { readFileSync } from 'node:fs';
@@ -118,39 +128,70 @@ export function parseConfig(raw: unknown): LeadsmanConfig {
     throw new ConfigError('config.maxChecksPerRun must be a positive number');
   }
 
+  // ── notify ──────────────────────────────────────────────────────────────────
+  // Where alerts go is a deployment fact, not check policy: the same config file is
+  // meant to describe *what* to watch across every install, while the receiver's
+  // address changes per host. So the whole of `notify` can come from the environment
+  // and env wins over the file — which lets an orchestrator (docker compose, systemd,
+  // Kubernetes) point the engine at a receiver without rewriting a mounted file.
+  //
+  // Empty string counts as unset. `LEADSMAN_WEBHOOK_URL=` in a .env arrives as "",
+  // and treating that as a configured value would fail URL validation and take the
+  // whole engine down over a blank line.
+  const envStr = (name: string): string | undefined => {
+    const v = process.env[name];
+    return v !== undefined && v.trim() !== '' ? v.trim() : undefined;
+  };
+  const envUrl = envStr('LEADSMAN_WEBHOOK_URL');
+  const envAuth = envStr('LEADSMAN_WEBHOOK_AUTH');
+  const envTokenHeader = envStr('LEADSMAN_WEBHOOK_TOKEN_HEADER');
+
   let notify: LeadsmanConfig['notify'];
-  if (raw.notify !== undefined) {
-    if (!isPlainObject(raw.notify)) throw new ConfigError('config.notify must be an object');
-    const url = raw.notify.webhookUrl ?? null;
-    if (url !== null && typeof url !== 'string') {
+  if (raw.notify !== undefined || envUrl !== undefined) {
+    if (raw.notify !== undefined && !isPlainObject(raw.notify)) {
+      throw new ConfigError('config.notify must be an object');
+    }
+    const rawNotify: Record<string, unknown> = isPlainObject(raw.notify) ? raw.notify : {};
+
+    const fileUrl = rawNotify.webhookUrl ?? null;
+    if (fileUrl !== null && typeof fileUrl !== 'string') {
       throw new ConfigError('config.notify.webhookUrl must be a string or null');
     }
+    const url = envUrl ?? fileUrl;
     if (typeof url === 'string') {
       try {
         new URL(url);
       } catch {
-        throw new ConfigError(`config.notify.webhookUrl is not a valid URL: ${url}`);
+        throw new ConfigError(
+          envUrl !== undefined
+            ? `LEADSMAN_WEBHOOK_URL is not a valid URL: ${url}`
+            : `config.notify.webhookUrl is not a valid URL: ${url}`,
+        );
       }
     }
-    const auth = raw.notify.webhookAuth ?? 'bearer';
+
+    const auth = envAuth ?? rawNotify.webhookAuth ?? 'bearer';
     if (auth !== 'hmac' && auth !== 'token' && auth !== 'bearer') {
       throw new ConfigError(
-        `config.notify.webhookAuth must be "hmac", "token", or "bearer" (got ${JSON.stringify(auth)})`,
+        `${envAuth !== undefined ? 'LEADSMAN_WEBHOOK_AUTH' : 'config.notify.webhookAuth'} ` +
+          `must be "hmac", "token", or "bearer" (got ${JSON.stringify(auth)})`,
       );
     }
-    const tokenHeader = raw.notify.webhookTokenHeader ?? null;
-    if (tokenHeader !== null && typeof tokenHeader !== 'string') {
+
+    const fileTokenHeader = rawNotify.webhookTokenHeader ?? null;
+    if (fileTokenHeader !== null && typeof fileTokenHeader !== 'string') {
       throw new ConfigError('config.notify.webhookTokenHeader must be a string or null');
     }
+    const tokenHeader = envTokenHeader ?? fileTokenHeader;
 
     notify = {
       webhookUrl: url,
-      // Secret comes from the environment, never the config file.
-      webhookToken: process.env.LEADSMAN_WEBHOOK_TOKEN ?? null,
+      // Secret comes from the environment only, never the config file.
+      webhookToken: envStr('LEADSMAN_WEBHOOK_TOKEN') ?? null,
       webhookAuth: auth,
       webhookTokenHeader: tokenHeader,
       timeoutMs:
-        typeof raw.notify.timeoutMs === 'number' ? raw.notify.timeoutMs : 5_000,
+        typeof rawNotify.timeoutMs === 'number' ? rawNotify.timeoutMs : 5_000,
     };
   }
 

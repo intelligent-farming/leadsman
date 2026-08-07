@@ -425,10 +425,20 @@ pattern as the stack's own `010_events_roles.sh`, so it can be dropped into
 | `LEADSMAN_MIGRATE_URL` | Owner-role URL, used by `migrate`. Falls back to the above |
 | `LEADSMAN_CONFIG` | Config path. Default `config/leadsman.json` |
 | `LEADSMAN_RULES_DIR` | Extra directory of operator-supplied checks |
-| `LEADSMAN_WEBHOOK_TOKEN` | Bearer token for `notify.webhookUrl` |
+| `LEADSMAN_WEBHOOK_URL` | Overrides `notify.webhookUrl` |
+| `LEADSMAN_WEBHOOK_AUTH` | Overrides `notify.webhookAuth` — `hmac` \| `token` \| `bearer` |
+| `LEADSMAN_WEBHOOK_TOKEN` | The shared secret. Env only — never read from the config file |
+| `LEADSMAN_WEBHOOK_TOKEN_HEADER` | Overrides `notify.webhookTokenHeader` (`token` auth) |
 | `LEADSMAN_APPLY_EVENT_INDEXES` | `true` lets `migrate` apply migration 002 |
 | `LEADSMAN_LOG_LEVEL` | `debug` \| `info` \| `warn` \| `error`. Default `info` |
 | `LEADSMAN_LOG_FORMAT` | `json` \| `text`. Default `json` |
+
+The four `LEADSMAN_WEBHOOK_*` variables take precedence over the config file, so an
+orchestrator can point the engine at a receiver without rewriting a mounted config.
+That split is deliberate: the config file says *what* to watch and is identical across
+installs, while where alerts go is a property of the host. An **empty** variable counts
+as unset — a blank `LEADSMAN_WEBHOOK_URL=` in a `.env` file will not override a URL the
+config sets, and will not fail validation.
 
 ## Tests
 

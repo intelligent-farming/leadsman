@@ -8,7 +8,7 @@
   "maxChecksPerRun": 64,
 
   "notify": {
-    "//": "POSTed once per newly-raised alert. Point at your own Twilio sender, or a Hermes webhook route with deliver_only:true for zero-token SMS.",
+    "//": "POSTed once per newly-raised alert. Point at your own Twilio sender, or a Hermes webhook route with deliver_only:true for zero-token SMS. LEADSMAN_WEBHOOK_URL / LEADSMAN_WEBHOOK_AUTH override these, so a deployment can set the receiver without editing this file; the secret always comes from LEADSMAN_WEBHOOK_TOKEN.",
     "webhookUrl": null,
     "timeoutMs": 5000
   },
