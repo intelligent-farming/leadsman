@@ -111,8 +111,20 @@ export interface NotifyConfig {
      * `deliver_only: true` for a zero-token SMS. Leadsman does not send SMS itself.
      */
     webhookUrl?: string | null;
-    /** Bearer token sent as `Authorization`, if the receiver wants one. */
+    /** Secret for whichever auth mode is selected. Read from LEADSMAN_WEBHOOK_TOKEN. */
     webhookToken?: string | null;
+    /**
+     * How the POST proves itself to the receiver.
+     *
+     * `hmac` signs `<unix-seconds>.<body>` with HMAC-SHA256 and sends
+     * `X-Webhook-Signature-V2` + `X-Webhook-Timestamp` — replay-safe, and what Hermes'
+     * generic webhook route expects. `token` sends the raw secret in
+     * `webhookTokenHeader`. `bearer` (the default, for backwards compatibility) sends
+     * `Authorization: Bearer`.
+     */
+    webhookAuth?: 'hmac' | 'token' | 'bearer';
+    /** Header for `token` mode. Default `X-Webhook-Token`. */
+    webhookTokenHeader?: string | null;
     /** Give up on a webhook after this long. Default 5000. */
     timeoutMs?: number;
 }

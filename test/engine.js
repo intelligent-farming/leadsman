@@ -366,6 +366,59 @@ if (!h.available) {
     }
   });
 
+  test('notifier: hmac mode signs <timestamp>.<body> and the signature verifies', async () => {
+    // The receiver recomputes this exact digest. If leadsman serialized the body twice —
+    // once to sign, once to send — the two strings could differ and every delivery would
+    // be rejected with no useful error, so the test verifies end to end.
+    const secret = 'shhh';
+    const hook = await receiver((req, res) => { res.writeHead(204); res.end(); });
+    try {
+      await notifyRaised(
+        [raised(1, 'aa')],
+        { webhookUrl: hook.url, webhookToken: secret, webhookAuth: 'hmac', timeoutMs: 2000 },
+        env.store, h.quietLogger(),
+      );
+
+      const got = hook.received[0];
+      const ts = got.headers['x-webhook-timestamp'];
+      const sig = got.headers['x-webhook-signature-v2'];
+      assert.ok(ts, 'X-Webhook-Timestamp must be present');
+      assert.ok(sig, 'X-Webhook-Signature-V2 must be present');
+      assert.equal(got.headers.authorization, undefined, 'hmac mode must not also send a bearer');
+
+      // Recompute over the body as the receiver would see it.
+      const expected = require('node:crypto')
+        .createHmac('sha256', secret)
+        .update(`${ts}.${JSON.stringify(got.body)}`)
+        .digest('hex');
+      assert.equal(sig, expected, 'the signature must cover exactly the bytes that were sent');
+
+      // Replay protection depends on the timestamp being current.
+      const skew = Math.abs(Math.floor(Date.now() / 1000) - Number(ts));
+      assert.ok(skew < 60, `timestamp should be current, was ${skew}s off`);
+    } finally {
+      await hook.close();
+    }
+  });
+
+  test('notifier: token mode sends the raw secret in a configurable header', async () => {
+    const hook = await receiver((req, res) => { res.writeHead(204); res.end(); });
+    try {
+      await notifyRaised(
+        [raised(1, 'aa')],
+        {
+          webhookUrl: hook.url, webhookToken: 'plain', webhookAuth: 'token',
+          webhookTokenHeader: 'X-Gitlab-Token', timeoutMs: 2000,
+        },
+        env.store, h.quietLogger(),
+      );
+      assert.equal(hook.received[0].headers['x-gitlab-token'], 'plain');
+      assert.equal(hook.received[0].headers.authorization, undefined);
+    } finally {
+      await hook.close();
+    }
+  });
+
   test('notifier: only NEWLY raised alerts are delivered', async () => {
     const rule = fakeRule('r', async () => [finding('aa')]);
     const hook = await receiver((req, res) => { res.writeHead(204); res.end(); });

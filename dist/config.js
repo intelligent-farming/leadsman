@@ -119,10 +119,20 @@ function parseConfig(raw) {
                 throw new ConfigError(`config.notify.webhookUrl is not a valid URL: ${url}`);
             }
         }
+        const auth = raw.notify.webhookAuth ?? 'bearer';
+        if (auth !== 'hmac' && auth !== 'token' && auth !== 'bearer') {
+            throw new ConfigError(`config.notify.webhookAuth must be "hmac", "token", or "bearer" (got ${JSON.stringify(auth)})`);
+        }
+        const tokenHeader = raw.notify.webhookTokenHeader ?? null;
+        if (tokenHeader !== null && typeof tokenHeader !== 'string') {
+            throw new ConfigError('config.notify.webhookTokenHeader must be a string or null');
+        }
         notify = {
             webhookUrl: url,
-            // Token comes from the environment, never the config file.
+            // Secret comes from the environment, never the config file.
             webhookToken: process.env.LEADSMAN_WEBHOOK_TOKEN ?? null,
+            webhookAuth: auth,
+            webhookTokenHeader: tokenHeader,
             timeoutMs: typeof raw.notify.timeoutMs === 'number' ? raw.notify.timeoutMs : 5000,
         };
     }

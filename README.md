@@ -3,9 +3,6 @@
 Scheduled rule engine over a ChirpStack event store. It runs a set of checks you
 select in a config file, and records deduplicated alerts in Postgres.
 
-Named for the crew member who took periodic soundings with a lead line and called
-out the depth — and the hazards.
-
 Leadsman is the deterministic tier of a monitoring stack. It consumes no inference
 tokens, and it does not send messages: it decides *what is wrong* and writes that
 down. Delivery (SMS, webhook, an LLM agent for the cases that need interpretation)

@@ -17,6 +17,24 @@
  * soundings is delivered once, which is the whole point of the raise/resolve
  * lifecycle — and the reason a flapping sensor cannot generate repeated
  * notifications or repeated agent invocations.
+ *
+ * ── authenticating to the receiver ─────────────────────────────────────────────
+ * Three modes, because receivers disagree about how a webhook should prove itself:
+ *
+ *   hmac    X-Webhook-Signature-V2 + X-Webhook-Timestamp, where the signature is an
+ *           HMAC-SHA256 hex digest of `<unix-seconds>.<body>`. The timestamp is part of
+ *           the signed string, so a captured request cannot be replayed later — the
+ *           receiver rejects a stale timestamp and the attacker cannot re-sign a fresh
+ *           one without the secret. This is what Hermes' generic webhook route expects,
+ *           and it is the right default for anything reachable off the loopback.
+ *   token   A plain shared secret in a configurable header. Simpler, and what several
+ *           receivers accept (Hermes' GitLab-shaped route matches X-Gitlab-Token this
+ *           way). No replay protection.
+ *   bearer  Authorization: Bearer <secret>. The original behaviour, kept for receivers
+ *           that treat the webhook as an ordinary authenticated API call.
+ *
+ * All three read the secret from LEADSMAN_WEBHOOK_TOKEN, so it never enters the config
+ * file.
  */
 import type { RaisedAlert, Store } from './db';
 import type { Logger, NotifyConfig } from './types';
