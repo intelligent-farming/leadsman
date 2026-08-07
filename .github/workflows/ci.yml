@@ -126,3 +126,147 @@ jobs:
           node dist/cli.js verify
           node dist/cli.js run
           node test/makerfabs.js
+
+  # ── publish the container image to GHCR ──────────────────────────────────────
+  #
+  # `needs: [test, integration]` is the point of putting this in the same workflow
+  # rather than a separate one: no image is ever published unless the full suite —
+  # including the Postgres job that actually validates the check SQL — passed on this
+  # exact commit. A workflow_run trigger would decouple them and could ship an image
+  # built from a commit whose tests failed.
+  #
+  # This is also the only thing that produces dist/ now that build output is no longer
+  # committed, so the smoke step below is load-bearing: it proves the image can run its
+  # own CLI rather than merely that the layers assembled.
+  #
+  # Tagging:
+  #   push to main  → :main, :sha-<short>   (bleeding edge; set LEADSMAN_IMAGE to test)
+  #   tag v1.2.3    → :1.2.3, :1.2, :latest (what intelligent-farming-stack pins)
+  #
+  # ⚠ One-time manual step: GHCR packages are PRIVATE by default even for a public
+  # repo, so the first publish will not be pullable by anyone else. After the first
+  # successful run, open the package page and set its visibility to public, or the
+  # stack's `docker pull` fails for everyone but you.
+  publish:
+    name: Publish image (GHCR)
+    runs-on: ubuntu-latest
+    needs: [test, integration]
+    if: >-
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    permissions:
+      contents: read
+      packages: write
+      # Lets the build attach a signed provenance attestation, so a consumer can verify
+      # which workflow and commit produced the image.
+      attestations: write
+      id-token: write
+    env:
+      IMAGE: ghcr.io/${{ github.repository }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        # Needed for the arm64 leg. Leadsman is pure JS on node:22-alpine (pg has no
+        # native dependency), so cross-building is just slow, not fragile — and arm64
+        # matters for Apple Silicon and Pi-class edge hardware.
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          # No secret to manage: the workflow token can write packages for this repo.
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive tags and labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+          labels: |
+            org.opencontainers.image.title=leadsman
+            org.opencontainers.image.description=Scheduled rule engine over a ChirpStack event store
+            org.opencontainers.image.licenses=AGPL-3.0-or-later
+            org.opencontainers.image.vendor=Intelligent Farming Foundation
+
+      # Single-arch first, loaded into the local daemon so it can actually be run.
+      # A multi-platform build cannot be `load`ed, hence two steps — the second is
+      # nearly free because it reuses this build's cache.
+      - name: Build amd64 image for smoke testing
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: leadsman:smoke
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test the built image
+        # Proves the entrypoint, tini, the non-root user, and the in-image `npm run
+        # build` all work. `list` and `help` need no database, so this stays hermetic.
+        # Without dist/ in git, a broken build step would otherwise ship silently.
+        run: |
+          set -euo pipefail
+          docker run --rm leadsman:smoke help | grep -q 'Usage: leadsman'
+          docker run --rm leadsman:smoke list | grep -q 'checks available'
+          # Every check must be present in the image, not just on a developer's machine.
+          count=$(docker run --rm leadsman:smoke list --json | node -e \
+            'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>console.log(JSON.parse(d).length))')
+          echo "checks in image: $count"
+          test "$count" -ge 18
+          # Migrations are copied into the runtime stage and the CLI must find them.
+          docker run --rm leadsman:smoke migrate 2>&1 | grep -qi 'LEADSMAN_MIGRATE_URL' \
+            || { echo "migrate did not reach its config check"; exit 1; }
+          # Confirm it does not run as root.
+          test "$(docker run --rm --entrypoint id leadsman:smoke -un)" = "node"
+
+      - name: Build and push multi-arch image
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: mode=max
+          sbom: true
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+      - name: Summarise
+        run: |
+          {
+            echo "### Published"
+            echo
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+            echo
+            echo "digest: \`${{ steps.push.outputs.digest }}\`"
+            echo
+            echo "Pin in intelligent-farming-stack with:"
+            echo '```yaml'
+            echo "    image: ${{ env.IMAGE }}:latest"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

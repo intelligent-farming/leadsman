@@ -13,8 +13,15 @@ WORKDIR /app
 # No package-lock.json is committed (org convention), so `npm install` resolves at
 # build time. Copy only the manifest first: the dependency layer is then cached and
 # reused whenever only source files change.
+#
+# --ignore-scripts is required, not an optimisation. package.json declares
+# `prepare: npm run build` so that `npm install` from a git checkout produces dist/
+# automatically — but here only package.json has been copied, so tsc would run with no
+# tsconfig.json and no src/ and fail the layer. Skipping lifecycle scripts keeps the
+# cached dependency layer AND lets the compile happen explicitly below, once the sources
+# are actually present. (Safe: pg and croner are pure JavaScript with no install steps.)
 COPY package.json ./
-RUN npm install --no-audit --no-fund
+RUN npm install --no-audit --no-fund --ignore-scripts
 
 COPY tsconfig.json ./
 COPY src ./src
