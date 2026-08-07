@@ -187,6 +187,11 @@ jobs:
       - name: Derive tags and labels
         id: meta
         uses: docker/metadata-action@v5
+        env:
+          # Default is `manifest`, which annotates only the per-platform manifests and
+          # leaves the index bare — so `docker buildx imagetools inspect` and most registry
+          # UIs, which read the index, show nothing. Annotate both levels.
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: index,manifest
         with:
           images: ${{ env.IMAGE }}
           tags: |
