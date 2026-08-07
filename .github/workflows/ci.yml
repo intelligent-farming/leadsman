@@ -1,0 +1,128 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Intelligent Farming Foundation
+
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test (Node ${{ matrix.node-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Support floor is engines.node ">=18"; cover the current LTS lines too.
+        node-version: ['18.x', '20.x', '22.x']
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      # No package-lock.json is committed, so `npm ci` and setup-node's npm cache
+      # (both of which require a lockfile) are not used. `npm install` resolves
+      # fresh on every run.
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Test
+        run: npm test
+
+  integration:
+    name: Integration (real Postgres)
+    runs-on: ubuntu-latest
+    # The smoke suite covers config and rule-contract logic without a database.
+    # This job is what actually validates the SQL: migrations apply, the partial
+    # unique index behaves, and every check's query runs against a ChirpStack-shaped
+    # event_up. A check whose SQL is subtly wrong passes unit tests and fails here.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: events
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: chirpstack_events
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U events -d chirpstack_events"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      LEADSMAN_DATABASE_URL: postgres://events:test@127.0.0.1:5432/chirpstack_events
+      LEADSMAN_MIGRATE_URL: postgres://events:test@127.0.0.1:5432/chirpstack_events
+      LEADSMAN_CONFIG: test/fixtures/integration.json
+      LEADSMAN_LOG_FORMAT: text
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.x'
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Build
+        run: npm run build
+
+      - name: Seed a ChirpStack-shaped event store
+        run: psql "$LEADSMAN_DATABASE_URL" -q -f test/fixtures/seed.sql
+
+      - name: Apply migrations
+        run: |
+          node dist/cli.js migrate
+          LEADSMAN_APPLY_EVENT_INDEXES=true node dist/cli.js migrate
+
+      # Unit-level coverage of the SQL: the multi-path resolvers, the device-scope
+      # filter, the reconciler, and the notifier. These build the smallest event store
+      # that can distinguish each behaviour, so a failure names the mechanism rather
+      # than a farm scenario — and they cover things the big fixtures cannot, such as
+      # candidate-path priority when a device reports two of them.
+      - name: Resolver and engine tests
+        env:
+          LEADSMAN_TEST_DATABASE_URL: postgres://events:test@127.0.0.1:5432/chirpstack_events
+        run: node --test --test-reporter=spec test/resolver.js test/engine.js
+
+      - name: Verify config and schema
+        run: node dist/cli.js verify
+
+      - name: Sounding raises the expected alerts
+        run: node dist/cli.js run
+
+      - name: Assert the alert lifecycle
+        run: node test/integration.js
+
+      # The shipped per-device config is documentation as much as configuration, and
+      # stale documentation is worse than none. Re-run it against payload shapes taken
+      # from each Makerfabs codec's vectors.json so a vocabulary change breaks CI
+      # rather than a farm.
+      - name: Reset the event store for the per-device fixture
+        run: psql "$LEADSMAN_DATABASE_URL" -q -f test/fixtures/makerfabs-seed.sql
+
+      - name: Clear alert state between fixtures
+        run: psql "$LEADSMAN_DATABASE_URL" -q -c "TRUNCATE leadsman.alert, leadsman.run;"
+
+      - name: Makerfabs AgroSense config raises the expected alerts
+        env:
+          LEADSMAN_CONFIG: config/makerfabs-agrosense.example.json
+        run: |
+          node dist/cli.js verify
+          node dist/cli.js run
+          node test/makerfabs.js

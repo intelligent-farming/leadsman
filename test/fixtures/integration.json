@@ -1,0 +1,102 @@
+{
+  "//": "Integration fixture config: every check enabled, tuned to test/fixtures/seed.sql. Each entry should raise exactly the devices it is designed for, and the FFxx healthy controls should raise nothing at all. Not a deployment template — see config/leadsman.example.json for that.",
+
+  "schedule": "*/15 * * * *",
+  "timezone": "UTC",
+  "statementTimeoutMs": 15000,
+  "maxChecksPerRun": 64,
+
+  "checks": [
+    { "rule": "device-silent", "params": { "silentMinutes": 180, "inventoryHours": 168, "minUplinks": 5 } },
+    { "rule": "battery-low", "params": { "paths": ["battery", "power.voltage"], "raiseAtVolts": 3.4, "clearAtVolts": 3.55, "criticalAtVolts": 3.2 } },
+    { "rule": "decode-failure", "params": { "minFailures": 5, "minFailureRatio": 0.5 } },
+    { "rule": "signal-degraded", "params": { "rssiThresholdDbm": -115, "minUplinks": 20, "lookbackHours": 72 } },
+
+    { "rule": "measurement-missing", "as": "soil-moisture-missing",
+      "params": { "paths": ["soil.moisture"], "lookbackHours": 168, "recentHours": 12, "minRecentUplinks": 5, "minHistoricalSightings": 10 } },
+
+    { "//": "Multi-path: device 0101 matches air.temperature, device 0102 only has bare `temperature`. Both must fire from this one entry.",
+      "rule": "measurement-threshold", "as": "frost-risk", "severity": "critical",
+      "params": { "paths": ["air.temperature", "temperature", "leaf.temperature"], "min": 1.5, "max": null, "unit": "C", "clearMargin": 1, "lookbackHours": 6 } },
+
+    { "rule": "measurement-threshold", "as": "heat-stress",
+      "params": { "paths": ["air.temperature", "temperature"], "min": null, "max": 35, "unit": "C", "clearMargin": 2, "lookbackHours": 6 } },
+
+    { "rule": "measurement-rate", "as": "temperature-crash",
+      "params": { "paths": ["air.temperature", "temperature"], "direction": "falling", "maxRatePerHour": 3, "unit": "C", "lookbackHours": 5, "minSamples": 4, "minSpanHours": 1 } },
+
+    { "//": "Latest wind reading on device 0201 is calm; only the window peak is high.",
+      "rule": "measurement-peak", "as": "wind-gust",
+      "params": { "paths": ["wind.speed"], "direction": "max", "threshold": 17, "unit": " m/s", "lookbackHours": 3, "minSamples": 3 } },
+
+    { "rule": "measurement-stuck", "as": "anemometer-stuck",
+      "params": { "paths": ["wind.speed"], "lookbackHours": 24, "minSamples": 24, "decimals": 1, "maxDistinctValues": 1 } },
+
+    { "rule": "measurement-threshold", "as": "soil-moisture-low",
+      "params": { "paths": ["soil.moisture"], "min": 15, "max": null, "unit": "%", "clearMargin": 2, "lookbackHours": 24 } },
+
+    { "rule": "measurement-stuck", "as": "soil-probe-stuck",
+      "params": { "paths": ["soil.moisture"], "lookbackHours": 24, "minSamples": 12, "decimals": 2, "maxDistinctValues": 1 } },
+
+    { "rule": "measurement-threshold", "as": "soil-salinity-high",
+      "params": { "paths": ["soil.ec"], "min": null, "max": 4, "unit": " dS/m", "clearMargin": 0.5, "lookbackHours": 24 } },
+
+    { "rule": "measurement-rate", "as": "tank-draining-fast", "severity": "critical",
+      "params": { "paths": ["tank.level", "water.level", "tank.volume"], "direction": "falling", "maxRatePerHour": 8, "unit": "%", "lookbackHours": 7, "minSamples": 4, "minSpanHours": 1 } },
+
+    { "//": "Multi-path: device 0402 has no tank.level, only linear.position.",
+      "rule": "measurement-threshold", "as": "tank-low",
+      "params": { "paths": ["tank.level", "linear.position", "analog.ratio"], "min": 20, "max": null, "unit": "%", "clearMargin": 5, "lookbackHours": 12 } },
+
+    { "rule": "counter-spike", "as": "water-burst", "severity": "critical",
+      "params": { "paths": ["metering.water.total", "pulse.total"], "maxRatePerHour": 500, "unit": "L", "lookbackHours": 4, "minSamples": 3, "minSpanHours": 0.5 } },
+
+    { "//": "Fires twice: device 0502 (flat total) and device 0503 (total went backwards).",
+      "rule": "counter-stalled", "as": "water-meter-stalled",
+      "params": { "paths": ["metering.water.total", "pulse.total"], "lookbackHours": 12, "minAdvance": 1, "minSamples": 4, "alertOnDecrease": true } },
+
+    { "rule": "measurement-threshold", "as": "dissolved-oxygen-low", "severity": "critical",
+      "params": { "paths": ["water.dissolvedOxygen"], "min": 5, "max": null, "unit": " mg/L", "clearMargin": 0.5, "lookbackHours": 12 } },
+
+    { "rule": "measurement-threshold", "as": "co2-high",
+      "params": { "paths": ["air.co2"], "min": null, "max": 1500, "unit": " ppm", "clearMargin": 200, "lookbackHours": 6 } },
+
+    { "rule": "measurement-threshold", "as": "leaf-wetness-high",
+      "params": { "paths": ["leaf.wetness"], "min": null, "max": 80, "unit": "%", "clearMargin": 10, "lookbackHours": 12 } },
+
+    { "rule": "measurement-threshold", "as": "pump-vibration-high",
+      "params": { "paths": ["vibration.velocityRms", "vibration.accelerationRms"], "min": null, "max": 7.1, "unit": " mm/s", "clearMargin": 1, "lookbackHours": 12 } },
+
+    { "rule": "boolean-alarm", "as": "water-leak", "severity": "critical",
+      "params": { "paths": ["water.leak"], "trueValues": ["true", "1", "detected", "wet"], "lookbackHours": 24, "label": "water leak detected" } },
+
+    { "//": "Exercises a non-boolean truthy value: the action.contactState enum.",
+      "rule": "boolean-alarm", "as": "contact-open",
+      "params": { "paths": ["action.contactState"], "trueValues": ["open"], "lookbackHours": 24, "label": "left open" } },
+
+    { "rule": "geofence-breach", "as": "asset-left-property", "severity": "critical",
+      "params": { "latPaths": ["position.latitude"], "lonPaths": ["position.longitude"], "shape": "box",
+                  "north": 41.9, "south": 41.8, "east": -93.5, "west": -93.7,
+                  "centerLat": null, "centerLon": null, "radiusMetres": null,
+                  "clearMargin": 0.0005, "lookbackHours": 24 } },
+    { "//": "──── network-layer checks: faults visible only outside event_up ────" },
+
+    { "rule": "device-log-error", "as": "chirpstack-errors",
+      "params": { "lookbackHours": 24, "minLevel": 2, "minEvents": 3, "excludeCodes": ["7"] } },
+
+    { "//": "MAC-layer battery. Device a2 reports 12% here while its uplinks say 3.9 V, so the codec-based battery-low check must stay silent on it.",
+      "rule": "status-battery-low", "as": "mac-battery",
+      "params": { "raiseAtPercent": 20, "clearAtPercent": 25, "criticalAtPercent": 10,
+                  "lookbackHours": 336, "ignoreExternalPower": true } },
+
+    { "rule": "status-margin-low", "as": "mac-margin",
+      "params": { "minMarginDb": 5, "criticalMarginDb": 0, "lookbackHours": 336, "minReadings": 3 } },
+
+    { "rule": "join-churn", "as": "rejoining",
+      "params": { "lookbackHours": 168, "maxJoins": 3, "maxJoinsPerUplinkRatio": 0.1,
+                  "minUplinksForRatio": 5 } },
+
+    { "rule": "downlink-unacked", "as": "commands-failing",
+      "params": { "lookbackHours": 24, "minUnacked": 2, "minUnackedRatio": 0.5 } }
+  ]
+}

@@ -1,0 +1,295 @@
+{
+  "//": "Complete check set for four Makerfabs AgroSense devices: AGLWSM02, AGLWTH01, AGLWPP01, AGLWL01. Derived from their normalized codec manifests in @intelligent-farming/lorawan-codec-normalization — every path below is verified against that codec's decoded output, not inferred from the model name.",
+
+  "//devices": [
+    "AGLWL01  → codec makerfabs/light-intensity   → battery(V), air.lightIntensity(lux), seqNo",
+    "AGLWPP01 → codec makerfabs/pipe-pressure     → battery(V), pressure.gauge(kPa), sampleCount, reportingInterval",
+    "AGLWTH01 → codec makerfabs/air-temperature-and-humidity (also ath20 / temperature-humidity-sht31 — identical output) → battery(V), air.temperature(C), air.relativeHumidity(%)",
+    "AGLWSM02 → codec makerfabs/soil-monitor      → battery(V), soil.moisture(%), soil.temperature(C), soil.ec(dS/m), soil.pH, transmitInterval",
+    "AGLWSM02 alt → codec makerfabs/soil-moisture → battery(V), soilMoistureAdc (UNCALIBRATED raw count, not a percentage)"
+  ],
+
+  "//model-mapping": "Only AGLWL01 is stamped in the codec source (light-intensity/codec.js). The other three are mapped by the AGLW<abbrev><version> convention: PP=Pipe Pressure, TH=Temperature/Humidity, SM=Soil Moisture. TH01 is safe either way — all three Makerfabs climate codecs emit identical paths. SM02 is the one to confirm: makerfabs/soil-monitor emits normalized soil.* fields, while makerfabs/soil-moisture emits only an uncalibrated soilMoistureAdc count. Both variants are configured below; delete the block that does not apply. Confirm with:  SELECT DISTINCT device_profile_name, jsonb_pretty(object) FROM event_up WHERE device_profile_name ILIKE '%soil%' ORDER BY 1 LIMIT 5;",
+
+  "//profiles": "deviceProfiles values must match your ChirpStack device_profile_name exactly. The names below are placeholders — list yours with:  SELECT DISTINCT device_profile_name, count(*) FROM event_up GROUP BY 1 ORDER BY 2 DESC;",
+
+  "//thresholds": "Thresholds are starting points in the vocabulary's guaranteed units (C, %, kPa, lux, V, dS/m). Battery figures especially need calibration against your own fleet — these devices do not share a voltage range. Establish yours with:  SELECT device_profile_name, min((object->>'battery')::numeric), percentile_cont(0.05) WITHIN GROUP (ORDER BY (object->>'battery')::numeric), max((object->>'battery')::numeric) FROM event_up WHERE object ? 'battery' GROUP BY 1;",
+
+  "schedule": "*/15 * * * *",
+  "timezone": "America/Chicago",
+  "statementTimeoutMs": 15000,
+  "maxChecksPerRun": 64,
+
+  "notify": { "webhookUrl": null, "timeoutMs": 5000 },
+
+  "checks": [
+    { "//": "════════ FLEET-WIDE, SCOPED PER DEVICE FAMILY ════════ These are the checks where the candidate path does NOT scope the check for you, because every device emits the field. battery is the clearest case: a coin-cell light sensor and a pipe-pressure logger do not share a low-battery voltage, so one fleet-wide threshold either cries wolf on one or stays silent on the other." },
+
+    {
+      "//": "Soil monitor: 4-in-1 probe, typically a larger pack. Confirm against your fleet.",
+      "rule": "battery-low", "as": "battery-low-soil", "enabled": true,
+      "params": { "paths": ["battery"], "raiseAtVolts": 3.3, "clearAtVolts": 3.45, "criticalAtVolts": 3.1,
+                  "lookbackHours": 48, "deviceProfiles": ["makerfabs-soil-monitor"] }
+    },
+    {
+      "rule": "battery-low", "as": "battery-low-climate", "enabled": true,
+      "params": { "paths": ["battery"], "raiseAtVolts": 3.2, "clearAtVolts": 3.35, "criticalAtVolts": 3.0,
+                  "lookbackHours": 48, "deviceProfiles": ["makerfabs-air-temperature-and-humidity"] }
+    },
+    {
+      "//": "Pipe pressure runs a higher supply (its vectors span 3.6–4.0 V), so a 3.2 V raise point would never fire before the node died.",
+      "rule": "battery-low", "as": "battery-low-pressure", "enabled": true,
+      "params": { "paths": ["battery"], "raiseAtVolts": 3.5, "clearAtVolts": 3.65, "criticalAtVolts": 3.3,
+                  "lookbackHours": 48, "deviceProfiles": ["makerfabs-pipe-pressure"] }
+    },
+    {
+      "//": "Light sensor sits lowest of the four — its vectors show normal operation at 2.9 V. The fleet default of 3.4 V would alert on a healthy device immediately.",
+      "rule": "battery-low", "as": "battery-low-light", "enabled": true,
+      "params": { "paths": ["battery"], "raiseAtVolts": 2.8, "clearAtVolts": 2.95, "criticalAtVolts": 2.6,
+                  "lookbackHours": 48, "deviceProfiles": ["makerfabs-light-intensity"] }
+    },
+
+    {
+      "//": "Silence, scoped by family because reporting intervals differ. Pipe pressure defaults to 300–1800 s; the soil monitor reports on transmitInterval (hours). A single threshold cannot suit both.",
+      "rule": "device-silent", "as": "silent-fast-reporters", "enabled": true,
+      "params": { "silentMinutes": 120, "inventoryHours": 168, "minUplinks": 5,
+                  "deviceProfiles": ["makerfabs-pipe-pressure", "makerfabs-light-intensity"] }
+    },
+    {
+      "rule": "device-silent", "as": "silent-slow-reporters", "enabled": true,
+      "params": { "silentMinutes": 360, "inventoryHours": 168, "minUplinks": 5,
+                  "deviceProfiles": ["makerfabs-soil-monitor", "makerfabs-soil-moisture",
+                                     "makerfabs-air-temperature-and-humidity"] }
+    },
+    {
+      "//": "Codec producing nothing. Unscoped on purpose — you want this on any device, including one whose profile you have not listed here.",
+      "rule": "decode-failure", "enabled": true,
+      "params": { "lookbackHours": 24, "minFailures": 5, "minFailureRatio": 0.5 }
+    },
+
+    { "//": "════════ AGLWSM02 — SOIL MONITOR ════════ soil.moisture(%), soil.temperature(C), soil.ec(dS/m), soil.pH. These four paths are emitted by nothing else in the fleet, so the checks below need no deviceProfiles — the candidate path IS the scope." },
+
+    {
+      "rule": "measurement-threshold", "as": "sm02-moisture-low", "enabled": true,
+      "params": { "paths": ["soil.moisture"], "min": 15, "max": null, "unit": "%",
+                  "clearMargin": 2, "lookbackHours": 24 }
+    },
+    {
+      "//": "Waterlogging: root-zone oxygen loss after over-irrigation or heavy rain.",
+      "rule": "measurement-threshold", "as": "sm02-waterlogged", "enabled": true,
+      "params": { "paths": ["soil.moisture"], "min": null, "max": 45, "unit": "%",
+                  "clearMargin": 3, "lookbackHours": 12 }
+    },
+    {
+      "//": "Moisture falling fast after irrigation means the water went somewhere other than the root zone — a broken line, or drainage far quicker than the soil type suggests.",
+      "rule": "measurement-rate", "as": "sm02-drying-fast", "enabled": true,
+      "params": { "paths": ["soil.moisture"], "direction": "falling", "maxRatePerHour": 4,
+                  "unit": "%", "lookbackHours": 6, "minSamples": 4, "minSpanHours": 2 }
+    },
+    {
+      "//": "A probe lifted out of the ground keeps reporting a plausible constant forever. Invisible to every threshold above.",
+      "rule": "measurement-stuck", "as": "sm02-probe-stuck", "enabled": true,
+      "params": { "paths": ["soil.moisture"], "lookbackHours": 24, "minSamples": 12,
+                  "decimals": 1, "maxDistinctValues": 1 }
+    },
+    {
+      "//": "Root-zone frost. Separate from air frost: soil lags air by hours, so this is the one that tells you the roots were actually hit.",
+      "rule": "measurement-threshold", "as": "sm02-root-frost", "enabled": true, "severity": "critical",
+      "params": { "paths": ["soil.temperature"], "min": 1.0, "max": null, "unit": "C",
+                  "clearMargin": 1, "lookbackHours": 12 }
+    },
+    {
+      "rule": "measurement-threshold", "as": "sm02-soil-too-hot", "enabled": false,
+      "params": { "paths": ["soil.temperature"], "min": null, "max": 32, "unit": "C",
+                  "clearMargin": 2, "lookbackHours": 12 }
+    },
+    {
+      "//": "Salinity. soil.ec is dS/m; above ~4 is a yield problem for most crops. Rising EC with falling moisture is the fertiliser-burn signature.",
+      "rule": "measurement-threshold", "as": "sm02-salinity-high", "enabled": true,
+      "params": { "paths": ["soil.ec"], "min": null, "max": 4.0, "unit": " dS/m",
+                  "clearMargin": 0.5, "lookbackHours": 24 }
+    },
+    {
+      "//": "EC climbing steadily means salts accumulating — usually irrigation water quality or insufficient leaching.",
+      "rule": "measurement-rate", "as": "sm02-salinity-rising", "enabled": false,
+      "params": { "paths": ["soil.ec"], "direction": "rising", "maxRatePerHour": 0.15,
+                  "unit": " dS/m", "lookbackHours": 24, "minSamples": 6, "minSpanHours": 8 }
+    },
+    {
+      "//": "pH band. Widen for your crop — blueberries and brassicas want very different windows.",
+      "rule": "measurement-threshold", "as": "sm02-ph-out-of-band", "enabled": true,
+      "params": { "paths": ["soil.pH"], "min": 5.5, "max": 7.8, "unit": "",
+                  "clearMargin": 0.2, "lookbackHours": 48 }
+    },
+    {
+      "//": "One probe element failing while the others keep reporting — the field vanishes from the codec output and every check above it goes quiet. Silence looks identical to health, which is why this matters.",
+      "rule": "measurement-missing", "as": "sm02-fields-missing", "enabled": true,
+      "params": { "paths": ["soil.moisture", "soil.temperature", "soil.ec", "soil.pH"],
+                  "lookbackHours": 168, "recentHours": 12,
+                  "minRecentUplinks": 4, "minHistoricalSightings": 10 }
+    },
+
+    { "//": "════════ AGLWSM02 — RAW-ADC VARIANT ════════ Only if your SM02 resolves to makerfabs/soil-moisture, which emits soilMoistureAdc instead of soil.*. That value is an UNCALIBRATED capacitive count (the codec attaches a warning saying so), not a percentage — the thresholds below are raw counts and MUST be calibrated per probe and soil type. Observed vector range is roughly 1500–2048. Delete this block if your SM02 is the 4-in-1 soil-monitor." },
+
+    {
+      "//": "Higher ADC count generally means drier on capacitive probes, but verify the direction on your hardware before trusting it — some invert.",
+      "rule": "measurement-threshold", "as": "sm02adc-dry", "enabled": false,
+      "params": { "paths": ["soilMoistureAdc"], "min": null, "max": 1900, "unit": " adc",
+                  "clearMargin": 40, "lookbackHours": 24 }
+    },
+    {
+      "//": "Works without calibration: a raw count that never moves is a detached or failed probe regardless of what the number means.",
+      "rule": "measurement-stuck", "as": "sm02adc-stuck", "enabled": false,
+      "params": { "paths": ["soilMoistureAdc"], "lookbackHours": 24, "minSamples": 12,
+                  "decimals": 0, "maxDistinctValues": 1 }
+    },
+    {
+      "//": "Also calibration-free: a hard rail at 0 or full-scale means an open or shorted probe lead.",
+      "rule": "measurement-threshold", "as": "sm02adc-railed", "enabled": false, "severity": "critical",
+      "params": { "paths": ["soilMoistureAdc"], "min": 20, "max": 4075, "unit": " adc",
+                  "clearMargin": 0, "lookbackHours": 12 }
+    },
+
+    { "//": "════════ AGLWTH01 — AIR TEMPERATURE & HUMIDITY ════════ air.temperature(C), air.relativeHumidity(%). Note the candidate lists include bare `temperature` so these entries keep working if you add a plain temperature probe (e.g. makerfabs/rtd-pt1000-temperature) later." },
+
+    {
+      "//": "Current air frost risk.",
+      "rule": "measurement-threshold", "as": "th01-frost-risk", "enabled": true, "severity": "critical",
+      "params": { "paths": ["air.temperature", "temperature"], "min": 1.5, "max": null,
+                  "unit": "C", "clearMargin": 1, "lookbackHours": 6 }
+    },
+    {
+      "//": "Did it frost overnight, even though the morning reading has recovered? Uses the window MINIMUM, so the event is not erased by daybreak.",
+      "rule": "measurement-peak", "as": "th01-frost-occurred", "enabled": true, "severity": "critical",
+      "params": { "paths": ["air.temperature", "temperature"], "direction": "min",
+                  "comparison": "below", "threshold": 0, "unit": "C",
+                  "lookbackHours": 12, "minSamples": 3 }
+    },
+    {
+      "rule": "measurement-threshold", "as": "th01-heat-stress", "enabled": true,
+      "params": { "paths": ["air.temperature", "temperature"], "min": null, "max": 35,
+                  "unit": "C", "clearMargin": 2, "lookbackHours": 6 }
+    },
+    {
+      "//": "Falling 3 C/h at dusk is the shape of a frost event hours before the temperature itself is alarming. This is the entry that buys you time to act.",
+      "rule": "measurement-rate", "as": "th01-temperature-crash", "enabled": true,
+      "params": { "paths": ["air.temperature", "temperature"], "direction": "falling",
+                  "maxRatePerHour": 3, "unit": "C", "lookbackHours": 4,
+                  "minSamples": 4, "minSpanHours": 1 }
+    },
+    {
+      "//": "Sustained high humidity is the primary driver of fungal infection periods. Leadsman cannot compute a dew point (it has no derived-value support), so this plus th01-temperature-crash is the practical approximation.",
+      "rule": "measurement-threshold", "as": "th01-humidity-high", "enabled": true,
+      "params": { "paths": ["air.relativeHumidity"], "min": null, "max": 88,
+                  "unit": "%", "clearMargin": 5, "lookbackHours": 12 }
+    },
+    {
+      "//": "Very low humidity — transpiration stress under glass, or a failed humidifier.",
+      "rule": "measurement-threshold", "as": "th01-humidity-low", "enabled": false,
+      "params": { "paths": ["air.relativeHumidity"], "min": 30, "max": null,
+                  "unit": "%", "clearMargin": 5, "lookbackHours": 12 }
+    },
+    {
+      "//": "A saturated or failed RH element pins at exactly 100 % (or 0) and stops moving. Threshold checks are satisfied; the reading is junk.",
+      "rule": "measurement-stuck", "as": "th01-humidity-stuck", "enabled": true,
+      "params": { "paths": ["air.relativeHumidity"], "lookbackHours": 24, "minSamples": 12,
+                  "decimals": 0, "maxDistinctValues": 1 }
+    },
+    {
+      "//": "Air temperature is the least likely reading to be genuinely constant over a day, which makes a frozen value strong evidence of a failed sensor.",
+      "rule": "measurement-stuck", "as": "th01-temperature-stuck", "enabled": true,
+      "params": { "paths": ["air.temperature", "temperature"], "lookbackHours": 24,
+                  "minSamples": 12, "decimals": 1, "maxDistinctValues": 1 }
+    },
+    {
+      "rule": "measurement-missing", "as": "th01-fields-missing", "enabled": true,
+      "params": { "paths": ["air.temperature", "air.relativeHumidity"],
+                  "lookbackHours": 168, "recentHours": 12,
+                  "minRecentUplinks": 4, "minHistoricalSightings": 10 }
+    },
+
+    { "//": "════════ AGLWPP01 — PIPE PRESSURE ════════ pressure.gauge(kPa). The most operationally valuable of the four for irrigation: pressure tells you whether the system is actually doing what you commanded. 100 kPa ≈ 14.5 psi ≈ 1 bar." },
+
+    {
+      "//": "Line pressure lost while it should be running: pump failed, well ran dry, or the main broke. Critical — irrigation is silently not happening.",
+      "rule": "measurement-threshold", "as": "pp01-pressure-low", "enabled": true, "severity": "critical",
+      "params": { "paths": ["pressure.gauge"], "min": 150, "max": null, "unit": " kPa",
+                  "clearMargin": 25, "lookbackHours": 3 }
+    },
+    {
+      "//": "Overpressure: a closed valve downstream, a blockage, or a failed regulator. Risks bursting the weakest fitting.",
+      "rule": "measurement-threshold", "as": "pp01-pressure-high", "enabled": true,
+      "params": { "paths": ["pressure.gauge"], "min": null, "max": 600, "unit": " kPa",
+                  "clearMargin": 50, "lookbackHours": 3 }
+    },
+    {
+      "//": "A sudden sustained drop is a burst or a sheared fitting. Catches it while pressure is still nominally in band, which is hours before the tank empties.",
+      "rule": "measurement-rate", "as": "pp01-pressure-collapse", "enabled": true, "severity": "critical",
+      "params": { "paths": ["pressure.gauge"], "direction": "falling", "maxRatePerHour": 120,
+                  "unit": " kPa", "lookbackHours": 3, "minSamples": 4, "minSpanHours": 0.5 }
+    },
+    {
+      "//": "Climbing fast usually means a valve closed against a running pump (deadhead) — expensive for the pump.",
+      "rule": "measurement-rate", "as": "pp01-pressure-surge", "enabled": true,
+      "params": { "paths": ["pressure.gauge"], "direction": "rising", "maxRatePerHour": 150,
+                  "unit": " kPa", "lookbackHours": 3, "minSamples": 4, "minSpanHours": 0.5 }
+    },
+    {
+      "//": "Water hammer. A transient spike between uplinks that averages away completely — only the window MAXIMUM sees it.",
+      "rule": "measurement-peak", "as": "pp01-pressure-spike", "enabled": true,
+      "params": { "paths": ["pressure.gauge"], "direction": "max", "comparison": "above",
+                  "threshold": 800, "unit": " kPa", "lookbackHours": 6, "minSamples": 2 }
+    },
+    {
+      "//": "A failed transducer or a blocked sensing port reads a constant. Every threshold above stays satisfied while the pressure reading is meaningless.",
+      "rule": "measurement-stuck", "as": "pp01-transducer-stuck", "enabled": true,
+      "params": { "paths": ["pressure.gauge"], "lookbackHours": 12, "minSamples": 10,
+                  "decimals": 1, "maxDistinctValues": 1 }
+    },
+    {
+      "rule": "measurement-missing", "as": "pp01-pressure-missing", "enabled": true,
+      "params": { "paths": ["pressure.gauge"], "lookbackHours": 168, "recentHours": 6,
+                  "minRecentUplinks": 6, "minHistoricalSightings": 10 }
+    },
+
+    { "//": "════════ AGLWL01 — LIGHT INTENSITY ════════ air.lightIntensity(lux). The awkward one: lux spans five orders of magnitude between night and noon, so a plain low-light threshold would fire every single evening. Use the daily PEAK instead — that is what distinguishes a fouled sensor from nightfall." },
+
+    {
+      "//": "The important entry. A daily maximum that never gets bright means the sensor is dirty, obscured by canopy growth, snow-covered, or buried — not that it was dark. This is measurement-peak's max/below combination, which a threshold check cannot express.",
+      "rule": "measurement-peak", "as": "l01-sensor-fouled", "enabled": true,
+      "params": { "paths": ["air.lightIntensity"], "direction": "max", "comparison": "below",
+                  "threshold": 5000, "unit": " lux", "lookbackHours": 24, "minSamples": 12 }
+    },
+    {
+      "//": "A photodiode reading exactly 0 around the clock is a dead element or a disconnected head — distinct from 'dim', and worth escalating.",
+      "rule": "measurement-peak", "as": "l01-sensor-dead", "enabled": true, "severity": "critical",
+      "params": { "paths": ["air.lightIntensity"], "direction": "max", "comparison": "below",
+                  "threshold": 1, "unit": " lux", "lookbackHours": 24, "minSamples": 12 }
+    },
+    {
+      "//": "A latched ADC produces a constant across day and night, which no real light sensor does.",
+      "rule": "measurement-stuck", "as": "l01-sensor-stuck", "enabled": true,
+      "params": { "paths": ["air.lightIntensity"], "lookbackHours": 24, "minSamples": 12,
+                  "decimals": 0, "maxDistinctValues": 1 }
+    },
+    {
+      "//": "Supplemental-lighting check for a greenhouse: if the daily peak never reaches the crop's requirement, the lamps are not compensating. Set the threshold from your DLI target and enable only under glass.",
+      "rule": "measurement-peak", "as": "l01-insufficient-light", "enabled": false,
+      "params": { "paths": ["air.lightIntensity"], "direction": "max", "comparison": "below",
+                  "threshold": 20000, "unit": " lux", "lookbackHours": 24, "minSamples": 12 }
+    },
+    {
+      "rule": "measurement-missing", "as": "l01-light-missing", "enabled": true,
+      "params": { "paths": ["air.lightIntensity"], "lookbackHours": 168, "recentHours": 12,
+                  "minRecentUplinks": 4, "minHistoricalSightings": 10 }
+    },
+
+    { "//": "════════ LINK QUALITY (all four) ════════ Unscoped: RSSI has nothing to do with which sensor is attached. Disabled until you have tuned the threshold to your gateway layout, or it will be noisy on the first run." },
+
+    {
+      "rule": "signal-degraded", "enabled": false,
+      "params": { "lookbackHours": 72, "rssiThresholdDbm": -115, "snrThresholdDb": null,
+                  "minUplinks": 20 }
+    }
+  ]
+}

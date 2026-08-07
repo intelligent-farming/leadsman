@@ -1,0 +1,74 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Intelligent Farming Foundation
+#
+# Standalone development compose: Leadsman plus a throwaway Postgres.
+#
+# This is NOT how it runs in production. There, Leadsman joins the
+# intelligent-farming-stack network and reads that stack's events-postgres —
+# see docs/stack-fragment.yml for the service definition to add there.
+#
+# The Postgres here has no ChirpStack writing to it, so the event_* tables do not
+# exist and `leadsman verify` will correctly report them missing. Use this to work
+# on the engine itself (config parsing, rule loading, the alert lifecycle); use the
+# real stack to work on check SQL.
+#
+#   cp .env.example .env
+#   docker compose up --build
+#   docker compose run --rm leadsman list
+#   docker compose run --rm leadsman verify
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${DEV_POSTGRES_USER:-events}
+      POSTGRES_PASSWORD: ${DEV_POSTGRES_PASSWORD:-changeme}
+      POSTGRES_DB: ${DEV_POSTGRES_DB:-chirpstack_events}
+    ports:
+      # Loopback only — this is a dev database, not something to expose.
+      - "127.0.0.1:${DEV_POSTGRES_HOST_PORT:-5435}:5432"
+    volumes:
+      - devpgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  # One-shot: create the leadsman schema before the engine starts.
+  migrate:
+    build: .
+    restart: "no"
+    command: ["migrate"]
+    environment:
+      # Dev shortcut: migrate as the owner, which is also the engine role here.
+      # In the real stack these are two different roles (see stack-fragment.yml).
+      LEADSMAN_MIGRATE_URL: >-
+        postgres://${DEV_POSTGRES_USER:-events}:${DEV_POSTGRES_PASSWORD:-changeme}@postgres:5432/${DEV_POSTGRES_DB:-chirpstack_events}
+      LEADSMAN_LOG_FORMAT: text
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  leadsman:
+    build: .
+    restart: unless-stopped
+    environment:
+      LEADSMAN_DATABASE_URL: >-
+        postgres://${DEV_POSTGRES_USER:-events}:${DEV_POSTGRES_PASSWORD:-changeme}@postgres:5432/${DEV_POSTGRES_DB:-chirpstack_events}
+      LEADSMAN_CONFIG: /etc/leadsman/leadsman.json
+      LEADSMAN_LOG_LEVEL: ${LEADSMAN_LOG_LEVEL:-debug}
+      LEADSMAN_LOG_FORMAT: ${LEADSMAN_LOG_FORMAT:-text}
+      LEADSMAN_WEBHOOK_TOKEN: ${LEADSMAN_WEBHOOK_TOKEN:-}
+    volumes:
+      # Read-only mount: the engine never writes its own config.
+      - ./config:/etc/leadsman:ro
+      # Uncomment to develop checks outside this repo — they override built-ins by id.
+      # - ./local-rules:/opt/leadsman/rules:ro
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+volumes:
+  devpgdata:

@@ -1,0 +1,44 @@
+{
+  "name": "@intelligent-farming/leadsman",
+  "version": "0.1.0",
+  "description": "Scheduled rule engine that takes periodic soundings of ChirpStack telemetry and raises deduplicated alerts into Postgres. Checks are pluggable scripts selected by a config file.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "leadsman": "dist/cli.js"
+  },
+  "license": "AGPL-3.0-or-later",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/intelligent-farming/leadsman.git"
+  },
+  "homepage": "https://github.com/intelligent-farming/leadsman#readme",
+  "bugs": {
+    "url": "https://github.com/intelligent-farming/leadsman/issues"
+  },
+  "files": [
+    "dist/",
+    "migrations/",
+    "config/leadsman.example.json"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc",
+    "prepare": "npm run build",
+    "test": "npm run build && node --test --test-reporter=spec test/smoke.js",
+    "leadsman": "node dist/cli.js",
+    "test:db": "npm run build && node --test --test-reporter=spec test/resolver.js test/engine.js",
+    "test:all": "npm run test && npm run test:db"
+  },
+  "dependencies": {
+    "croner": "^8.1.0",
+    "pg": "^8.11.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/pg": "^8.11.0",
+    "typescript": "^5.4.0"
+  }
+}

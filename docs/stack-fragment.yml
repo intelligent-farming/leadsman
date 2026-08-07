@@ -1,0 +1,80 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Intelligent Farming Foundation
+#
+# Service definition to add to intelligent-farming-stack/docker-compose.yml.
+#
+# Paste the `leadsman` service into that file's `services:` block and add the two
+# LEADSMAN_* variables to its .env. Leadsman reads the ChirpStack event_* tables in
+# events-postgres and writes its alerts to the leadsman schema in the same database
+# — no new Postgres instance, no new port, nothing published to the host.
+#
+# ── one-time setup ────────────────────────────────────────────────────────────
+#
+# 1. Create the engine role. Copy this repo's migrations/010_leadsman_role.sh into
+#    the stack's postgresql/events-initdb/ so fresh volumes get it automatically,
+#    then apply it to the existing volume:
+#
+#      docker compose exec events-postgres \
+#        bash /docker-entrypoint-initdb.d/010_leadsman_role.sh
+#
+#    with these added to the stack's .env (and to events-postgres' environment:):
+#      POSTGRES_LEADSMAN_USER=leadsman
+#      POSTGRES_LEADSMAN_PASSWORD=<generate one>
+#
+# 2. Create the leadsman schema (runs as the owner role):
+#
+#      docker compose run --rm leadsman migrate
+#
+# 3. Index the event_* tables. ChirpStack ships them with a primary-key index only,
+#    and every check filters by time and groups by dev_eui — without indexes each
+#    sounding is a sequential scan, which is how a monitor starts degrading the
+#    thing it monitors. Opt in explicitly since it alters ChirpStack-owned tables:
+#
+#      docker compose run --rm -e LEADSMAN_APPLY_EVENT_INDEXES=true leadsman migrate
+#
+# 4. Copy config/leadsman.example.json to the stack as config/leadsman.json, pick
+#    your checks, then:
+#
+#      docker compose run --rm leadsman verify
+#      docker compose up -d leadsman
+#
+# ── notification ──────────────────────────────────────────────────────────────
+#
+# Leadsman does not send SMS. Set notify.webhookUrl in the config to whatever
+# delivers: your own Twilio sender, or a Hermes webhook route. For routine
+# threshold alerts use a Hermes route with `deliver_only: true` — zero LLM tokens.
+# Reserve agent-invoking routes for alerts that genuinely need interpretation.
+
+  leadsman:
+    # Swap `build:` for `image:` once this is published to a registry.
+    build: https://github.com/intelligent-farming/leadsman.git
+    restart: unless-stopped
+    environment:
+      # Engine role: SELECT on public (read ChirpStack events), INSERT/UPDATE on the
+      # leadsman schema (write its own alerts). It cannot alter ChirpStack's data.
+      LEADSMAN_DATABASE_URL: >-
+        postgres://${POSTGRES_LEADSMAN_USER:-leadsman}:${POSTGRES_LEADSMAN_PASSWORD}@events-postgres:5432/${EVENTS_POSTGRES_DB:-chirpstack_events}
+      # Owner role, used only by `migrate` — DDL is deliberately outside the
+      # engine role's rights.
+      LEADSMAN_MIGRATE_URL: >-
+        postgres://${EVENTS_POSTGRES_USER:-events}:${EVENTS_POSTGRES_PASSWORD:-changeme}@events-postgres:5432/${EVENTS_POSTGRES_DB:-chirpstack_events}
+      LEADSMAN_CONFIG: /etc/leadsman/leadsman.json
+      LEADSMAN_LOG_LEVEL: ${LEADSMAN_LOG_LEVEL:-info}
+      LEADSMAN_LOG_FORMAT: json
+      LEADSMAN_WEBHOOK_TOKEN: ${LEADSMAN_WEBHOOK_TOKEN:-}
+    volumes:
+      - ./config:/etc/leadsman:ro
+    depends_on:
+      events-postgres:
+        condition: service_healthy
+      # Wait for ChirpStack to have created event_up, so the first sounding does not
+      # fail against a schema that does not exist yet. Reuses the stack's own gate.
+      events-schema-wait:
+        condition: service_completed_successfully
+    # Resource ceiling. On a 2-core edge device the engine must not be able to
+    # crowd out ChirpStack's ingestion; soundings are not latency-critical.
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 256M
