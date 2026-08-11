@@ -51,6 +51,9 @@ const rule: Rule = {
     'is low — the device can barely hear the gateway. Early warning for failing ' +
     'downlinks, ADR problems, and join churn. The downlink counterpart to signal-degraded.',
   defaultSeverity: 'warning',
+  /** A number against a threshold. Actionable on its own — the link needs attention.
+   */
+  defaultRouting: 'fact',
   defaultParams: {
     /**
      * Alert at or below this average margin, in dB. 5 dB leaves little headroom above

@@ -40,6 +40,9 @@ const rule: Rule = {
     'by a minimum amount over the window, or that went backwards. Enable only where ' +
     'consumption is genuinely expected — an idle meter is not a fault.',
   defaultSeverity: 'warning',
+  /** Generic: a monotonic counter that stopped advancing.
+   */
+  defaultRouting: 'fact',
   defaultParams: {
     /** Priority-ordered candidate vocabulary paths holding the total. */
     paths: ['metering.water.total', 'pulse.total'],

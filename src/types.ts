@@ -14,6 +14,24 @@
 
 export type Severity = 'info' | 'warning' | 'critical';
 
+/**
+ * Whether an alert is self-explanatory or needs interpreting.
+ *
+ * This is the routing axis, and it is deliberately NOT severity. Severity says how bad;
+ * routing says whether a reader — human or model — has to work out what the alert means.
+ *
+ *   fact       The summary line is the whole story: "battery 3.15V (raise <=3.4V)". Send it
+ *              straight to whoever acts on it. Costs nothing to deliver.
+ *   situation  Ambiguous alone, actionable only in combination with other alerts or outside
+ *              context: one silent device is a dead node, six at once is the gateway. This is
+ *              the only class worth spending an LLM invocation on.
+ *
+ * A critical alert is very often a `fact` — `pipe-pressure-low` already tells you the pressure
+ * and the threshold. Routing everything critical to a model is the mistake this type exists to
+ * prevent, because you then pay tokens to be told what the summary already said.
+ */
+export type Routing = 'fact' | 'situation';
+
 /** A device that a check found to be in breach on this run. */
 export interface Finding {
   /** DevEUI, lowercase hex. The stable device identity — device_name is mutable. */
@@ -90,6 +108,17 @@ export interface Rule {
   description: string;
   /** Applied to findings that don't set their own. */
   defaultSeverity: Severity;
+  /**
+   * Where this check's alerts go by default — see `Routing`. Config `notifyTo` overrides it.
+   *
+   * Only meaningful for rules whose id *is* their meaning (device-silent, battery-low,
+   * geofence-breach). The generic mechanisms — measurement-threshold, measurement-peak,
+   * counter-spike and friends — serve many meanings at once: one config can use
+   * measurement-threshold for both `frost-risk` (a situation) and `soil-ph-range` (a fact).
+   * Those rules default to 'fact' as the cheap, safe baseline, and the per-check `notifyTo`
+   * is how a deployment says which of its instances need interpreting.
+   */
+  defaultRouting: Routing;
   /** Merged under config `params`. Every parameter must have a default. */
   defaultParams: Record<string, unknown>;
   /**
@@ -114,32 +143,116 @@ export interface CheckConfig {
   as?: string;
   enabled?: boolean;
   severity?: Severity;
+  /**
+   * Destination name from `notify.destinations`, or a `Routing` value resolved through
+   * `notify.routing`. Overrides the rule's `defaultRouting`. This is where a deployment
+   * expresses meaning the generic rules cannot know — that its `measurement-threshold`
+   * instance named `pipe-pressure-low` is a situation while `soil-ph-range` is a fact.
+   */
+  notifyTo?: string;
   params?: Record<string, unknown>;
 }
 
-export interface NotifyConfig {
-  /**
-   * Optional POST target, fired once per newly-raised alert. This is the seam to
-   * the notification path — a Twilio sender, or a Hermes webhook route with
-   * `deliver_only: true` for a zero-token SMS. Leadsman does not send SMS itself.
-   */
-  webhookUrl?: string | null;
-  /** Secret for whichever auth mode is selected. Read from LEADSMAN_WEBHOOK_TOKEN. */
-  webhookToken?: string | null;
-  /**
-   * How the POST proves itself to the receiver.
-   *
-   * `hmac` signs `<unix-seconds>.<body>` with HMAC-SHA256 and sends
-   * `X-Webhook-Signature-V2` + `X-Webhook-Timestamp` — replay-safe, and what Hermes'
-   * generic webhook route expects. `token` sends the raw secret in
-   * `webhookTokenHeader`. `bearer` (the default, for backwards compatibility) sends
-   * `Authorization: Bearer`.
-   */
+/**
+ * How a destination delivers.
+ *
+ *   webhook   POST the alert JSON. The original behaviour, and what an agent route wants:
+ *             the receiver gets structured fields, not a sentence.
+ *   twilio    SMS via Twilio's REST API.
+ *   telegram  A Telegram bot message.
+ *   signal    Signal via a signal-cli-rest-api instance you run.
+ *
+ * The three messaging providers send *text*, so they render the alert to one line. Reach for
+ * a webhook when the receiver needs the structure; reach for a provider when a person needs
+ * to read it on a phone.
+ */
+export type NotifyProvider = 'webhook' | 'twilio' | 'telegram' | 'signal';
+
+/** Credentials and endpoints for the messaging providers. Env only — never the config file. */
+export interface MessagingCredentials {
+  twilio?: {
+    accountSid: string;
+    authToken: string;
+    /** Sending number or messaging-service alphanumeric sender. */
+    from: string;
+    /** Override for testing or a regional edge. Default https://api.twilio.com */
+    baseUrl?: string;
+  };
+  telegram?: {
+    botToken: string;
+    /** Override for a local Bot API server. Default https://api.telegram.org */
+    baseUrl?: string;
+  };
+  signal?: {
+    /** signal-cli-rest-api base URL, e.g. http://signal-cli:8080 — there is no hosted API. */
+    baseUrl: string;
+    /** The registered sending number. */
+    from: string;
+  };
+}
+
+/** One delivery target: either a webhook or a messaging provider. */
+export interface NotifyDestination {
+  /** Defaults to 'webhook', which keeps every existing destination working unchanged. */
+  provider?: NotifyProvider;
+
+  /** Recipients for `twilio` and `signal` — E.164 numbers. */
+  to?: string[];
+  /** Chat or channel id for `telegram`. Groups and channels are negative. */
+  chatId?: string;
+
+  /** Required for `webhook`; ignored by the providers. */
+  webhookUrl?: string;
+  /** See NotifyConfig.webhookAuth. Defaults to 'bearer'. */
   webhookAuth?: 'hmac' | 'token' | 'bearer';
-  /** Header for `token` mode. Default `X-Webhook-Token`. */
+  /** Header for `token` auth. Default `X-Webhook-Token`. */
   webhookTokenHeader?: string | null;
-  /** Give up on a webhook after this long. Default 5000. */
+  /**
+   * Secret, read from LEADSMAN_WEBHOOK_TOKEN_<NAME> (name upper-cased, hyphens to
+   * underscores), falling back to LEADSMAN_WEBHOOK_TOKEN so a single shared secret still
+   * works. Never read from the config file.
+   */
+  webhookToken?: string | null;
+  /** Give up after this long. Default 5000. */
   timeoutMs?: number;
+}
+
+export interface NotifyConfig {
+  /** Default per-destination timeout, overridable on each one. Default 5000. */
+  timeoutMs?: number;
+
+  /**
+   * Named delivery targets, keyed by a name you choose. Required whenever `notify` is
+   * present: there is exactly one way to describe delivery, so there is no second path that
+   * can quietly win or quietly do nothing.
+   */
+  destinations: Record<string, NotifyDestination>;
+
+  /**
+   * Which destination each `Routing` class goes to. The normal shape is
+   * `{ "fact": "sms", "situation": "agent" }`. A class mapped to null is recorded in Postgres
+   * and not delivered — useful for silencing the high-volume half without losing it.
+   */
+  routing?: Partial<Record<Routing, string | null>>;
+
+  /**
+   * Fallback destination when routing yields nothing. Null means record-only, which is the
+   * safe default: an unroutable alert is never silently dropped, it is just not pushed.
+   */
+  defaultDestination?: string | null;
+
+  /**
+   * Optional severity override, applied above the rule's routing but below a check's explicit
+   * `notifyTo`. `{ "critical": "agent" }` escalates everything critical regardless of class.
+   * Use sparingly — most critical alerts are facts whose summary is already actionable.
+   */
+  bySeverity?: Partial<Record<Severity, string | null>>;
+
+  /**
+   * Provider credentials, populated from the environment by parseConfig. Never read from the
+   * config file, so a config carrying a Twilio destination is still safe to commit.
+   */
+  messaging?: MessagingCredentials;
 }
 
 export interface LeadsmanConfig {

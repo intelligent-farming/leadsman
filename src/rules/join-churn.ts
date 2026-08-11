@@ -48,6 +48,11 @@ const rule: Rule = {
     'whose joins are high relative to the uplinks they delivered. Each rejoin discards ' +
     'queued downlinks and resets ADR. Invisible to every other check.',
   defaultSeverity: 'warning',
+  /** Repeated rejoins are a symptom, not a cause — failing battery under TX load, a
+   *  coverage edge, or a gateway flapping. Worth correlating with signal and battery
+   *  alerts on the same node before anyone is dispatched.
+   */
+  defaultRouting: 'situation',
   defaultParams: {
     /** Window to count joins over. */
     lookbackHours: 168,

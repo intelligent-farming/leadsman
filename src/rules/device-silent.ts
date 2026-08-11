@@ -34,6 +34,11 @@ const rule: Rule = {
     'have not sent an uplink within the silence threshold. Catches dead batteries, ' +
     'gateway coverage loss, and physically damaged nodes.',
   defaultSeverity: 'critical',
+  /** One node silent is a dead node; several at once is the gateway, the backhaul, or a
+   *  power cut. Which of those it is can only be told by looking at what ELSE went quiet,
+   *  so this is the canonical case for correlation.
+   */
+  defaultRouting: 'situation',
   defaultParams: {
     /** No uplink for this long → alert. */
     silentMinutes: 180,

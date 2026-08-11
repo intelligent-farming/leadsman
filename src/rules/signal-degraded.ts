@@ -37,6 +37,10 @@ const rule: Rule = {
     'below threshold. A leading indicator of coverage loss — enable it to get warning ' +
     'before a node goes silent.',
   defaultSeverity: 'info',
+  /** Informational RSSI/SNR trend. Useful for siting decisions, not something to wake a
+   *  model for.
+   */
+  defaultRouting: 'fact',
   defaultParams: {
     /** Window to average over. Long enough to smooth weather; short enough to notice. */
     lookbackHours: 72,

@@ -1,6 +1,6 @@
 {
   "name": "@intelligent-farming/leadsman",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Scheduled rule engine that takes periodic soundings of ChirpStack telemetry and raises deduplicated alerts into Postgres. Checks are pluggable scripts selected by a config file.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -27,7 +27,7 @@
   "scripts": {
     "build": "tsc",
     "prepare": "npm run build",
-    "test": "npm run build && node --test --test-reporter=spec test/smoke.js",
+    "test": "npm run build && node --test --test-reporter=spec test/smoke.js test/providers.js",
     "leadsman": "node dist/cli.js",
     "test:db": "npm run build && node --test --test-reporter=spec test/resolver.js test/engine.js",
     "test:all": "npm run test && npm run test:db"

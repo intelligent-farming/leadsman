@@ -281,7 +281,7 @@ if (!h.available) {
     try {
       const out = await notifyRaised(
         [raised(rows[0].id, 'aa')],
-        { webhookUrl: hook.url, timeoutMs: 2000 },
+        { destinations: { hook: { webhookUrl: hook.url, timeoutMs: 2000 } }, defaultDestination: 'hook' },
         env.store, h.quietLogger(),
       );
       assert.equal(out.delivered, 1);
@@ -308,7 +308,7 @@ if (!h.available) {
     try {
       const out = await notifyRaised(
         [raised(rows[0].id, 'aa')],
-        { webhookUrl: hook.url, timeoutMs: 2000 },
+        { destinations: { hook: { webhookUrl: hook.url, timeoutMs: 2000 } }, defaultDestination: 'hook' },
         env.store, h.quietLogger(),
       );
       assert.equal(out.delivered, 0);
@@ -329,7 +329,7 @@ if (!h.available) {
     // sounding down with it.
     const out = await notifyRaised(
       [raised(1, 'aa')],
-      { webhookUrl: 'http://127.0.0.1:1/hook', timeoutMs: 1000 },
+      { destinations: { hook: { webhookUrl: 'http://127.0.0.1:1/hook', timeoutMs: 1000 } }, defaultDestination: 'hook' },
       env.store, h.quietLogger(),
     );
     assert.equal(out.failed, 1);
@@ -342,7 +342,7 @@ if (!h.available) {
       const started = Date.now();
       const out = await notifyRaised(
         [raised(1, 'aa')],
-        { webhookUrl: hook.url, timeoutMs: 300 },
+        { destinations: { hook: { webhookUrl: hook.url, timeoutMs: 300 } }, defaultDestination: 'hook' },
         env.store, h.quietLogger(),
       );
       assert.equal(out.failed, 1);
@@ -357,7 +357,7 @@ if (!h.available) {
     try {
       await notifyRaised(
         [raised(1, 'aa')],
-        { webhookUrl: hook.url, webhookToken: 's3cret', timeoutMs: 2000 },
+        { destinations: { hook: { webhookUrl: hook.url, webhookToken: 's3cret', timeoutMs: 2000 } }, defaultDestination: 'hook' },
         env.store, h.quietLogger(),
       );
       assert.equal(hook.received[0].headers.authorization, 'Bearer s3cret');
@@ -375,7 +375,7 @@ if (!h.available) {
     try {
       await notifyRaised(
         [raised(1, 'aa')],
-        { webhookUrl: hook.url, webhookToken: secret, webhookAuth: 'hmac', timeoutMs: 2000 },
+        { destinations: { hook: { webhookUrl: hook.url, webhookToken: secret, webhookAuth: 'hmac', timeoutMs: 2000 } }, defaultDestination: 'hook' },
         env.store, h.quietLogger(),
       );
 
@@ -406,10 +406,8 @@ if (!h.available) {
     try {
       await notifyRaised(
         [raised(1, 'aa')],
-        {
-          webhookUrl: hook.url, webhookToken: 'plain', webhookAuth: 'token',
-          webhookTokenHeader: 'X-Gitlab-Token', timeoutMs: 2000,
-        },
+        { destinations: { hook: { webhookUrl: hook.url, webhookToken: 'plain', webhookAuth: 'token',
+          webhookTokenHeader: 'X-Gitlab-Token', timeoutMs: 2000 } }, defaultDestination: 'hook' },
         env.store, h.quietLogger(),
       );
       assert.equal(hook.received[0].headers['x-gitlab-token'], 'plain');
@@ -426,7 +424,7 @@ if (!h.available) {
       const cfg = {
         schedule: '* * * * *',
         statementTimeoutMs: 15_000,
-        notify: { webhookUrl: hook.url, timeoutMs: 2000 },
+        notify: { destinations: { hook: { webhookUrl: hook.url, timeoutMs: 2000 } }, defaultDestination: 'hook' },
         checks: [{ rule: 'r', as: 'r', enabled: true }],
       };
       const opts = {
@@ -447,7 +445,7 @@ if (!h.available) {
     }
   });
 
-  test('notifier: with no webhook configured, alerts are still recorded', async () => {
+  test('notifier: with no notify config, alerts are still recorded', async () => {
     const rule = fakeRule('r', async () => [finding('aa')]);
     const summary = await sound([rule], [{ rule: 'r', as: 'r', enabled: true }]);
     assert.equal(summary.raised, 1);

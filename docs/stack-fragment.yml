@@ -40,10 +40,10 @@
 #
 # ── notification ──────────────────────────────────────────────────────────────
 #
-# Leadsman does not send SMS. Set notify.webhookUrl in the config to whatever
-# delivers: your own Twilio sender, or a Hermes webhook route. For routine
-# threshold alerts use a Hermes route with `deliver_only: true` — zero LLM tokens.
-# Reserve agent-invoking routes for alerts that genuinely need interpretation.
+# Set notify.destinations in the config: a messaging platform (twilio/telegram/signal)
+# for alerts a person should read, or a webhook for a Hermes route. Route `fact` alerts
+# to the messaging destination and `situation` alerts to an agent route — for routine
+# threshold alerts a Hermes route with `deliver_only: true` costs zero LLM tokens.
 
   leadsman:
     # Swap `build:` for `image:` once this is published to a registry.

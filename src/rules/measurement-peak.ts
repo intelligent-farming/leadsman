@@ -46,6 +46,9 @@ const rule: Rule = {
     'threshold, rather than only the latest reading. Use for wind gusts, peak ' +
     'vibration or sound, pressure spikes, and overnight temperature minima.',
   defaultSeverity: 'warning',
+  /** Generic: a window max/min past a threshold.
+   */
+  defaultRouting: 'fact',
   defaultParams: {
     /** Priority-ordered candidate vocabulary paths. */
     paths: ['wind.speed'],

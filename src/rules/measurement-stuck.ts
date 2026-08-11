@@ -34,6 +34,9 @@ const rule: Rule = {
     'across many consecutive uplinks — a detached, seized, latched, or mis-decoded ' +
     'sensor. Invisible to threshold and silence checks.',
   defaultSeverity: 'warning',
+  /** A reading that never moves is a sensor fault — self-explanatory whatever the field.
+   */
+  defaultRouting: 'fact',
   defaultParams: {
     /** Priority-ordered candidate vocabulary paths. */
     paths: ['soil.moisture'],

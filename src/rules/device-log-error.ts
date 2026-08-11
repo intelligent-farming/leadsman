@@ -52,6 +52,9 @@ const rule: Rule = {
     'MIC errors, OTAA failures, frame-counter resets. The only check that reads the ' +
     "network server's own diagnosis rather than inferring from telemetry.",
   defaultSeverity: 'warning',
+  /** ChirpStack's own error events, already labelled with level and code.
+   */
+  defaultRouting: 'fact',
   defaultParams: {
     /** Window to examine. */
     lookbackHours: 24,

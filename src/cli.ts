@@ -37,9 +37,21 @@ interface Args {
   json: boolean;
 }
 
+/**
+ * Map a leading flag to the command it stands for.
+ *
+ * Anything starting with "-" otherwise falls through to `help`, which is why `--help` and
+ * `-h` appear to work by accident. `--version` needed to be listed explicitly or it would
+ * print the usage text and look like an unsupported flag.
+ */
+function commandFromFlag(flag: string): string {
+  if (flag === '--version' || flag === '-v') return 'version';
+  return 'help';
+}
+
 function parseArgs(argv: string[]): Args {
   const args: Args = {
-    command: argv[0] && !argv[0].startsWith('-') ? argv[0] : 'help',
+    command: argv[0] && !argv[0].startsWith('-') ? argv[0] : commandFromFlag(argv[0] ?? ''),
     config: process.env.LEADSMAN_CONFIG ?? 'config/leadsman.json',
     dryRun: false,
     runOnStart: false,
@@ -84,6 +96,7 @@ Commands:
   serve                Stay resident and sound on the configured schedule
   status               Show currently open alerts
   migrate              Apply migrations/*.sql (needs an owner-role URL)
+  version              Print the engine version
 
 Options:
   -c, --config <path>  Config file (default: $LEADSMAN_CONFIG or config/leadsman.json)
@@ -95,7 +108,7 @@ Options:
 Environment:
   LEADSMAN_DATABASE_URL   Postgres URL for the engine role (required)
   LEADSMAN_MIGRATE_URL    Owner-role URL for migrate (falls back to the above)
-  LEADSMAN_WEBHOOK_TOKEN  Bearer token for notify.webhookUrl, if it needs one
+  LEADSMAN_WEBHOOK_TOKEN  Shared secret for webhook destinations (see README)
   LEADSMAN_LOG_LEVEL      debug | info | warn | error (default info)
   LEADSMAN_LOG_FORMAT     json | text (default json)
 `;
@@ -311,6 +324,23 @@ async function cmdMigrate(): Promise<number> {
   }
 }
 
+/**
+ * Package version, read from package.json at runtime.
+ *
+ * Read rather than compiled in so it cannot drift from what npm or the image actually
+ * shipped — a hardcoded string is exactly the thing that goes stale and then misreports
+ * which config features are supported. dist/ sits one level below the package root, and
+ * this build is CommonJS, so __dirname is the right anchor.
+ */
+function version(): string {
+  try {
+    const raw = readFileSync(join(__dirname, '..', 'package.json'), 'utf8');
+    return (JSON.parse(raw) as { version?: string }).version ?? 'unknown';
+  } catch {
+    return 'unknown';
+  }
+}
+
 async function main(): Promise<number> {
   const args = parseArgs(process.argv.slice(2));
 
@@ -327,6 +357,15 @@ async function main(): Promise<number> {
       return cmdStatus(args);
     case 'migrate':
       return cmdMigrate();
+    case 'version':
+    case '--version':
+    case '-v':
+      // Worth a command of its own: config features are gated by version (named
+      // destinations and the messaging providers need >= 0.2.0), and an older engine
+      // silently ignores unknown config keys rather than complaining — so "why is nothing
+      // being delivered" is answered by this one line more often than by any log.
+      process.stdout.write(`${version()}\n`);
+      return 0;
     case 'help':
     case '--help':
     case '-h':

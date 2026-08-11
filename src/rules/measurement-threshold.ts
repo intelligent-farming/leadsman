@@ -34,6 +34,9 @@ const rule: Rule = {
     'list, falls below min or above max. Devices reporting none of the paths are ' +
     'ignored. Enable once per measurement with a distinct "as" name.',
   defaultSeverity: 'warning',
+  /** Generic: a value outside a configured band.
+   */
+  defaultRouting: 'fact',
   defaultParams: {
     /**
      * Priority-ordered candidate vocabulary paths. The first one present on a given

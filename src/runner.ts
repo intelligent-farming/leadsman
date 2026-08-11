@@ -12,7 +12,7 @@
  */
 
 import { Store, type RaisedAlert } from './db';
-import { notifyRaised } from './notify';
+import { notifyRaised, type AlertRoute } from './notify';
 import type { CheckResult, LeadsmanConfig, Logger, Rule, SoundingContext } from './types';
 
 export interface SoundingSummary {
@@ -42,6 +42,7 @@ export async function runSounding(options: RunSoundingOptions): Promise<Sounding
   const startedAt = new Date();
   const results: CheckResult[] = [];
   const allRaised: RaisedAlert[] = [];
+  const routes = new Map<string, AlertRoute>();
 
   const enabled = config.checks.filter((c) => c.enabled);
   log.info('sounding started', { checks: enabled.length, dryRun });
@@ -97,6 +98,11 @@ export async function runSounding(options: RunSoundingOptions): Promise<Sounding
       });
 
       const severity = check.severity ?? rule.defaultSeverity;
+
+      // Routing is resolved at delivery time, but only here are the config entry and
+      // the rule in scope together. RaisedAlert carries `kind`, so a kind-keyed map is
+      // all notify needs to look this up later.
+      routes.set(kind, { notifyTo: check.notifyTo, routing: rule.defaultRouting });
 
       if (dryRun) {
         const result: CheckResult = {
@@ -172,7 +178,7 @@ export async function runSounding(options: RunSoundingOptions): Promise<Sounding
 
   const delivered = dryRun
     ? 0
-    : (await notifyRaised(allRaised, config.notify, store, log)).delivered;
+    : (await notifyRaised(allRaised, config.notify, store, log, routes)).delivered;
 
   const finishedAt = new Date();
   const summary: SoundingSummary = {

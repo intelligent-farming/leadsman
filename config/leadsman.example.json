@@ -1,94 +1,139 @@
 {
-  "//": "The full menu. Copy to config/leadsman.json, then enable what applies to your deployment. Most entries ship disabled because a sensible threshold depends on your crop, region, and equipment — enabling everything at once produces noise, not signal. No credentials here: the database URL comes from LEADSMAN_DATABASE_URL and the webhook token from LEADSMAN_WEBHOOK_TOKEN, so this file is safe to commit.",
-  "//units": "Every threshold below is in the normalized codec vocabulary's units, which are guaranteed by @intelligent-farming/lorawan-codec-normalization: °C, %, m/s, mm, mm/h, hPa, ppm, ppb, µg/m³, lux, W/m², µmol/m²/s, dS/m, µS/cm, mg/L, mV, NTU, V, A, W, L, Wh, mm/s, g, Hz, dB, µm, g/h, degrees. See docs/vocabulary.md for every path.",
-
+  "//": "The full menu. Copy to config/leadsman.json, then enable what applies to your deployment. Most entries ship disabled because a sensible threshold depends on your crop, region, and equipment \u2014 enabling everything at once produces noise, not signal. No credentials here: the database URL comes from LEADSMAN_DATABASE_URL and the webhook token from LEADSMAN_WEBHOOK_TOKEN, so this file is safe to commit.",
+  "//units": "Every threshold below is in the normalized codec vocabulary's units, which are guaranteed by @intelligent-farming/lorawan-codec-normalization: \u00b0C, %, m/s, mm, mm/h, hPa, ppm, ppb, \u00b5g/m\u00b3, lux, W/m\u00b2, \u00b5mol/m\u00b2/s, dS/m, \u00b5S/cm, mg/L, mV, NTU, V, A, W, L, Wh, mm/s, g, Hz, dB, \u00b5m, g/h, degrees. See docs/vocabulary.md for every path.",
   "schedule": "*/15 * * * *",
   "timezone": "America/Chicago",
   "statementTimeoutMs": 15000,
   "maxChecksPerRun": 64,
-
-  "notify": {
-    "//": "POSTed once per newly-raised alert. Point at your own Twilio sender, or a Hermes webhook route with deliver_only:true for zero-token SMS. LEADSMAN_WEBHOOK_URL / LEADSMAN_WEBHOOK_AUTH override these, so a deployment can set the receiver without editing this file; the secret always comes from LEADSMAN_WEBHOOK_TOKEN.",
-    "webhookUrl": null,
-    "timeoutMs": 5000
-  },
-
+  "//delivery": "NO DELIVERY BY DEFAULT \u2014 with no `notify` block, alerts are recorded and nothing is pushed. `leadsman status` and the leadsman.open_alert view show them. To deliver, add a notify block naming destinations and routing the two alert classes: \"notify\": {\"destinations\": {\"oncall\": {\"provider\": \"twilio\", \"to\": [\"+15125550123\"]}, \"agent\": {\"webhookUrl\": \"http://localhost:8644/hermes/agent\", \"webhookAuth\": \"hmac\"}}, \"routing\": {\"fact\": \"oncall\", \"situation\": \"agent\"}}. Providers: webhook, twilio, telegram, signal. Credentials come from the environment only \u2014 see the Environment table in the README.",
   "checks": [
-    { "//": "═══ FLEET HEALTH — enabled by default. These need no crop-specific tuning and catch the failures that make every other check blind. ═══" },
-
     {
-      "//": "Devices that stopped reporting. The one check a purely event-driven engine cannot do — you cannot trigger on a message that never arrived.",
+      "//": "\u2550\u2550\u2550 FLEET HEALTH \u2014 enabled by default. These need no crop-specific tuning and catch the failures that make every other check blind. \u2550\u2550\u2550"
+    },
+    {
+      "//": "Devices that stopped reporting. The one check a purely event-driven engine cannot do \u2014 you cannot trigger on a message that never arrived.",
       "rule": "device-silent",
       "enabled": true,
-      "params": { "silentMinutes": 180, "inventoryHours": 168, "minUplinks": 5 }
+      "params": {
+        "silentMinutes": 180,
+        "inventoryHours": 168,
+        "minUplinks": 5
+      }
     },
     {
       "//": "Nearly every device category in the vocabulary reports battery, so this one entry covers most of a fleet. power.voltage catches mains- and analog-powered nodes.",
       "rule": "battery-low",
       "enabled": true,
       "params": {
-        "paths": ["battery", "power.voltage"],
-        "raiseAtVolts": 3.4, "clearAtVolts": 3.55, "criticalAtVolts": 3.2, "lookbackHours": 24
+        "paths": [
+          "battery",
+          "power.voltage"
+        ],
+        "raiseAtVolts": 3.4,
+        "clearAtVolts": 3.55,
+        "criticalAtVolts": 3.2,
+        "lookbackHours": 24
       }
     },
     {
-      "//": "Uplinks arriving but nothing decodes — a missing or broken payload codec. Silent under every other check because the radio link is healthy.",
+      "//": "Uplinks arriving but nothing decodes \u2014 a missing or broken payload codec. Silent under every other check because the radio link is healthy.",
       "rule": "decode-failure",
       "enabled": true,
-      "params": { "lookbackHours": 24, "minFailures": 5, "minFailureRatio": 0.5 }
+      "params": {
+        "lookbackHours": 24,
+        "minFailures": 5,
+        "minFailureRatio": 0.5
+      }
     },
     {
-      "//": "A field silently vanished from the codec output while uplinks keep decoding. Without this, every check on that field just stops matching the device and nothing fires — silence looks identical to health. Add one instance per measurement you actually depend on.",
+      "//": "A field silently vanished from the codec output while uplinks keep decoding. Without this, every check on that field just stops matching the device and nothing fires \u2014 silence looks identical to health. Add one instance per measurement you actually depend on.",
       "rule": "measurement-missing",
       "as": "soil-moisture-missing",
       "enabled": true,
-      "params": { "paths": ["soil.moisture"], "lookbackHours": 168, "recentHours": 12, "minRecentUplinks": 5, "minHistoricalSightings": 10 }
+      "params": {
+        "paths": [
+          "soil.moisture"
+        ],
+        "lookbackHours": 168,
+        "recentHours": 12,
+        "minRecentUplinks": 5,
+        "minHistoricalSightings": 10
+      }
     },
     {
-      "//": "Leading indicator of coverage loss — warns before a node goes silent. Tune to your gateway layout before enabling, or it will be noisy.",
+      "//": "Leading indicator of coverage loss \u2014 warns before a node goes silent. Tune to your gateway layout before enabling, or it will be noisy.",
       "rule": "signal-degraded",
       "enabled": false,
-      "params": { "lookbackHours": 72, "rssiThresholdDbm": -115, "snrThresholdDb": null, "minUplinks": 20 }
+      "params": {
+        "lookbackHours": 72,
+        "rssiThresholdDbm": -115,
+        "snrThresholdDb": null,
+        "minUplinks": 20
+      }
     },
-
-
-    { "//": "═══ NETWORK LAYER — faults that never appear in event_up ═══ Every check above reads decoded telemetry. These read the other tables ChirpStack's integration writes, and they catch devices that look perfectly healthy in event_up. Enabled by default: they need no crop- or site-specific tuning, and two of them keep working when the payload codec is broken." },
-
+    {
+      "//": "\u2550\u2550\u2550 NETWORK LAYER \u2014 faults that never appear in event_up \u2550\u2550\u2550 Every check above reads decoded telemetry. These read the other tables ChirpStack's integration writes, and they catch devices that look perfectly healthy in event_up. Enabled by default: they need no crop- or site-specific tuning, and two of them keep working when the payload codec is broken."
+    },
     {
       "//": "ChirpStack's own diagnosis, from event_log: codec failures, MIC errors, OTAA failures. The only check that reports what the network server explicitly recorded rather than inferring it. Filters on level (2 = ERROR) rather than a code allowlist, so a code added by a future ChirpStack version still reaches you with its own description. Code 7 is excluded because frame-counter retransmission is normal LoRaWAN behaviour that every healthy device logs.",
       "rule": "device-log-error",
       "enabled": true,
-      "params": { "lookbackHours": 24, "minLevel": 2, "minEvents": 3, "excludeCodes": ["7"] }
+      "params": {
+        "lookbackHours": 24,
+        "minLevel": 2,
+        "minEvents": 3,
+        "excludeCodes": [
+          "7"
+        ]
+      }
     },
     {
-      "//": "Battery percentage from the LoRaWAN MAC layer (DevStatusAns), not the payload codec. This is the check that still works when decoding is broken — exactly when a flat battery would otherwise go unnoticed, because every codec-based check has already gone quiet. Mains-powered nodes and devices reporting battery_level_unavailable are skipped rather than thresholded. Note the two-week window: status events arrive on the device profile's DevStatusReq interval, often daily or less.",
+      "//": "Battery percentage from the LoRaWAN MAC layer (DevStatusAns), not the payload codec. This is the check that still works when decoding is broken \u2014 exactly when a flat battery would otherwise go unnoticed, because every codec-based check has already gone quiet. Mains-powered nodes and devices reporting battery_level_unavailable are skipped rather than thresholded. Note the two-week window: status events arrive on the device profile's DevStatusReq interval, often daily or less.",
       "rule": "status-battery-low",
       "enabled": true,
-      "params": { "raiseAtPercent": 20, "clearAtPercent": 25, "criticalAtPercent": 10,
-                  "lookbackHours": 336, "ignoreExternalPower": true }
+      "params": {
+        "raiseAtPercent": 20,
+        "clearAtPercent": 25,
+        "criticalAtPercent": 10,
+        "lookbackHours": 336,
+        "ignoreExternalPower": true
+      }
     },
     {
-      "//": "Demodulation margin from DevStatusAns — how well the device can hear the GATEWAY. signal-degraded measures the opposite direction. Asymmetry is common, and a low margin breaks everything that needs a downlink: ADR cannot retune the device, confirmed uplinks never get acked, and actuator commands never arrive. An early warning for join-churn and downlink-unacked.",
+      "//": "Demodulation margin from DevStatusAns \u2014 how well the device can hear the GATEWAY. signal-degraded measures the opposite direction. Asymmetry is common, and a low margin breaks everything that needs a downlink: ADR cannot retune the device, confirmed uplinks never get acked, and actuator commands never arrive. An early warning for join-churn and downlink-unacked.",
       "rule": "status-margin-low",
       "enabled": true,
-      "params": { "minMarginDb": 5, "criticalMarginDb": 0, "lookbackHours": 336, "minReadings": 3 }
+      "params": {
+        "minMarginDb": 5,
+        "criticalMarginDb": 0,
+        "lookbackHours": 336,
+        "minReadings": 3
+      }
     },
     {
-      "//": "Repeated rejoins. Each one discards queued downlinks and resets ADR, so the device restarts at its slowest data rate. Judged on joins relative to uplinks as well as joins alone — a device that joins more often than it reports is effectively down, however few joins that is in absolute terms. Usually a power-cycling device, a failing downlink path, or a key mismatch after re-provisioning.",
+      "//": "Repeated rejoins. Each one discards queued downlinks and resets ADR, so the device restarts at its slowest data rate. Judged on joins relative to uplinks as well as joins alone \u2014 a device that joins more often than it reports is effectively down, however few joins that is in absolute terms. Usually a power-cycling device, a failing downlink path, or a key mismatch after re-provisioning.",
       "rule": "join-churn",
       "enabled": true,
-      "params": { "lookbackHours": 168, "maxJoins": 3, "maxJoinsPerUplinkRatio": 0.1,
-                  "minUplinksForRatio": 5 }
+      "params": {
+        "lookbackHours": 168,
+        "maxJoins": 3,
+        "maxJoinsPerUplinkRatio": 0.1,
+        "minUplinksForRatio": 5
+      }
     },
     {
-      "//": "Confirmed downlinks that were never acknowledged — a command you sent did not land. Silent in the telemetry: a valve that failed to open produces no anomalous reading, and a scheduler assuming success moves on. Disabled by default because event_ack only receives rows for CONFIRMED downlinks; enable it if you actuate anything.",
+      "//": "Confirmed downlinks that were never acknowledged \u2014 a command you sent did not land. Silent in the telemetry: a valve that failed to open produces no anomalous reading, and a scheduler assuming success moves on. Disabled by default because event_ack only receives rows for CONFIRMED downlinks; enable it if you actuate anything.",
       "rule": "downlink-unacked",
       "enabled": false,
-      "params": { "lookbackHours": 24, "minUnacked": 2, "minUnackedRatio": 0.5 }
+      "params": {
+        "lookbackHours": 24,
+        "minUnacked": 2,
+        "minUnackedRatio": 0.5
+      }
     },
-
-    { "//": "═══ FROST AND HEAT — temperature arrives at five different vocabulary paths depending on sensor type, so every entry lists all of them and uses whichever a device reports. ═══" },
-
+    {
+      "//": "\u2550\u2550\u2550 FROST AND HEAT \u2014 temperature arrives at five different vocabulary paths depending on sensor type, so every entry lists all of them and uses whichever a device reports. \u2550\u2550\u2550"
+    },
     {
       "//": "Current temperature approaching freezing.",
       "rule": "measurement-threshold",
@@ -96,8 +141,17 @@
       "enabled": false,
       "severity": "critical",
       "params": {
-        "paths": ["air.temperature", "temperature", "leaf.temperature", "soil.temperature"],
-        "min": 1.5, "max": null, "unit": "C", "clearMargin": 1, "lookbackHours": 6
+        "paths": [
+          "air.temperature",
+          "temperature",
+          "leaf.temperature",
+          "soil.temperature"
+        ],
+        "min": 1.5,
+        "max": null,
+        "unit": "C",
+        "clearMargin": 1,
+        "lookbackHours": 6
       }
     },
     {
@@ -107,8 +161,16 @@
       "enabled": false,
       "severity": "critical",
       "params": {
-        "paths": ["air.temperature", "temperature", "leaf.temperature"],
-        "direction": "min", "threshold": 0, "unit": "C", "lookbackHours": 12, "minSamples": 3
+        "paths": [
+          "air.temperature",
+          "temperature",
+          "leaf.temperature"
+        ],
+        "direction": "min",
+        "threshold": 0,
+        "unit": "C",
+        "lookbackHours": 12,
+        "minSamples": 3
       }
     },
     {
@@ -117,8 +179,16 @@
       "as": "heat-stress",
       "enabled": false,
       "params": {
-        "paths": ["air.temperature", "temperature", "leaf.temperature"],
-        "min": null, "max": 35, "unit": "C", "clearMargin": 2, "lookbackHours": 6
+        "paths": [
+          "air.temperature",
+          "temperature",
+          "leaf.temperature"
+        ],
+        "min": null,
+        "max": 35,
+        "unit": "C",
+        "clearMargin": 2,
+        "lookbackHours": 6
       }
     },
     {
@@ -127,42 +197,68 @@
       "as": "temperature-crash",
       "enabled": false,
       "params": {
-        "paths": ["air.temperature", "temperature"],
-        "direction": "falling", "maxRatePerHour": 3, "unit": "C", "lookbackHours": 4, "minSamples": 4, "minSpanHours": 1
+        "paths": [
+          "air.temperature",
+          "temperature"
+        ],
+        "direction": "falling",
+        "maxRatePerHour": 3,
+        "unit": "C",
+        "lookbackHours": 4,
+        "minSamples": 4,
+        "minSpanHours": 1
       }
     },
-
-    { "//": "═══ WIND — wind.speed is always m/s after normalization (knots × 0.514444). Point at a gust field if your station provides one; otherwise measurement-peak recovers the gust from the window. ═══" },
-
     {
-      "//": "Sustained wind — spray drift, vent closing. 12 m/s ≈ 27 mph.",
+      "//": "\u2550\u2550\u2550 WIND \u2014 wind.speed is always m/s after normalization (knots \u00d7 0.514444). Point at a gust field if your station provides one; otherwise measurement-peak recovers the gust from the window. \u2550\u2550\u2550"
+    },
+    {
+      "//": "Sustained wind \u2014 spray drift, vent closing. 12 m/s \u2248 27 mph.",
       "rule": "measurement-threshold",
       "as": "wind-advisory",
       "enabled": false,
       "params": {
-        "paths": ["wind.speed"],
-        "min": null, "max": 12, "unit": " m/s", "clearMargin": 3, "lookbackHours": 3
+        "paths": [
+          "wind.speed"
+        ],
+        "min": null,
+        "max": 12,
+        "unit": " m/s",
+        "clearMargin": 3,
+        "lookbackHours": 3
       }
     },
     {
-      "//": "Gusts. Catches a peak between uplinks that an averaged latest-reading check would miss entirely. 17 m/s ≈ 38 mph.",
+      "//": "Gusts. Catches a peak between uplinks that an averaged latest-reading check would miss entirely. 17 m/s \u2248 38 mph.",
       "rule": "measurement-peak",
       "as": "wind-gust",
       "enabled": false,
       "params": {
-        "paths": ["wind.speed"],
-        "direction": "max", "threshold": 17, "unit": " m/s", "lookbackHours": 3, "minSamples": 3
+        "paths": [
+          "wind.speed"
+        ],
+        "direction": "max",
+        "threshold": 17,
+        "unit": " m/s",
+        "lookbackHours": 3,
+        "minSamples": 3
       }
     },
     {
-      "//": "Damaging wind. 25 m/s ≈ 56 mph — secure equipment, expect structural damage.",
+      "//": "Damaging wind. 25 m/s \u2248 56 mph \u2014 secure equipment, expect structural damage.",
       "rule": "measurement-peak",
       "as": "wind-damaging",
       "enabled": false,
       "severity": "critical",
       "params": {
-        "paths": ["wind.speed"],
-        "direction": "max", "threshold": 25, "unit": " m/s", "lookbackHours": 6, "minSamples": 2
+        "paths": [
+          "wind.speed"
+        ],
+        "direction": "max",
+        "threshold": 25,
+        "unit": " m/s",
+        "lookbackHours": 6,
+        "minSamples": 2
       }
     },
     {
@@ -170,51 +266,83 @@
       "rule": "measurement-stuck",
       "as": "anemometer-stuck",
       "enabled": false,
-      "params": { "paths": ["wind.speed"], "lookbackHours": 24, "minSamples": 24, "decimals": 1, "maxDistinctValues": 1 }
+      "params": {
+        "paths": [
+          "wind.speed"
+        ],
+        "lookbackHours": 24,
+        "minSamples": 24,
+        "decimals": 1,
+        "maxDistinctValues": 1
+      }
     },
-
-    { "//": "═══ RAIN ═══" },
-
     {
-      "//": "Rainfall intensity — field access, erosion, spray windows.",
+      "//": "\u2550\u2550\u2550 RAIN \u2550\u2550\u2550"
+    },
+    {
+      "//": "Rainfall intensity \u2014 field access, erosion, spray windows.",
       "rule": "measurement-threshold",
       "as": "heavy-rain",
       "enabled": false,
       "params": {
-        "paths": ["rain.intensity"],
-        "min": null, "max": 20, "unit": " mm/h", "clearMargin": 5, "lookbackHours": 3
+        "paths": [
+          "rain.intensity"
+        ],
+        "min": null,
+        "max": 20,
+        "unit": " mm/h",
+        "clearMargin": 5,
+        "lookbackHours": 3
       }
     },
     {
-      "//": "Peak intensity anywhere in the window — a cloudburst between uplinks.",
+      "//": "Peak intensity anywhere in the window \u2014 a cloudburst between uplinks.",
       "rule": "measurement-peak",
       "as": "rain-burst",
       "enabled": false,
       "params": {
-        "paths": ["rain.intensity"],
-        "direction": "max", "threshold": 40, "unit": " mm/h", "lookbackHours": 6, "minSamples": 2
+        "paths": [
+          "rain.intensity"
+        ],
+        "direction": "max",
+        "threshold": 40,
+        "unit": " mm/h",
+        "lookbackHours": 6,
+        "minSamples": 2
       }
     },
-
-    { "//": "═══ SOIL AND IRRIGATION ═══" },
-
+    {
+      "//": "\u2550\u2550\u2550 SOIL AND IRRIGATION \u2550\u2550\u2550"
+    },
     {
       "rule": "measurement-threshold",
       "as": "soil-moisture-low",
       "enabled": false,
       "params": {
-        "paths": ["soil.moisture"],
-        "min": 15, "max": null, "unit": "%", "clearMargin": 2, "lookbackHours": 24
+        "paths": [
+          "soil.moisture"
+        ],
+        "min": 15,
+        "max": null,
+        "unit": "%",
+        "clearMargin": 2,
+        "lookbackHours": 24
       }
     },
     {
-      "//": "Waterlogging — root-zone oxygen loss after over-irrigation or heavy rain.",
+      "//": "Waterlogging \u2014 root-zone oxygen loss after over-irrigation or heavy rain.",
       "rule": "measurement-threshold",
       "as": "soil-waterlogged",
       "enabled": false,
       "params": {
-        "paths": ["soil.moisture"],
-        "min": null, "max": 45, "unit": "%", "clearMargin": 3, "lookbackHours": 12
+        "paths": [
+          "soil.moisture"
+        ],
+        "min": null,
+        "max": 45,
+        "unit": "%",
+        "clearMargin": 3,
+        "lookbackHours": 12
       }
     },
     {
@@ -223,8 +351,15 @@
       "as": "soil-drying-fast",
       "enabled": false,
       "params": {
-        "paths": ["soil.moisture"],
-        "direction": "falling", "maxRatePerHour": 4, "unit": "%", "lookbackHours": 6, "minSamples": 4, "minSpanHours": 2
+        "paths": [
+          "soil.moisture"
+        ],
+        "direction": "falling",
+        "maxRatePerHour": 4,
+        "unit": "%",
+        "lookbackHours": 6,
+        "minSamples": 4,
+        "minSpanHours": 2
       }
     },
     {
@@ -232,7 +367,15 @@
       "rule": "measurement-stuck",
       "as": "soil-probe-stuck",
       "enabled": false,
-      "params": { "paths": ["soil.moisture"], "lookbackHours": 24, "minSamples": 12, "decimals": 2, "maxDistinctValues": 1 }
+      "params": {
+        "paths": [
+          "soil.moisture"
+        ],
+        "lookbackHours": 24,
+        "minSamples": 12,
+        "decimals": 2,
+        "maxDistinctValues": 1
+      }
     },
     {
       "//": "Salinity. soil.ec is dS/m; above ~4 is a yield problem for most crops.",
@@ -240,8 +383,14 @@
       "as": "soil-salinity-high",
       "enabled": false,
       "params": {
-        "paths": ["soil.ec"],
-        "min": null, "max": 4, "unit": " dS/m", "clearMargin": 0.5, "lookbackHours": 24
+        "paths": [
+          "soil.ec"
+        ],
+        "min": null,
+        "max": 4,
+        "unit": " dS/m",
+        "clearMargin": 0.5,
+        "lookbackHours": 24
       }
     },
     {
@@ -249,20 +398,34 @@
       "as": "soil-ph-out-of-band",
       "enabled": false,
       "params": {
-        "paths": ["soil.pH"],
-        "min": 5.5, "max": 7.8, "unit": "", "clearMargin": 0.2, "lookbackHours": 48
+        "paths": [
+          "soil.pH"
+        ],
+        "min": 5.5,
+        "max": 7.8,
+        "unit": "",
+        "clearMargin": 0.2,
+        "lookbackHours": 48
       }
     },
-
-    { "//": "═══ TANK AND WATER LEVEL — level arrives as a percentage, a volume, a depth, or an ullage distance depending on the sensor. Order the candidates by what you prefer to threshold on. ═══" },
-
+    {
+      "//": "\u2550\u2550\u2550 TANK AND WATER LEVEL \u2014 level arrives as a percentage, a volume, a depth, or an ullage distance depending on the sensor. Order the candidates by what you prefer to threshold on. \u2550\u2550\u2550"
+    },
     {
       "rule": "measurement-threshold",
       "as": "tank-low",
       "enabled": false,
       "params": {
-        "paths": ["tank.level", "linear.position", "analog.ratio"],
-        "min": 20, "max": null, "unit": "%", "clearMargin": 5, "lookbackHours": 12
+        "paths": [
+          "tank.level",
+          "linear.position",
+          "analog.ratio"
+        ],
+        "min": 20,
+        "max": null,
+        "unit": "%",
+        "clearMargin": 5,
+        "lookbackHours": 12
       }
     },
     {
@@ -272,19 +435,38 @@
       "enabled": false,
       "severity": "critical",
       "params": {
-        "paths": ["tank.level", "water.level", "tank.volume"],
-        "direction": "falling", "maxRatePerHour": 8, "unit": "%", "lookbackHours": 6, "minSamples": 4, "minSpanHours": 1
+        "paths": [
+          "tank.level",
+          "water.level",
+          "tank.volume"
+        ],
+        "direction": "falling",
+        "maxRatePerHour": 8,
+        "unit": "%",
+        "lookbackHours": 6,
+        "minSamples": 4,
+        "minSpanHours": 1
       }
     },
     {
       "rule": "measurement-stuck",
       "as": "tank-sensor-stuck",
       "enabled": false,
-      "params": { "paths": ["tank.level", "tank.distance", "water.level"], "lookbackHours": 24, "minSamples": 12, "decimals": 1, "maxDistinctValues": 1 }
+      "params": {
+        "paths": [
+          "tank.level",
+          "tank.distance",
+          "water.level"
+        ],
+        "lookbackHours": 24,
+        "minSamples": 12,
+        "decimals": 1,
+        "maxDistinctValues": 1
+      }
     },
-
-    { "//": "═══ WATER METERING — counters need different treatment from instantaneous readings: 'unchanged' is normal most of the time. ═══" },
-
+    {
+      "//": "\u2550\u2550\u2550 WATER METERING \u2014 counters need different treatment from instantaneous readings: 'unchanged' is normal most of the time. \u2550\u2550\u2550"
+    },
     {
       "//": "Burst pipe, stuck float valve, trough left running. The total climbs steadily while every other check stays quiet.",
       "rule": "counter-spike",
@@ -292,18 +474,31 @@
       "enabled": false,
       "severity": "critical",
       "params": {
-        "paths": ["metering.water.total", "pulse.total"],
-        "maxRatePerHour": 500, "unit": "L", "lookbackHours": 3, "minSamples": 3, "minSpanHours": 0.5
+        "paths": [
+          "metering.water.total",
+          "pulse.total"
+        ],
+        "maxRatePerHour": 500,
+        "unit": "L",
+        "lookbackHours": 3,
+        "minSamples": 3,
+        "minSpanHours": 0.5
       }
     },
     {
-      "//": "No water used when it should have been — failed pump, closed valve, seized meter. Only enable on meters where consumption is genuinely expected in the window; never on rain.cumulative, where flat means dry weather.",
+      "//": "No water used when it should have been \u2014 failed pump, closed valve, seized meter. Only enable on meters where consumption is genuinely expected in the window; never on rain.cumulative, where flat means dry weather.",
       "rule": "counter-stalled",
       "as": "water-meter-stalled",
       "enabled": false,
       "params": {
-        "paths": ["metering.water.total", "pulse.total"],
-        "lookbackHours": 12, "minAdvance": 1, "minSamples": 4, "alertOnDecrease": true
+        "paths": [
+          "metering.water.total",
+          "pulse.total"
+        ],
+        "lookbackHours": 12,
+        "minAdvance": 1,
+        "minSamples": 4,
+        "alertOnDecrease": true
       }
     },
     {
@@ -311,18 +506,33 @@
       "as": "energy-spike",
       "enabled": false,
       "params": {
-        "paths": ["metering.energy.total"],
-        "maxRatePerHour": 5000, "unit": "Wh", "lookbackHours": 3, "minSamples": 3, "minSpanHours": 0.5
+        "paths": [
+          "metering.energy.total"
+        ],
+        "maxRatePerHour": 5000,
+        "unit": "Wh",
+        "lookbackHours": 3,
+        "minSamples": 3,
+        "minSpanHours": 0.5
       }
     },
-
-    { "//": "═══ WATER QUALITY — livestock troughs, ponds, hydroponic reservoirs. ═══" },
-
+    {
+      "//": "\u2550\u2550\u2550 WATER QUALITY \u2014 livestock troughs, ponds, hydroponic reservoirs. \u2550\u2550\u2550"
+    },
     {
       "rule": "measurement-threshold",
       "as": "water-ph-out-of-band",
       "enabled": false,
-      "params": { "paths": ["water.ph"], "min": 6.0, "max": 8.5, "unit": "", "clearMargin": 0.2, "lookbackHours": 12 }
+      "params": {
+        "paths": [
+          "water.ph"
+        ],
+        "min": 6.0,
+        "max": 8.5,
+        "unit": "",
+        "clearMargin": 0.2,
+        "lookbackHours": 12
+      }
     },
     {
       "//": "Dissolved oxygen below ~5 mg/L stresses fish and aerobic systems.",
@@ -330,75 +540,165 @@
       "as": "dissolved-oxygen-low",
       "enabled": false,
       "severity": "critical",
-      "params": { "paths": ["water.dissolvedOxygen"], "min": 5, "max": null, "unit": " mg/L", "clearMargin": 0.5, "lookbackHours": 6 }
+      "params": {
+        "paths": [
+          "water.dissolvedOxygen"
+        ],
+        "min": 5,
+        "max": null,
+        "unit": " mg/L",
+        "clearMargin": 0.5,
+        "lookbackHours": 6
+      }
     },
     {
       "rule": "measurement-threshold",
       "as": "water-turbidity-high",
       "enabled": false,
-      "params": { "paths": ["water.turbidity"], "min": null, "max": 50, "unit": " NTU", "clearMargin": 10, "lookbackHours": 12 }
+      "params": {
+        "paths": [
+          "water.turbidity"
+        ],
+        "min": null,
+        "max": 50,
+        "unit": " NTU",
+        "clearMargin": 10,
+        "lookbackHours": 12
+      }
     },
     {
-      "//": "water.ec is µS/cm here (soil.ec is dS/m — different units, same concept).",
+      "//": "water.ec is \u00b5S/cm here (soil.ec is dS/m \u2014 different units, same concept).",
       "rule": "measurement-threshold",
       "as": "water-ec-high",
       "enabled": false,
-      "params": { "paths": ["water.ec"], "min": null, "max": 2000, "unit": " µS/cm", "clearMargin": 100, "lookbackHours": 24 }
+      "params": {
+        "paths": [
+          "water.ec"
+        ],
+        "min": null,
+        "max": 2000,
+        "unit": " \u00b5S/cm",
+        "clearMargin": 100,
+        "lookbackHours": 24
+      }
     },
     {
       "rule": "measurement-threshold",
       "as": "water-temperature-high",
       "enabled": false,
       "params": {
-        "paths": ["water.temperature.current", "water.temperature.avg", "water.temperature.max"],
-        "min": null, "max": 25, "unit": "C", "clearMargin": 1, "lookbackHours": 12
+        "paths": [
+          "water.temperature.current",
+          "water.temperature.avg",
+          "water.temperature.max"
+        ],
+        "min": null,
+        "max": 25,
+        "unit": "C",
+        "clearMargin": 1,
+        "lookbackHours": 12
       }
     },
-
-    { "//": "═══ AIR QUALITY AND GREENHOUSE CLIMATE ═══" },
-
     {
-      "//": "CO2 too high — ventilation failure in a closed house, or a storage-room hazard.",
+      "//": "\u2550\u2550\u2550 AIR QUALITY AND GREENHOUSE CLIMATE \u2550\u2550\u2550"
+    },
+    {
+      "//": "CO2 too high \u2014 ventilation failure in a closed house, or a storage-room hazard.",
       "rule": "measurement-threshold",
       "as": "co2-high",
       "enabled": false,
-      "params": { "paths": ["air.co2"], "min": null, "max": 1500, "unit": " ppm", "clearMargin": 200, "lookbackHours": 6 }
+      "params": {
+        "paths": [
+          "air.co2"
+        ],
+        "min": null,
+        "max": 1500,
+        "unit": " ppm",
+        "clearMargin": 200,
+        "lookbackHours": 6
+      }
     },
     {
-      "//": "CO2 too low — enrichment system has stopped in a greenhouse running above ambient.",
+      "//": "CO2 too low \u2014 enrichment system has stopped in a greenhouse running above ambient.",
       "rule": "measurement-threshold",
       "as": "co2-enrichment-failed",
       "enabled": false,
-      "params": { "paths": ["air.co2"], "min": 600, "max": null, "unit": " ppm", "clearMargin": 100, "lookbackHours": 6 }
+      "params": {
+        "paths": [
+          "air.co2"
+        ],
+        "min": 600,
+        "max": null,
+        "unit": " ppm",
+        "clearMargin": 100,
+        "lookbackHours": 6
+      }
     },
     {
       "//": "High humidity drives fungal disease pressure in a closed house.",
       "rule": "measurement-threshold",
       "as": "humidity-high",
       "enabled": false,
-      "params": { "paths": ["air.relativeHumidity"], "min": null, "max": 85, "unit": "%", "clearMargin": 5, "lookbackHours": 6 }
+      "params": {
+        "paths": [
+          "air.relativeHumidity"
+        ],
+        "min": null,
+        "max": 85,
+        "unit": "%",
+        "clearMargin": 5,
+        "lookbackHours": 6
+      }
     },
     {
       "rule": "measurement-threshold",
       "as": "particulate-high",
       "enabled": false,
-      "params": { "paths": ["air.pm2_5", "air.pm10"], "min": null, "max": 55, "unit": " µg/m³", "clearMargin": 10, "lookbackHours": 6 }
+      "params": {
+        "paths": [
+          "air.pm2_5",
+          "air.pm10"
+        ],
+        "min": null,
+        "max": 55,
+        "unit": " \u00b5g/m\u00b3",
+        "clearMargin": 10,
+        "lookbackHours": 6
+      }
     },
     {
       "rule": "measurement-threshold",
       "as": "tvoc-high",
       "enabled": false,
-      "params": { "paths": ["air.tvoc"], "min": null, "max": 1000, "unit": " ppb", "clearMargin": 200, "lookbackHours": 6 }
+      "params": {
+        "paths": [
+          "air.tvoc"
+        ],
+        "min": null,
+        "max": 1000,
+        "unit": " ppb",
+        "clearMargin": 200,
+        "lookbackHours": 6
+      }
     },
-
-    { "//": "═══ PLANT AND DISEASE ═══" },
-
+    {
+      "//": "\u2550\u2550\u2550 PLANT AND DISEASE \u2550\u2550\u2550"
+    },
     {
       "//": "Prolonged leaf wetness is the primary driver of fungal infection periods. Threshold plus duration is the real model; this is the threshold half.",
       "rule": "measurement-threshold",
       "as": "leaf-wetness-high",
       "enabled": false,
-      "params": { "paths": ["leaf.wetness"], "min": null, "max": 80, "unit": "%", "clearMargin": 10, "lookbackHours": 12 }
+      "params": {
+        "paths": [
+          "leaf.wetness"
+        ],
+        "min": null,
+        "max": 80,
+        "unit": "%",
+        "clearMargin": 10,
+        "lookbackHours": 12
+      }
     },
     {
       "//": "Trunk diameter contracting faster than normal indicates water stress.",
@@ -406,28 +706,51 @@
       "as": "dendrometer-shrinking",
       "enabled": false,
       "params": {
-        "paths": ["plant.dendrometer"],
-        "direction": "falling", "maxRatePerHour": 20, "unit": "µm", "lookbackHours": 12, "minSamples": 6, "minSpanHours": 4
+        "paths": [
+          "plant.dendrometer"
+        ],
+        "direction": "falling",
+        "maxRatePerHour": 20,
+        "unit": "\u00b5m",
+        "lookbackHours": 12,
+        "minSamples": 6,
+        "minSpanHours": 4
       }
     },
     {
-      "//": "Sap flow collapsing during daylight means the plant has closed down — severe water stress or root damage.",
+      "//": "Sap flow collapsing during daylight means the plant has closed down \u2014 severe water stress or root damage.",
       "rule": "measurement-threshold",
       "as": "sap-flow-low",
       "enabled": false,
-      "params": { "paths": ["plant.sapFlow"], "min": 5, "max": null, "unit": " g/h", "clearMargin": 2, "lookbackHours": 6 }
+      "params": {
+        "paths": [
+          "plant.sapFlow"
+        ],
+        "min": 5,
+        "max": null,
+        "unit": " g/h",
+        "clearMargin": 2,
+        "lookbackHours": 6
+      }
     },
-
-    { "//": "═══ EQUIPMENT HEALTH ═══" },
-
+    {
+      "//": "\u2550\u2550\u2550 EQUIPMENT HEALTH \u2550\u2550\u2550"
+    },
     {
       "//": "Pump and motor bearing wear shows up in velocity RMS long before failure.",
       "rule": "measurement-threshold",
       "as": "pump-vibration-high",
       "enabled": false,
       "params": {
-        "paths": ["vibration.velocityRms", "vibration.accelerationRms"],
-        "min": null, "max": 7.1, "unit": " mm/s", "clearMargin": 1, "lookbackHours": 12
+        "paths": [
+          "vibration.velocityRms",
+          "vibration.accelerationRms"
+        ],
+        "min": null,
+        "max": 7.1,
+        "unit": " mm/s",
+        "clearMargin": 1,
+        "lookbackHours": 12
       }
     },
     {
@@ -435,74 +758,164 @@
       "rule": "measurement-threshold",
       "as": "tilt-excessive",
       "enabled": false,
-      "params": { "paths": ["tilt.angle"], "min": null, "max": 15, "unit": "°", "clearMargin": 3, "lookbackHours": 12 }
+      "params": {
+        "paths": [
+          "tilt.angle"
+        ],
+        "min": null,
+        "max": 15,
+        "unit": "\u00b0",
+        "clearMargin": 3,
+        "lookbackHours": 12
+      }
     },
     {
-      "//": "Machine hour meter not advancing during a shift — equipment down or the meter failed.",
+      "//": "Machine hour meter not advancing during a shift \u2014 equipment down or the meter failed.",
       "rule": "counter-stalled",
       "as": "runtime-stalled",
       "enabled": false,
-      "params": { "paths": ["device.runtime"], "lookbackHours": 12, "minAdvance": 600, "minSamples": 4, "alertOnDecrease": true }
+      "params": {
+        "paths": [
+          "device.runtime"
+        ],
+        "lookbackHours": 12,
+        "minAdvance": 600,
+        "minSamples": 4,
+        "alertOnDecrease": true
+      }
     },
     {
       "//": "Mains voltage sag or a failing inverter.",
       "rule": "measurement-threshold",
       "as": "supply-voltage-out-of-band",
       "enabled": false,
-      "params": { "paths": ["power.voltage"], "min": 210, "max": 250, "unit": "V", "clearMargin": 5, "lookbackHours": 6 }
+      "params": {
+        "paths": [
+          "power.voltage"
+        ],
+        "min": 210,
+        "max": 250,
+        "unit": "V",
+        "clearMargin": 5,
+        "lookbackHours": 6
+      }
     },
-
-    { "//": "═══ BOOLEAN ALARMS — flags rather than numbers. Each resolves when the flag reads false again. ═══" },
-
+    {
+      "//": "\u2550\u2550\u2550 BOOLEAN ALARMS \u2014 flags rather than numbers. Each resolves when the flag reads false again. \u2550\u2550\u2550"
+    },
     {
       "rule": "boolean-alarm",
       "as": "water-leak",
       "enabled": false,
       "severity": "critical",
-      "params": { "paths": ["water.leak"], "trueValues": ["true", "1", "detected", "wet"], "lookbackHours": 24, "label": "water leak detected" }
+      "params": {
+        "paths": [
+          "water.leak"
+        ],
+        "trueValues": [
+          "true",
+          "1",
+          "detected",
+          "wet"
+        ],
+        "lookbackHours": 24,
+        "label": "water leak detected"
+      }
     },
     {
       "rule": "boolean-alarm",
       "as": "gas-alarm",
       "enabled": false,
       "severity": "critical",
-      "params": { "paths": ["air.gasAlarm"], "trueValues": ["true", "1", "alarm"], "lookbackHours": 24, "label": "gas alarm" }
+      "params": {
+        "paths": [
+          "air.gasAlarm"
+        ],
+        "trueValues": [
+          "true",
+          "1",
+          "alarm"
+        ],
+        "lookbackHours": 24,
+        "label": "gas alarm"
+      }
     },
     {
       "rule": "boolean-alarm",
       "as": "smoke-alarm",
       "enabled": false,
       "severity": "critical",
-      "params": { "paths": ["action.smoke.detected"], "trueValues": ["true", "1"], "lookbackHours": 24, "label": "smoke detected" }
+      "params": {
+        "paths": [
+          "action.smoke.detected"
+        ],
+        "trueValues": [
+          "true",
+          "1"
+        ],
+        "lookbackHours": 24,
+        "label": "smoke detected"
+      }
     },
     {
       "//": "A gate, hatch, or grain-bin lid left open. action.contactState is the enum open|closed.",
       "rule": "boolean-alarm",
       "as": "contact-open",
       "enabled": false,
-      "params": { "paths": ["action.contactState"], "trueValues": ["open"], "lookbackHours": 24, "label": "left open" }
+      "params": {
+        "paths": [
+          "action.contactState"
+        ],
+        "trueValues": [
+          "open"
+        ],
+        "lookbackHours": 24,
+        "label": "left open"
+      }
     },
     {
       "rule": "boolean-alarm",
       "as": "intrusion",
       "enabled": false,
-      "params": { "paths": ["action.motion.detected", "action.occupancy.occupied"], "trueValues": ["true", "1"], "lookbackHours": 6, "label": "motion detected" }
+      "params": {
+        "paths": [
+          "action.motion.detected",
+          "action.occupancy.occupied"
+        ],
+        "trueValues": [
+          "true",
+          "1"
+        ],
+        "lookbackHours": 6,
+        "label": "motion detected"
+      }
     },
-
-    { "//": "═══ ASSET TRACKING ═══" },
-
     {
-      "//": "Box fence: replace the bounds with your property corners. Use shape 'radius' with a tight radiusMetres for a fixed asset that should never move — that is a theft alarm.",
+      "//": "\u2550\u2550\u2550 ASSET TRACKING \u2550\u2550\u2550"
+    },
+    {
+      "//": "Box fence: replace the bounds with your property corners. Use shape 'radius' with a tight radiusMetres for a fixed asset that should never move \u2014 that is a theft alarm.",
       "rule": "geofence-breach",
       "as": "asset-left-property",
       "enabled": false,
       "severity": "critical",
       "params": {
-        "latPaths": ["position.latitude"], "lonPaths": ["position.longitude"],
+        "latPaths": [
+          "position.latitude"
+        ],
+        "lonPaths": [
+          "position.longitude"
+        ],
         "shape": "box",
-        "north": 41.9, "south": 41.8, "east": -93.5, "west": -93.7,
-        "centerLat": null, "centerLon": null, "radiusMetres": null,
-        "clearMargin": 0.0005, "lookbackHours": 24
+        "north": 41.9,
+        "south": 41.8,
+        "east": -93.5,
+        "west": -93.7,
+        "centerLat": null,
+        "centerLon": null,
+        "radiusMetres": null,
+        "clearMargin": 0.0005,
+        "lookbackHours": 24
       }
     }
   ]

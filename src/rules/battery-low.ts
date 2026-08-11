@@ -30,6 +30,10 @@ const rule: Rule = {
     'Covers most of a fleet from one entry, since nearly every device category ' +
     'reports battery.',
   defaultSeverity: 'warning',
+  /** The summary carries the voltage and the threshold. Nothing to interpret: replace the
+   *  cell.
+   */
+  defaultRouting: 'fact',
   defaultParams: {
     /**
      * Candidate paths, in priority order. `battery` is the vocabulary's standard

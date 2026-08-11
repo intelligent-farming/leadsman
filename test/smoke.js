@@ -59,12 +59,6 @@ test('parseConfig requires a checks array', () => {
   assert.throws(() => parseConfig({ checks: {} }), ConfigError);
 });
 
-test('parseConfig rejects an invalid webhook URL', () => {
-  assert.throws(
-    () => parseConfig({ checks: [], notify: { webhookUrl: 'not-a-url' } }),
-    ConfigError,
-  );
-});
 
 test('every bundled check loads and satisfies the Rule contract', () => {
   const rules = loadRules();
@@ -529,17 +523,6 @@ test('parseConfig rejects a non-positive statementTimeoutMs', () => {
   assert.throws(() => parseConfig({ statementTimeoutMs: -1, checks: [] }), ConfigError);
 });
 
-test('parseConfig reads the webhook token from the environment, never the file', () => {
-  const prev = process.env.LEADSMAN_WEBHOOK_TOKEN;
-  process.env.LEADSMAN_WEBHOOK_TOKEN = 'from-env';
-  try {
-    const cfg = parseConfig({ checks: [], notify: { webhookUrl: 'https://example.test/h' } });
-    assert.equal(cfg.notify.webhookToken, 'from-env');
-  } finally {
-    if (prev === undefined) delete process.env.LEADSMAN_WEBHOOK_TOKEN;
-    else process.env.LEADSMAN_WEBHOOK_TOKEN = prev;
-  }
-});
 
 // ── notify: environment overrides ─────────────────────────────────────────────
 // Where alerts go is a property of the host, so an orchestrator must be able to set it
@@ -565,78 +548,12 @@ function withEnv(vars, fn) {
   }
 }
 
-test('LEADSMAN_WEBHOOK_URL creates the notify block when the file has none', () => {
-  withEnv({ LEADSMAN_WEBHOOK_URL: 'https://from-env.test/hook' }, () => {
-    const cfg = parseConfig({ checks: [] });
-    assert.equal(cfg.notify.webhookUrl, 'https://from-env.test/hook');
-    // Default auth is unchanged by the env path.
-    assert.equal(cfg.notify.webhookAuth, 'bearer');
-  });
-});
 
-test('LEADSMAN_WEBHOOK_URL wins over the config file', () => {
-  withEnv({ LEADSMAN_WEBHOOK_URL: 'https://env.test/hook' }, () => {
-    const cfg = parseConfig({
-      checks: [],
-      notify: { webhookUrl: 'https://file.test/hook', webhookAuth: 'hmac' },
-    });
-    assert.equal(cfg.notify.webhookUrl, 'https://env.test/hook');
-    // Only the URL was overridden — the file's auth mode survives.
-    assert.equal(cfg.notify.webhookAuth, 'hmac');
-  });
-});
 
-test('an empty LEADSMAN_WEBHOOK_URL is unset, not a value', () => {
-  withEnv({ LEADSMAN_WEBHOOK_URL: '' }, () => {
-    // No notify block in the file either — the empty var must not conjure one.
-    const bare = parseConfig({ checks: [] });
-    assert.equal(bare.notify, undefined);
-    // And it must not clobber a URL the file did set.
-    const cfg = parseConfig({ checks: [], notify: { webhookUrl: 'https://file.test/h' } });
-    assert.equal(cfg.notify.webhookUrl, 'https://file.test/h');
-  });
-});
 
-test('whitespace-only webhook env vars are treated as unset', () => {
-  withEnv({ LEADSMAN_WEBHOOK_URL: '   ', LEADSMAN_WEBHOOK_TOKEN: '  ' }, () => {
-    const cfg = parseConfig({ checks: [], notify: { webhookUrl: 'https://file.test/h' } });
-    assert.equal(cfg.notify.webhookUrl, 'https://file.test/h');
-    assert.equal(cfg.notify.webhookToken, null);
-  });
-});
 
-test('LEADSMAN_WEBHOOK_AUTH overrides the auth mode, and is validated', () => {
-  withEnv({ LEADSMAN_WEBHOOK_AUTH: 'hmac' }, () => {
-    const cfg = parseConfig({ checks: [], notify: { webhookUrl: 'https://x.test/h' } });
-    assert.equal(cfg.notify.webhookAuth, 'hmac');
-  });
-  withEnv({ LEADSMAN_WEBHOOK_AUTH: 'basic' }, () => {
-    assert.throws(
-      () => parseConfig({ checks: [], notify: { webhookUrl: 'https://x.test/h' } }),
-      // The message must name the env var, not a config path the operator never edited.
-      (err) => err instanceof ConfigError && /LEADSMAN_WEBHOOK_AUTH/.test(err.message),
-    );
-  });
-});
 
-test('an invalid LEADSMAN_WEBHOOK_URL blames the env var, not the file', () => {
-  withEnv({ LEADSMAN_WEBHOOK_URL: 'not-a-url' }, () => {
-    assert.throws(
-      () => parseConfig({ checks: [] }),
-      (err) => err instanceof ConfigError && /LEADSMAN_WEBHOOK_URL/.test(err.message),
-    );
-  });
-});
 
-test('LEADSMAN_WEBHOOK_TOKEN_HEADER overrides the header for token auth', () => {
-  withEnv({ LEADSMAN_WEBHOOK_TOKEN_HEADER: 'x-gitlab-token' }, () => {
-    const cfg = parseConfig({
-      checks: [],
-      notify: { webhookUrl: 'https://x.test/h', webhookAuth: 'token' },
-    });
-    assert.equal(cfg.notify.webhookTokenHeader, 'x-gitlab-token');
-  });
-});
 
 test('the Makerfabs config parses and references only real rules and params', () => {
   const rules = loadRules();
@@ -649,4 +566,207 @@ test('the Makerfabs config parses and references only real rules and params', ()
       assert.ok(key in rule.defaultParams, `unknown param "${key}" on "${check.rule}"`);
     }
   }
+});
+
+// ── notify routing (fact / situation) ─────────────────────────────────────────
+// The point of routing is that the expensive destination stays small. These pin the
+// precedence chain, and that a misconfiguration is refused at parse time rather than
+// discovered as silence.
+
+const { resolveDestination } = require('../dist/notify');
+
+const DESTS = {
+  destinations: {
+    sms: { webhookUrl: 'https://sms.test/h' },
+    agent: { webhookUrl: 'https://agent.test/h' },
+  },
+  routing: { fact: 'sms', situation: 'agent' },
+};
+
+test('routing sends facts and situations to different destinations', () => {
+  const fact = resolveDestination({ severity: 'warning' }, { routing: 'fact' }, DESTS);
+  const sit = resolveDestination({ severity: 'warning' }, { routing: 'situation' }, DESTS);
+  assert.equal(fact, 'sms');
+  assert.equal(sit, 'agent');
+});
+
+test('a check notifyTo beats the rule class', () => {
+  // The whole reason notifyTo exists: measurement-threshold is a 'fact' rule, but THIS
+  // instance of it is pipe-pressure-low, which wants correlating.
+  const d = resolveDestination(
+    { severity: 'critical' },
+    { routing: 'fact', notifyTo: 'agent' },
+    DESTS,
+  );
+  assert.equal(d, 'agent');
+});
+
+test('bySeverity beats the rule class but loses to notifyTo', () => {
+  const cfg = { ...DESTS, bySeverity: { critical: 'agent' } };
+  // critical fact -> escalated by severity
+  assert.equal(resolveDestination({ severity: 'critical' }, { routing: 'fact' }, cfg), 'agent');
+  // warning fact -> untouched by the severity map
+  assert.equal(resolveDestination({ severity: 'warning' }, { routing: 'fact' }, cfg), 'sms');
+  // an explicit notifyTo still wins over the severity map
+  assert.equal(
+    resolveDestination({ severity: 'critical' }, { routing: 'situation', notifyTo: 'sms' }, cfg),
+    'sms',
+  );
+});
+
+test('an explicit null in the chain means record-only, and stops the chain', () => {
+  // Silencing the noisy half without losing it: facts are recorded, never pushed.
+  const cfg = { ...DESTS, routing: { fact: null, situation: 'agent' }, defaultDestination: 'sms' };
+  assert.equal(resolveDestination({ severity: 'warning' }, { routing: 'fact' }, cfg), null);
+  // The null must NOT fall through to defaultDestination — that would defeat the silencing.
+  assert.equal(resolveDestination({ severity: 'warning' }, { routing: 'situation' }, cfg), 'agent');
+});
+
+test('an unroutable alert falls back to defaultDestination, else record-only', () => {
+  const withDefault = { destinations: DESTS.destinations, defaultDestination: 'sms' };
+  assert.equal(resolveDestination({ severity: 'info' }, undefined, withDefault), 'sms');
+  const bare = { destinations: DESTS.destinations };
+  assert.equal(resolveDestination({ severity: 'info' }, undefined, bare), null);
+});
+
+test('every rule declares a routing class, and situations stay a small set', () => {
+  const rules = loadRules();
+  const situations = [];
+  for (const [id, rule] of rules) {
+    assert.ok(
+      rule.defaultRouting === 'fact' || rule.defaultRouting === 'situation',
+      `${id} has no valid defaultRouting`,
+    );
+    if (rule.defaultRouting === 'situation') situations.push(id);
+  }
+  // A guard against drift: every rule moved into 'situation' costs tokens on every fire,
+  // so growing this set should be a deliberate act that updates this test.
+  assert.deepEqual(situations.sort(), ['device-silent', 'geofence-breach', 'join-churn']);
+});
+
+test('the generic measurement rules default to fact, not situation', () => {
+  const rules = loadRules();
+  // These serve many meanings at once, so they cannot know they are a situation. Defaulting
+  // them to 'situation' would send every threshold alert to an LLM.
+  for (const id of [
+    'measurement-threshold', 'measurement-peak', 'measurement-rate',
+    'measurement-stuck', 'measurement-missing', 'counter-spike', 'counter-stalled',
+  ]) {
+    assert.equal(rules.get(id).defaultRouting, 'fact', `${id} should default to fact`);
+  }
+});
+
+test('parseConfig rejects routing to a destination that does not exist', () => {
+  assert.throws(
+    () => parseConfig({
+      checks: [],
+      notify: { destinations: { sms: { webhookUrl: 'https://a.test/h' } }, routing: { fact: 'nope' } },
+    }),
+    (err) => err instanceof ConfigError && /not in notify.destinations/.test(err.message),
+  );
+});
+
+test('parseConfig rejects a check notifyTo naming an unknown destination', () => {
+  assert.throws(
+    () => parseConfig({
+      checks: [{ rule: 'device-silent', notifyTo: 'ghost' }],
+      notify: { destinations: { sms: { webhookUrl: 'https://a.test/h' } }, routing: { fact: 'sms' } },
+    }),
+    (err) => err instanceof ConfigError && /notifyTo names destination "ghost"/.test(err.message),
+  );
+});
+
+
+test('parseConfig refuses destinations that nothing routes to', () => {
+  // Otherwise the operator gets silence and believes delivery is configured.
+  assert.throws(
+    () => parseConfig({
+      checks: [],
+      notify: { destinations: { sms: { webhookUrl: 'https://a.test/h' } } },
+    }),
+    (err) => err instanceof ConfigError && /nothing routes to it/.test(err.message),
+  );
+});
+
+test('per-destination secrets come from LEADSMAN_WEBHOOK_TOKEN_<NAME>', () => {
+  withEnv(
+    { LEADSMAN_WEBHOOK_TOKEN_AGENT: 'agent-secret', LEADSMAN_WEBHOOK_TOKEN: 'shared' },
+    () => {
+      const cfg = parseConfig({
+        checks: [],
+        notify: {
+          destinations: {
+            sms: { webhookUrl: 'https://a.test/h', webhookAuth: 'hmac' },
+            agent: { webhookUrl: 'https://b.test/h', webhookAuth: 'hmac' },
+          },
+          routing: { fact: 'sms', situation: 'agent' },
+        },
+      });
+      // Specific wins for agent; sms falls back to the shared secret.
+      assert.equal(cfg.notify.destinations.agent.webhookToken, 'agent-secret');
+      assert.equal(cfg.notify.destinations.sms.webhookToken, 'shared');
+    },
+  );
+});
+
+
+// ── notify shape: one way to configure delivery ───────────────────────────────
+// The single-URL form was removed because two ways to say the same thing meant one could be
+// set, look configured, and quietly lose. These pin the replacements for what it used to
+// validate, plus a clear error for anyone carrying an old config forward.
+
+test('a destination webhookUrl is still URL-validated', () => {
+  assert.throws(
+    () => parseConfig({
+      checks: [],
+      notify: { destinations: { hook: { webhookUrl: 'not-a-url' } }, routing: { fact: 'hook' } },
+    }),
+    (err) => err instanceof ConfigError && /is not a valid URL/.test(err.message),
+  );
+});
+
+test('notify without destinations is refused, and says what to write instead', () => {
+  // The message has to carry a usable example: there is no longer an obvious minimal form,
+  // so "destinations is required" on its own would leave the operator guessing.
+  assert.throws(
+    () => parseConfig({ checks: [], notify: { timeoutMs: 1000 } }),
+    (err) =>
+      err instanceof ConfigError &&
+      /destinations is required/.test(err.message) &&
+      /"provider": "twilio"/.test(err.message) &&
+      /Omit `notify` entirely/.test(err.message),
+  );
+});
+
+test('a top-level webhookUrl points at where it moved to', () => {
+  for (const dead of ['webhookUrl', 'webhookAuth', 'webhookTokenHeader']) {
+    try {
+      parseConfig({ checks: [], notify: { [dead]: 'x', destinations: {} } });
+      assert.fail(`expected ${dead} to be refused`);
+    } catch (e) {
+      assert.ok(e instanceof ConfigError);
+      assert.match(e.message, new RegExp(`notify\\.${dead} is no longer supported`));
+      assert.match(e.message, /notify\.destinations\.<name>/);
+    }
+  }
+});
+
+test('notifyTo with no notify block at all is refused', () => {
+  assert.throws(
+    () => parseConfig({ checks: [{ rule: 'device-silent', notifyTo: 'agent' }] }),
+    (err) => err instanceof ConfigError && /there is no notify block/.test(err.message),
+  );
+});
+
+test('omitting notify entirely is valid and means record-only', () => {
+  // The default posture for a fresh install: alerts accumulate, nothing is pushed.
+  const cfg = parseConfig({ checks: [{ rule: 'device-silent' }] });
+  assert.equal(cfg.notify, undefined);
+});
+
+test('an empty destinations map is refused', () => {
+  assert.throws(
+    () => parseConfig({ checks: [], notify: { destinations: {} } }),
+    (err) => err instanceof ConfigError && /destinations is empty/.test(err.message),
+  );
 });

@@ -38,6 +38,9 @@ const rule: Rule = {
     'leak, gas, smoke, motion, switch, occupancy, button, or an open contact. ' +
     'Resolves when the flag reads false again.',
   defaultSeverity: 'critical',
+  /** A device asserted its own alarm flag. The device has already done the interpreting.
+   */
+  defaultRouting: 'fact',
   defaultParams: {
     /** Priority-ordered candidate vocabulary paths holding the flag. */
     paths: ['water.leak'],

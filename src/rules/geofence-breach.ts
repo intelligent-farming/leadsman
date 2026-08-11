@@ -49,6 +49,10 @@ const rule: Rule = {
     'radius from a centre point. Use for implements, generators, trailers, and ' +
     'livestock collars.',
   defaultSeverity: 'critical',
+  /** An asset left its boundary. Whether that is theft, a legitimate move, or GPS drift
+   *  depends on context this check cannot see.
+   */
+  defaultRouting: 'situation',
   defaultParams: {
     /** Candidate paths for latitude and longitude. */
     latPaths: ['position.latitude'],

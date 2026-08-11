@@ -53,6 +53,9 @@ const rule: Rule = {
     'is below threshold. Independent of the payload codec, so it still reports on a ' +
     'device whose decoding is broken — the companion to decode-failure.',
   defaultSeverity: 'warning',
+  /** Same, as a MAC-layer percentage.
+   */
+  defaultRouting: 'fact',
   defaultParams: {
     /** Raise at or below this percentage. */
     raiseAtPercent: 20,

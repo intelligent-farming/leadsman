@@ -34,6 +34,9 @@ const rule: Rule = {
     'limit — a burst pipe, stuck valve, or equipment left running. Catches sustained ' +
     'consumption that every threshold check ignores.',
   defaultSeverity: 'critical',
+  /** Generic: a counter advancing faster than a limit.
+   */
+  defaultRouting: 'fact',
   defaultParams: {
     /** Priority-ordered candidate vocabulary paths holding the total. */
     paths: ['metering.water.total', 'pulse.total'],

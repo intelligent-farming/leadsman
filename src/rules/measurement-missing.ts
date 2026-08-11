@@ -38,6 +38,10 @@ const rule: Rule = {
     'while still sending decodable uplinks — usually a codec or device-profile change. ' +
     'Catches the case where checks on that field go silently blind.',
   defaultSeverity: 'warning',
+  /** A field that used to decode and stopped. The cause is nearly always the device
+   *  profile's codec, so the action is known.
+   */
+  defaultRouting: 'fact',
   defaultParams: {
     /** Candidate vocabulary paths the device is expected to keep reporting. */
     paths: ['soil.moisture'],

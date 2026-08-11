@@ -38,6 +38,10 @@ const rule: Rule = {
     'object, meaning the device profile has a missing or broken payload codec. Silent ' +
     'under every other check, because the radio link is healthy.',
   defaultSeverity: 'warning',
+  /** Uplinks arriving, codec producing nothing. The fix is always the same: look at the
+   *  device profile's payload codec.
+   */
+  defaultRouting: 'fact',
   defaultParams: {
     /** Window to evaluate. */
     lookbackHours: 24,

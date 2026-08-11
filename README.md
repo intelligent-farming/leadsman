@@ -4,16 +4,17 @@ Scheduled rule engine over a ChirpStack event store. It runs a set of checks you
 select in a config file, and records deduplicated alerts in Postgres.
 
 Leadsman is the deterministic tier of a monitoring stack. It consumes no inference
-tokens, and it does not send messages: it decides *what is wrong* and writes that
-down. Delivery (SMS, webhook, an LLM agent for the cases that need interpretation)
-is a separate concern reached through one webhook.
+tokens: it decides *what is wrong*, records it, and routes each alert to one
+destination — a webhook, or an SMS/Telegram/Signal message. Alerts whose summary is
+already actionable go straight to a person; the few that need interpreting can go to
+an LLM agent instead. See [Delivery](#delivery).
 
 ```
 ChirpStack ──▶ events-postgres (event_up, event_join, …)
                      │  SELECT
                      ▼
-                 leadsman  ──▶ leadsman.alert  ──▶ notify.webhookUrl
-                 (cron)          (deduplicated)     (your sender / Hermes)
+                 leadsman  ──▶ leadsman.alert  ──▶ destinations
+                 (cron)          (deduplicated)     (SMS / Telegram / Signal / webhook)
 ```
 
 ## Why a scheduler rather than an MQTT consumer
@@ -65,15 +66,14 @@ and prints what it would raise.
 ## Configuration
 
 `config/leadsman.json` selects checks and sets their parameters. It holds no
-credentials — the database URL and webhook token come from the environment — so it
-is safe to commit and review in a diff.
+credentials — the database URL, webhook secrets and provider credentials all come from
+the environment — so it is safe to commit and review in a diff.
 
 ```json
 {
   "schedule": "*/15 * * * *",
   "timezone": "America/Chicago",
   "statementTimeoutMs": 15000,
-  "notify": { "webhookUrl": null },
   "checks": [
     { "rule": "device-silent", "params": { "silentMinutes": 180 } },
 
@@ -301,22 +301,87 @@ Migration 001 grants `SELECT` on the `leadsman` schema to the stack's existing
 `events-api/.postgraphilerc.js` exposes alerts over the existing read-only GraphQL
 endpoint with no new credentials.
 
-## Notification
+## Delivery
 
-Set `notify.webhookUrl` and Leadsman POSTs once per newly-raised alert, then stamps
-`notified_at`. A failed POST leaves the alert unstamped, so the next sounding retries
-it — there is no separate retry queue.
+Each newly-raised alert is POSTed or messaged exactly once, and `notified_at` is stamped
+on success. A failure leaves it unstamped so the next sounding retries it — there is no
+separate retry queue.
+
+Named **destinations** let one instance send different alerts to different places — an SMS to
+whoever is on call, a webhook to an agent for the handful that need interpreting. With no
+`notify` block at all, alerts are recorded and nothing is delivered.
 
 ```json
-{ "schema": "leadsman.alert/1", "id": "12", "rule": "battery-low",
-  "kind": "battery-low", "devEui": "a84041000181d9e2", "deviceName": "soil-north-01",
-  "severity": "critical", "summary": "soil-north-01 battery 3.2V (raise <=3.4V, clear >3.55V)",
-  "detail": { "value": 3.2, "raiseAtVolts": 3.4 }, "raisedAt": "2026-08-06T12:00:00Z" }
+{
+  "notify": {
+    "destinations": {
+      "oncall": { "provider": "twilio",   "to": ["+15125550123"] },
+      "crew":   { "provider": "telegram", "chatId": "-1001234567890" },
+      "agent":  { "webhookUrl": "http://localhost:8644/hermes/agent", "webhookAuth": "hmac" }
+    },
+    "routing": { "fact": "oncall", "situation": "agent" },
+    "defaultDestination": "oncall"
+  }
+}
 ```
 
-Point it at your own sender, or at a Hermes webhook route. For routine threshold
-alerts use a route with `deliver_only: true` — no model is invoked. Reserve
-agent-invoking routes for alerts that genuinely need interpretation.
+No credentials appear here — they come from the environment, so this file stays committable.
+
+| Provider | Transport | Needs |
+|---|---|---|
+| `webhook` (default) | POST of the alert JSON, signed | `webhookUrl` |
+| `twilio` | SMS, one request per recipient | `to` + the three `LEADSMAN_TWILIO_*` vars |
+| `telegram` | Bot message | `chatId` + `LEADSMAN_TELEGRAM_BOT_TOKEN` |
+| `signal` | One request carrying all recipients | `to` + `LEADSMAN_SIGNAL_BASE_URL` / `_FROM` |
+
+Signal has no hosted send API, so `signal` talks to a [signal-cli-rest-api](https://github.com/bbernhard/signal-cli-rest-api) instance you run.
+
+Messaging providers send one line of text:
+
+```
+Leadsman [CRITICAL] pipe-pressure-low: pipe-dry pressure.gauge 4kPa is below min 20kPa
+```
+
+Use a webhook where the receiver wants structure, and a provider where a person is reading it
+on a phone.
+
+### Routing
+
+Which destination an alert goes to is decided by, highest precedence first:
+
+1. the check's `notifyTo` — this deployment says so explicitly
+2. `notify.bySeverity[severity]` — blanket escalation; use sparingly
+3. `notify.routing[class]` — the rule's own `fact` / `situation` classification
+4. `notify.defaultDestination`
+
+A `null` at any level means *record only*: the alert is stored and deliberately not sent, and
+the chain stops there rather than falling through.
+
+`fact` versus `situation` is not severity. Severity says how bad; the class says whether a
+reader has to work out what the alert means. `pipe-pressure-low` is critical but its summary
+already says what to do — that is a fact. `device-silent` is ambiguous alone, because one node
+is a dead node and six at once is the gateway; only combining it with other alerts answers
+that, which is what makes it worth an agent's tokens. Fifteen of the eighteen rules are facts.
+
+The generic rules (`measurement-threshold` and friends) serve many meanings at once, so they
+default to `fact` and you name the exceptions per check:
+
+```json
+{ "rule": "measurement-threshold", "as": "pipe-pressure-low", "notifyTo": "agent" }
+```
+
+### Changing platform without touching the config
+
+Every destination is overridable from the environment, which matters when the config file is
+mounted read-only or shared across installs:
+
+```sh
+LEADSMAN_DEST_ONCALL_PROVIDER=telegram
+LEADSMAN_DEST_ONCALL_CHAT_ID=-1001234567890
+```
+
+A destination whose provider has no credentials is rejected at **config** time, not on the
+first alert — otherwise the failure looks like a network fault at 3am.
 
 ## Writing a check
 
@@ -425,20 +490,28 @@ pattern as the stack's own `010_events_roles.sh`, so it can be dropped into
 | `LEADSMAN_MIGRATE_URL` | Owner-role URL, used by `migrate`. Falls back to the above |
 | `LEADSMAN_CONFIG` | Config path. Default `config/leadsman.json` |
 | `LEADSMAN_RULES_DIR` | Extra directory of operator-supplied checks |
-| `LEADSMAN_WEBHOOK_URL` | Overrides `notify.webhookUrl` |
-| `LEADSMAN_WEBHOOK_AUTH` | Overrides `notify.webhookAuth` — `hmac` \| `token` \| `bearer` |
 | `LEADSMAN_WEBHOOK_TOKEN` | The shared secret. Env only — never read from the config file |
-| `LEADSMAN_WEBHOOK_TOKEN_HEADER` | Overrides `notify.webhookTokenHeader` (`token` auth) |
+| `LEADSMAN_WEBHOOK_TOKEN_<NAME>` | Per-destination secret, e.g. `…_AGENT` for destination `agent`. Falls back to the shared one |
+| `LEADSMAN_TWILIO_ACCOUNT_SID` | Twilio account SID. All three Twilio vars must be set to use the provider |
+| `LEADSMAN_TWILIO_AUTH_TOKEN` | Twilio auth token |
+| `LEADSMAN_TWILIO_FROM` | Sending number or messaging-service sender |
+| `LEADSMAN_TELEGRAM_BOT_TOKEN` | Telegram bot token from @BotFather |
+| `LEADSMAN_SIGNAL_BASE_URL` | Your signal-cli-rest-api base URL — Signal has no hosted send API |
+| `LEADSMAN_SIGNAL_FROM` | Registered Signal sending number |
+| `LEADSMAN_DEST_<NAME>_PROVIDER` | Override one destination's platform: `webhook`\|`twilio`\|`telegram`\|`signal` |
+| `LEADSMAN_DEST_<NAME>_TO` | Override its recipients, comma-separated E.164 |
+| `LEADSMAN_DEST_<NAME>_CHAT_ID` | Override its Telegram chat id |
+| `LEADSMAN_DEST_<NAME>_WEBHOOK_URL` | Override its webhook URL |
 | `LEADSMAN_APPLY_EVENT_INDEXES` | `true` lets `migrate` apply migration 002 |
 | `LEADSMAN_LOG_LEVEL` | `debug` \| `info` \| `warn` \| `error`. Default `info` |
 | `LEADSMAN_LOG_FORMAT` | `json` \| `text`. Default `json` |
 
-The four `LEADSMAN_WEBHOOK_*` variables take precedence over the config file, so an
-orchestrator can point the engine at a receiver without rewriting a mounted config.
-That split is deliberate: the config file says *what* to watch and is identical across
-installs, while where alerts go is a property of the host. An **empty** variable counts
-as unset — a blank `LEADSMAN_WEBHOOK_URL=` in a `.env` file will not override a URL the
-config sets, and will not fail validation.
+Every `LEADSMAN_DEST_*` variable takes precedence over the config file, so an orchestrator
+can repoint a destination — or switch its platform entirely — without rewriting a mounted
+config. That split is deliberate: the config says *what* to watch and which class of alert
+goes where, and is identical across installs; the addresses and secrets are properties of the
+host. An **empty** variable counts as unset, so a blank `VAR=` in a `.env` never overrides
+what the config sets and never fails validation.
 
 ## Tests
 

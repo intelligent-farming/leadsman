@@ -34,6 +34,9 @@ const rule: Rule = {
     'the average slope across the window. Catches a bad trajectory (draining tank, ' +
     'plunging temperature, collapsing soil moisture) while the value is still in bounds.',
   defaultSeverity: 'warning',
+  /** Generic: a value changing faster than a limit.
+   */
+  defaultRouting: 'fact',
   defaultParams: {
     /** Priority-ordered candidate vocabulary paths. */
     paths: ['tank.level', 'water.level', 'tank.volume'],

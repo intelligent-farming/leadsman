@@ -50,6 +50,9 @@ const rule: Rule = {
     'sent never landed. Silent in the telemetry, because a valve that failed to open ' +
     'produces no anomalous reading. Only meaningful if you send confirmed downlinks.',
   defaultSeverity: 'critical',
+  /** Downlinks not being acknowledged. A count against a threshold.
+   */
+  defaultRouting: 'fact',
   defaultParams: {
     /** Window to examine. */
     lookbackHours: 24,
