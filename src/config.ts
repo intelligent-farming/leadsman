@@ -15,7 +15,8 @@
  *   LEADSMAN_DEST_<NAME>_WEBHOOK_URL  webhook target
  *   LEADSMAN_WEBHOOK_TOKEN_<NAME>     that destination's secret
  *   LEADSMAN_WEBHOOK_TOKEN            shared-secret fallback for all of them
- *   LEADSMAN_TWILIO_* / _TELEGRAM_* / _SIGNAL_*   provider credentials
+ *   LEADSMAN_TWILIO_*  ACCOUNT_SID + API_KEY_SID + API_KEY_SECRET + FROM
+ *   LEADSMAN_TELEGRAM_* / _SIGNAL_*               other provider credentials
  *
  * NAME is the destination name upper-cased with hyphens as underscores. Env wins over the
  * file, which is what keeps the config identical across installs and safe to commit: it
@@ -237,11 +238,19 @@ export function parseConfig(raw: unknown): LeadsmanConfig {
           }
           // A number without a country code silently fails to deliver at the carrier, which
           // looks like a Leadsman bug. Catch it here instead.
-          const bad = to.filter((n) => !/^\+[1-9]\d{6,15}$/.test(n));
+          //
+          // Signal additionally addresses groups by id rather than by number — signal-cli
+          // reports them as `group.<base64>` — so those are accepted for `signal` only.
+          // Twilio has no such concept, and letting one through there would produce a 21211
+          // at send time instead of a clear error here.
+          const isNumber = (n: string) => /^\+[1-9]\d{6,15}$/.test(n);
+          const isSignalGroup = (n: string) => provider === 'signal' && /^group\.[A-Za-z0-9+/=_-]+$/.test(n);
+          const bad = to.filter((n) => !isNumber(n) && !isSignalGroup(n));
           if (bad.length > 0) {
             throw new ConfigError(
-              `${at}.to must be E.164 numbers starting with "+" and a country code ` +
-                `(bad: ${bad.join(', ')})`,
+              `${at}.to must be E.164 numbers starting with "+" and a country code` +
+                (provider === 'signal' ? ', or a Signal group id ("group.…")' : '') +
+                ` (bad: ${bad.join(', ')})`,
             );
           }
         }
@@ -299,13 +308,15 @@ export function parseConfig(raw: unknown): LeadsmanConfig {
     // Kept out of the config file so a config naming a Twilio destination is still safe to
     // commit and diff — the same reason the database URL and webhook secret live in env.
     const messaging: MessagingCredentials = {};
-    const twilioSid = envStr('LEADSMAN_TWILIO_ACCOUNT_SID');
-    const twilioToken = envStr('LEADSMAN_TWILIO_AUTH_TOKEN');
+    const twilioAccount = envStr('LEADSMAN_TWILIO_ACCOUNT_SID');
+    const twilioKeySid = envStr('LEADSMAN_TWILIO_API_KEY_SID');
+    const twilioKeySecret = envStr('LEADSMAN_TWILIO_API_KEY_SECRET');
     const twilioFrom = envStr('LEADSMAN_TWILIO_FROM');
-    if (twilioSid && twilioToken && twilioFrom) {
+    if (twilioAccount && twilioKeySid && twilioKeySecret && twilioFrom) {
       messaging.twilio = {
-        accountSid: twilioSid,
-        authToken: twilioToken,
+        accountSid: twilioAccount,
+        apiKeySid: twilioKeySid,
+        apiKeySecret: twilioKeySecret,
         from: twilioFrom,
         baseUrl: envStr('LEADSMAN_TWILIO_BASE_URL') ?? 'https://api.twilio.com',
       };
@@ -331,8 +342,9 @@ export function parseConfig(raw: unknown): LeadsmanConfig {
         const p = dest.provider ?? 'webhook';
         if (p === 'twilio' && !messaging.twilio) {
           missing.push(
-            `"${name}" uses twilio but LEADSMAN_TWILIO_ACCOUNT_SID / _AUTH_TOKEN / _FROM are ` +
-              'not all set',
+            `"${name}" uses twilio but LEADSMAN_TWILIO_ACCOUNT_SID / _API_KEY_SID / ` +
+              '_API_KEY_SECRET / _FROM are not all set. Create an API Key under Twilio ' +
+              'Console > Account > API keys & tokens — the Account Auth Token is not used.',
           );
         }
         if (p === 'telegram' && !messaging.telegram) {

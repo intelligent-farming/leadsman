@@ -1,6 +1,6 @@
 {
   "name": "@intelligent-farming/leadsman",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Scheduled rule engine that takes periodic soundings of ChirpStack telemetry and raises deduplicated alerts into Postgres. Checks are pluggable scripts selected by a config file.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",

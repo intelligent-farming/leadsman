@@ -259,7 +259,10 @@ async function sendTwilio(
   const url =
     `${creds.baseUrl ?? 'https://api.twilio.com'}/2010-04-01/Accounts/` +
     `${encodeURIComponent(creds.accountSid)}/Messages.json`;
-  const authHeader = `Basic ${Buffer.from(`${creds.accountSid}:${creds.authToken}`).toString('base64')}`;
+  // The API Key pair authenticates; the URL above still carries the Account SID, since a key
+  // identifies the caller rather than replacing the account it acts on.
+  const authHeader =
+    `Basic ${Buffer.from(`${creds.apiKeySid}:${creds.apiKeySecret}`).toString('base64')}`;
 
   for (const to of dest.to ?? []) {
     // Twilio's API is form-encoded, not JSON — a JSON body is rejected as a 400.
@@ -305,15 +308,22 @@ async function sendTelegram(
     body: JSON.stringify({ chat_id: dest.chatId, text: renderMessage(alert) }),
     signal,
   });
-  if (!res.ok) {
-    let detail = '';
-    try {
-      const j = (await res.json()) as { description?: string };
-      detail = j.description ?? '';
-    } catch {
-      /* non-JSON error body */
-    }
-    return { ok: false, status: res.status, detail };
+  // Telegram answers in an envelope: {"ok":false,"description":"..."}. It usually pairs that
+  // with a non-2xx, but the envelope is the authoritative signal — trusting the status alone
+  // risks recording a rejected message as delivered, which loses the alert for good because
+  // notified_at gets stamped and no sounding retries it.
+  let envelope: { ok?: boolean; description?: string } | null = null;
+  try {
+    envelope = (await res.json()) as { ok?: boolean; description?: string };
+  } catch {
+    /* non-JSON body; fall back to the status */
+  }
+  if (!res.ok || envelope?.ok === false) {
+    return {
+      ok: false,
+      status: res.status,
+      detail: envelope?.description ?? '',
+    };
   }
   return { ok: true };
 }

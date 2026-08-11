@@ -74,7 +74,8 @@ test('twilio: form-encoded body, basic auth, one POST per recipient', async () =
       messaging: {
         twilio: {
           accountSid: 'AC123',
-          authToken: 'tok',
+          apiKeySid: 'SK456',
+          apiKeySecret: 'keysecret',
           from: '+15125550000',
           baseUrl: `http://127.0.0.1:${api.port}`,
         },
@@ -92,9 +93,11 @@ test('twilio: form-encoded body, basic auth, one POST per recipient', async () =
   for (const req of api.seen) {
     assert.equal(req.url, '/2010-04-01/Accounts/AC123/Messages.json');
     assert.equal(req.headers['content-type'], 'application/x-www-form-urlencoded');
+    // The API Key pair authenticates; the Account SID appears only in the URL. Sending the
+    // Account SID as the username would be the old Auth Token scheme.
     assert.equal(
       req.headers.authorization,
-      `Basic ${Buffer.from('AC123:tok').toString('base64')}`,
+      `Basic ${Buffer.from('SK456:keysecret').toString('base64')}`,
     );
     const form = new URLSearchParams(req.body);
     assert.equal(form.get('From'), '+15125550000');
@@ -121,7 +124,8 @@ test('twilio: a partial failure does not stamp notified_at, so the next sounding
       destinations: { sms: { provider: 'twilio', to: ['+15125550123', '+15125550124'] } },
       routing: { fact: 'sms' },
       messaging: {
-        twilio: { accountSid: 'AC1', authToken: 't', from: '+1512', baseUrl: `http://127.0.0.1:${api.port}` },
+        twilio: { accountSid: 'AC1', apiKeySid: 'SK1', apiKeySecret: 's', from: '+1512',
+                  baseUrl: `http://127.0.0.1:${api.port}` },
       },
     },
     { markNotified: async (id) => void marked.push(id) },
@@ -226,7 +230,8 @@ function withEnv(vars, fn) {
 
 const TWILIO_ENV = {
   LEADSMAN_TWILIO_ACCOUNT_SID: 'AC1',
-  LEADSMAN_TWILIO_AUTH_TOKEN: 'tok',
+  LEADSMAN_TWILIO_API_KEY_SID: 'SK1',
+  LEADSMAN_TWILIO_API_KEY_SECRET: 'keysecret',
   LEADSMAN_TWILIO_FROM: '+15125550000',
 };
 
@@ -240,9 +245,10 @@ test('provider credentials are read from the environment, never the config file'
       },
     });
     assert.equal(cfg.notify.messaging.twilio.accountSid, 'AC1');
+    assert.equal(cfg.notify.messaging.twilio.apiKeySid, 'SK1');
     assert.equal(cfg.notify.messaging.twilio.from, '+15125550000');
     // The destination itself carries no secret.
-    assert.equal('authToken' in cfg.notify.destinations.sms, false);
+    assert.equal('apiKeySecret' in cfg.notify.destinations.sms, false);
   });
 });
 
@@ -256,7 +262,7 @@ test('a provider without its credentials is rejected at config time', () => {
         routing: { fact: 'sms' },
       },
     }),
-    (err) => err instanceof ConfigError && /LEADSMAN_TWILIO_ACCOUNT_SID/.test(err.message),
+    (err) => err instanceof ConfigError && /_API_KEY_SID/.test(err.message),
   );
 });
 
@@ -343,4 +349,121 @@ test('a webhook destination still requires a URL; a provider one does not', () =
     });
     assert.equal(cfg.notify.destinations.sms.webhookUrl, undefined);
   });
+});
+
+// ── Telegram: the envelope decides, not the status ────────────────────────────
+
+test('telegram: HTTP 200 with ok:false is a FAILURE, not a delivery', async () => {
+  // Telegram answers in an envelope. Trusting the status alone would stamp notified_at on a
+  // message the API rejected, and no later sounding would retry it — the alert is lost.
+  const api = await capture((req, res) =>
+    res.writeHead(200, { 'content-type': 'application/json' })
+      .end(JSON.stringify({ ok: false, description: 'Bad Request: chat not found' })));
+  const marked = [];
+  const warned = [];
+  const out = await notifyRaised(
+    [alert()],
+    {
+      destinations: { tg: { provider: 'telegram', chatId: '-100BAD' } },
+      routing: { fact: 'tg' },
+      messaging: { telegram: { botToken: 'x', baseUrl: `http://127.0.0.1:${api.port}` } },
+    },
+    { markNotified: async (id) => void marked.push(id) },
+    { ...quietLog, warn: (m, x) => warned.push(x) },
+    new Map([['pipe-pressure-low', { routing: 'fact' }]]),
+  );
+  api.close();
+  assert.equal(out.failed, 1);
+  assert.equal(out.delivered, 0);
+  assert.deepEqual(marked, [], 'a rejected message must stay pending');
+  // The reason has to reach the log or the operator is guessing.
+  assert.match(warned[0].detail, /chat not found/);
+  assert.equal(warned[0].status, 200);
+});
+
+test('telegram: ok:true with 200 still delivers', async () => {
+  const api = await capture((req, res) =>
+    res.writeHead(200, { 'content-type': 'application/json' }).end('{"ok":true,"result":{}}'));
+  const out = await notifyRaised(
+    [alert()],
+    {
+      destinations: { tg: { provider: 'telegram', chatId: '-1001' } },
+      routing: { fact: 'tg' },
+      messaging: { telegram: { botToken: 'x', baseUrl: `http://127.0.0.1:${api.port}` } },
+    },
+    { markNotified: async () => {} },
+    quietLog,
+    new Map([['pipe-pressure-low', { routing: 'fact' }]]),
+  );
+  api.close();
+  assert.equal(out.delivered, 1);
+});
+
+// ── Signal: groups are addressed by id, not by number ─────────────────────────
+
+test('signal: a group id is a valid recipient alongside numbers', () => {
+  withEnv({ LEADSMAN_SIGNAL_BASE_URL: 'http://signal:8080', LEADSMAN_SIGNAL_FROM: '+15125559999' }, () => {
+    const cfg = parseConfig({
+      checks: [],
+      notify: {
+        destinations: {
+          field: { provider: 'signal', to: ['+15125550123', 'group.dGVzdEdyb3VwSWQ='] },
+        },
+        routing: { fact: 'field' },
+      },
+    });
+    assert.deepEqual(cfg.notify.destinations.field.to,
+      ['+15125550123', 'group.dGVzdEdyb3VwSWQ=']);
+  });
+});
+
+test('signal: a malformed recipient is still rejected, and the error mentions groups', () => {
+  withEnv({ LEADSMAN_SIGNAL_BASE_URL: 'http://signal:8080', LEADSMAN_SIGNAL_FROM: '+15125559999' }, () => {
+    assert.throws(
+      () => parseConfig({
+        checks: [],
+        notify: {
+          destinations: { field: { provider: 'signal', to: ['5125550123'] } },
+          routing: { fact: 'field' },
+        },
+      }),
+      (err) => err instanceof ConfigError && /Signal group id/.test(err.message),
+    );
+  });
+});
+
+test('twilio does NOT accept a group id — there is no such concept', () => {
+  // Letting one through would surface as a Twilio 21211 at send time instead of here.
+  withEnv({
+    LEADSMAN_TWILIO_ACCOUNT_SID: 'AC1', LEADSMAN_TWILIO_API_KEY_SID: 'SK1',
+    LEADSMAN_TWILIO_API_KEY_SECRET: 's', LEADSMAN_TWILIO_FROM: '+15125550000',
+  }, () => {
+    assert.throws(
+      () => parseConfig({
+        checks: [],
+        notify: {
+          destinations: { sms: { provider: 'twilio', to: ['group.dGVzdA=='] } },
+          routing: { fact: 'sms' },
+        },
+      }),
+      (err) => err instanceof ConfigError && !/Signal group id/.test(err.message),
+    );
+  });
+});
+
+test('signal: group ids are sent through in the recipients array', async () => {
+  const api = await capture(ok201);
+  await notifyRaised(
+    [alert()],
+    {
+      destinations: { field: { provider: 'signal', to: ['group.dGVzdA=='] } },
+      routing: { fact: 'field' },
+      messaging: { baseUrl: undefined, signal: { baseUrl: `http://127.0.0.1:${api.port}`, from: '+1512' } },
+    },
+    { markNotified: async () => {} },
+    quietLog,
+    new Map([['pipe-pressure-low', { routing: 'fact' }]]),
+  );
+  api.close();
+  assert.deepEqual(JSON.parse(api.seen[0].body).recipients, ['group.dGVzdA==']);
 });

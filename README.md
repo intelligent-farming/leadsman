@@ -334,6 +334,31 @@ No credentials appear here — they come from the environment, so this file stay
 | `telegram` | Bot message | `chatId` + `LEADSMAN_TELEGRAM_BOT_TOKEN` |
 | `signal` | One request carrying all recipients | `to` + `LEADSMAN_SIGNAL_BASE_URL` / `_FROM` |
 
+Before waiting for a real alert, prove the wiring:
+
+```sh
+leadsman test-notify              # a synthetic alert to every destination
+leadsman test-notify --to oncall  # just one
+```
+
+It needs **no database** — deliberately, since setting up a bot token, a chat id, or a
+registered Signal number is where the mistakes happen, and that is usually before `migrate`
+has run. Nothing is written and no `notified_at` is stamped.
+
+Telegram's chat id is the fiddly part: add the bot to the chat, send one message, then read
+`result[].message.chat.id` from `https://api.telegram.org/bot<TOKEN>/getUpdates`. Groups and
+channels are negative. A bot cannot start a conversation, so that first message is required.
+
+Signal can address a **group** as well as numbers — put its `group.<base64>` id in `to`
+(`signal-cli … listGroups`). Twilio has no equivalent, so a group id is rejected there rather
+than failing at send time.
+
+Twilio authenticates with an **API Key**, not the Account Auth Token. A key is revocable and
+rotatable on its own, where the Auth Token is the account's master credential — rotating it
+breaks every other integration, and leaking it hands over the whole account. Create one under
+Console → Account → API keys & tokens. The Account SID is still required, because it names the
+account the key acts on.
+
 Signal has no hosted send API, so `signal` talks to a [signal-cli-rest-api](https://github.com/bbernhard/signal-cli-rest-api) instance you run.
 
 Messaging providers send one line of text:
@@ -492,10 +517,13 @@ pattern as the stack's own `010_events_roles.sh`, so it can be dropped into
 | `LEADSMAN_RULES_DIR` | Extra directory of operator-supplied checks |
 | `LEADSMAN_WEBHOOK_TOKEN` | The shared secret. Env only — never read from the config file |
 | `LEADSMAN_WEBHOOK_TOKEN_<NAME>` | Per-destination secret, e.g. `…_AGENT` for destination `agent`. Falls back to the shared one |
-| `LEADSMAN_TWILIO_ACCOUNT_SID` | Twilio account SID. All three Twilio vars must be set to use the provider |
-| `LEADSMAN_TWILIO_AUTH_TOKEN` | Twilio auth token |
+| `LEADSMAN_TWILIO_ACCOUNT_SID` | Twilio Account SID (`AC…`) — identifies the account in the request path |
+| `LEADSMAN_TWILIO_API_KEY_SID` | API Key SID (`SK…`) — this authenticates, not the Auth Token |
+| `LEADSMAN_TWILIO_API_KEY_SECRET` | The API Key's secret |
 | `LEADSMAN_TWILIO_FROM` | Sending number or messaging-service sender |
 | `LEADSMAN_TELEGRAM_BOT_TOKEN` | Telegram bot token from @BotFather |
+| `LEADSMAN_TELEGRAM_BASE_URL` | Override the Bot API host. Default `https://api.telegram.org` |
+| `LEADSMAN_TWILIO_BASE_URL` | Override the Twilio API host. Default `https://api.twilio.com` |
 | `LEADSMAN_SIGNAL_BASE_URL` | Your signal-cli-rest-api base URL — Signal has no hosted send API |
 | `LEADSMAN_SIGNAL_FROM` | Registered Signal sending number |
 | `LEADSMAN_DEST_<NAME>_PROVIDER` | Override one destination's platform: `webhook`\|`twilio`\|`telegram`\|`signal` |

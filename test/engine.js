@@ -20,6 +20,7 @@ const http = require('node:http');
 const h = require('./helpers/db.js');
 const { runSounding } = require('../dist/runner.js');
 const { notifyRaised } = require('../dist/notify.js');
+const { Store } = require('../dist/db.js');
 
 if (!h.available) {
   test('database-backed engine tests', { skip: h.skipMessage }, () => {});
@@ -573,3 +574,24 @@ if (!h.available) {
     assert.match(info.version, /PostgreSQL/);
   });
 }
+
+test('a pool error handler is attached, so an idle-connection failure cannot crash serve', async () => {
+  // Regression: node-postgres emits 'error' on the Pool when an IDLE client dies, which is
+  // what a Postgres restart looks like to a resident `serve`. With no listener that becomes an
+  // uncaught exception and the engine exits(1) — a transient database outage killed it.
+  // Asserting the listener exists is the cheap proxy for "does not crash"; the behavioural
+  // proof needs a real server to stop, which the container test covers.
+  const store = new Store({ connectionString: h.url, statementTimeoutMs: 5000 });
+  try {
+    const pool = store.pool;
+    assert.ok(pool, 'could not reach the pool to inspect its listeners');
+    assert.ok(
+      pool.listenerCount('error') >= 1,
+      'the Pool must have an error listener or an idle-client failure is an uncaught exception',
+    );
+    // And it must not throw when one fires.
+    pool.emit('error', new Error('simulated idle client failure'));
+  } finally {
+    await store.close();
+  }
+});

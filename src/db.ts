@@ -17,7 +17,7 @@
  */
 
 import { Pool, type PoolClient } from 'pg';
-import type { CheckResult, Finding, Severity } from './types';
+import type { CheckResult, Finding, Logger, Severity } from './types';
 
 export interface OpenAlert {
   id: string;
@@ -43,6 +43,12 @@ export interface StoreOptions {
   statementTimeoutMs: number;
   /** Small by design: soundings run sequentially, so 2 is plenty. */
   maxConnections?: number;
+  /**
+   * Where to report errors raised by IDLE pooled connections — see the constructor. Optional
+   * only so short-lived callers (migrate, one-shot scripts) need not build a logger; when it
+   * is absent the message still reaches stderr rather than being swallowed.
+   */
+  log?: Pick<Logger, 'warn'>;
 }
 
 export class Store {
@@ -59,6 +65,21 @@ export class Store {
       // A sounding is short-lived; do not hold idle connections open on a small box.
       idleTimeoutMillis: 10_000,
       application_name: 'leadsman',
+    });
+
+    // REQUIRED, not defensive. node-postgres emits 'error' on the Pool when an IDLE client
+    // dies — exactly what happens when Postgres restarts under a long-running `serve`. An
+    // EventEmitter 'error' with no listener becomes an uncaught exception, so without this the
+    // engine exits(1) on any transient database outage: an upgrade, a reboot ordering race,
+    // the OOM killer on a small box. Docker's restart policy brings it back, but only after a
+    // crash loop, with the healthcheck flapping and soundings missed in between.
+    //
+    // Logging and continuing is the correct response: the pool has already discarded the bad
+    // client, and the next query transparently acquires a fresh one.
+    this.pool.on('error', (err) => {
+      const message = `idle database connection error (pool recovered): ${err.message}`;
+      if (options.log) options.log.warn(message);
+      else process.stderr.write(`${message}\n`);
     });
   }
 

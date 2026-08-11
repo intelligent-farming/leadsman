@@ -171,8 +171,18 @@ export type NotifyProvider = 'webhook' | 'twilio' | 'telegram' | 'signal';
 /** Credentials and endpoints for the messaging providers. Env only — never the config file. */
 export interface MessagingCredentials {
   twilio?: {
+    /** Account SID (AC…). Identifies the account in the request path. */
     accountSid: string;
-    authToken: string;
+    /**
+     * API Key SID (SK…) and its secret. These authenticate — not the Account Auth Token.
+     *
+     * An API Key is revocable and rotatable on its own; the Auth Token is the account's
+     * master credential, so rotating it breaks every other integration and leaking it hands
+     * over the whole account. Twilio's own guidance is to use keys for application access,
+     * and there is no reason for an alerting engine to hold anything stronger.
+     */
+    apiKeySid: string;
+    apiKeySecret: string;
     /** Sending number or messaging-service alphanumeric sender. */
     from: string;
     /** Override for testing or a regional edge. Default https://api.twilio.com */

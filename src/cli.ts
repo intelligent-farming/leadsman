@@ -21,9 +21,10 @@ import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { Client } from 'pg';
 import { ConfigError, databaseUrlFromEnv, loadConfig } from './config';
-import { Store } from './db';
+import { Store, type RaisedAlert } from './db';
 import { createLogger } from './logger';
 import { loadRules, RuleLoadError } from './registry';
+import { notifyRaised } from './notify';
 import { runSounding } from './runner';
 import { serve } from './scheduler';
 import { verify } from './verify';
@@ -35,6 +36,8 @@ interface Args {
   runOnStart: boolean;
   rulesDir: string | null;
   json: boolean;
+  /** test-notify: limit to one destination. */
+  to: string | null;
 }
 
 /**
@@ -57,6 +60,7 @@ function parseArgs(argv: string[]): Args {
     runOnStart: false,
     rulesDir: process.env.LEADSMAN_RULES_DIR ?? null,
     json: false,
+    to: null,
   };
 
   for (let i = 0; i < argv.length; i += 1) {
@@ -78,6 +82,9 @@ function parseArgs(argv: string[]): Args {
       case '--json':
         args.json = true;
         break;
+      case '--to':
+        args.to = argv[++i] ?? null;
+        break;
       default:
         break;
     }
@@ -96,6 +103,7 @@ Commands:
   serve                Stay resident and sound on the configured schedule
   status               Show currently open alerts
   migrate              Apply migrations/*.sql (needs an owner-role URL)
+  test-notify          Send a synthetic alert to every destination (no database needed)
   version              Print the engine version
 
 Options:
@@ -104,6 +112,7 @@ Options:
       --dry-run        run: evaluate and report without writing or notifying
       --run-on-start   serve: take a sounding immediately instead of waiting
       --json           Machine-readable output where supported
+      --to <name>      test-notify: only this destination
 
 Environment:
   LEADSMAN_DATABASE_URL   Postgres URL for the engine role (required)
@@ -189,6 +198,7 @@ async function cmdRun(args: Args): Promise<number> {
   const log = createLogger();
   const store = new Store({
     connectionString: databaseUrlFromEnv(),
+    log,
     statementTimeoutMs: config.statementTimeoutMs ?? 15_000,
   });
 
@@ -208,6 +218,7 @@ async function cmdServe(args: Args): Promise<number> {
   const log = createLogger();
   const store = new Store({
     connectionString: databaseUrlFromEnv(),
+    log,
     statementTimeoutMs: config.statementTimeoutMs ?? 15_000,
   });
 
@@ -341,6 +352,82 @@ function version(): string {
   }
 }
 
+/**
+ * Send a synthetic alert through the real delivery path.
+ *
+ * Deliberately needs no database. Setting up Telegram (bot token + a chat id you have to go
+ * and find), Signal (a signal-cli-rest-api you host and register), or Twilio (a key and a
+ * verified recipient) is fiddly, and the alternative to this command is waiting for a real
+ * alert to discover you got one field wrong. Nothing is written: the store is a stub, so no
+ * alert row is created and no notified_at is stamped.
+ */
+async function cmdTestNotify(args: Args): Promise<number> {
+  const config = loadConfig(args.config);
+  const log = createLogger();
+
+  if (!config.notify) {
+    process.stderr.write(
+      'no notify block in the config — nothing to test. Add notify.destinations first.\n',
+    );
+    return 2;
+  }
+  const names = Object.keys(config.notify.destinations);
+  const targets = args.to ? [args.to] : names;
+  const unknown = targets.filter((t) => !names.includes(t));
+  if (unknown.length > 0) {
+    process.stderr.write(
+      `unknown destination "${unknown[0]}" — this config defines: ${names.join(', ')}\n`,
+    );
+    return 2;
+  }
+
+  // Obviously-synthetic so a recipient cannot mistake it for a real fault.
+  const sample: RaisedAlert = {
+    id: 'test',
+    ruleId: 'test-notify',
+    kind: 'test-notify',
+    devEui: '0000000000000000',
+    deviceName: 'leadsman test',
+    severity: 'info',
+    summary: 'test message from leadsman — delivery is configured correctly, no fault detected',
+    detail: { test: true, sentAt: new Date().toISOString() },
+    raisedAt: new Date().toISOString(),
+  };
+
+  // markNotified must not touch a database: this command is for people who have not
+  // necessarily run migrate yet.
+  const stubStore = { markNotified: async () => undefined } as unknown as Store;
+
+  let failed = 0;
+  for (const name of targets) {
+    const dest = config.notify.destinations[name];
+    const provider = dest.provider ?? 'webhook';
+    process.stdout.write(`sending to "${name}" (${provider}) ... `);
+    // Route explicitly at this one destination, bypassing the fact/situation rules — the
+    // question here is "does this destination work", not "where would an alert go".
+    const outcome = await notifyRaised(
+      [sample],
+      { ...config.notify, destinations: { [name]: dest } },
+      stubStore,
+      log,
+      new Map([['test-notify', { notifyTo: name, routing: 'fact' as const }]]),
+    );
+    if (outcome.delivered === 1) {
+      process.stdout.write('delivered\n');
+    } else {
+      failed += 1;
+      process.stdout.write('FAILED (see the warning above for the reason)\n');
+    }
+  }
+
+  if (failed > 0) {
+    process.stdout.write(`\n${failed} of ${targets.length} destination(s) failed\n`);
+    return 1;
+  }
+  process.stdout.write(`\n${targets.length} destination(s) ok\n`);
+  return 0;
+}
+
 async function main(): Promise<number> {
   const args = parseArgs(process.argv.slice(2));
 
@@ -357,6 +444,8 @@ async function main(): Promise<number> {
       return cmdStatus(args);
     case 'migrate':
       return cmdMigrate();
+    case 'test-notify':
+      return cmdTestNotify(args);
     case 'version':
     case '--version':
     case '-v':

@@ -24,6 +24,16 @@ export interface SoundingSummary {
   resolved: number;
   errors: number;
   delivered: number;
+  /**
+   * Deliveries that failed, and alerts that resolved to no destination.
+   *
+   * These were previously discarded, which made a TOTAL delivery failure — a wrong Twilio
+   * token, an unreachable webhook — read as `delivered=0 errors=0`: indistinguishable from
+   * having nothing to send. `errors` counts failed CHECKS, not failed sends, so it stayed
+   * zero too. Surfacing them means the summary line alone tells you delivery is broken.
+   */
+  deliveryFailed: number;
+  unrouted: number;
 }
 
 export interface RunSoundingOptions {
@@ -176,9 +186,9 @@ export async function runSounding(options: RunSoundingOptions): Promise<Sounding
     }
   }
 
-  const delivered = dryRun
-    ? 0
-    : (await notifyRaised(allRaised, config.notify, store, log, routes)).delivered;
+  const notified = dryRun
+    ? { delivered: 0, failed: 0, unrouted: 0 }
+    : await notifyRaised(allRaised, config.notify, store, log, routes);
 
   const finishedAt = new Date();
   const summary: SoundingSummary = {
@@ -189,7 +199,9 @@ export async function runSounding(options: RunSoundingOptions): Promise<Sounding
     raised: results.reduce((n, r) => n + r.raised, 0),
     resolved: results.reduce((n, r) => n + r.resolved, 0),
     errors: results.filter((r) => r.status === 'error').length,
-    delivered,
+    delivered: notified.delivered,
+    deliveryFailed: notified.failed,
+    unrouted: notified.unrouted,
   };
 
   log.info('sounding finished', {
@@ -197,6 +209,9 @@ export async function runSounding(options: RunSoundingOptions): Promise<Sounding
     raised: summary.raised,
     resolved: summary.resolved,
     delivered: summary.delivered,
+    // Only surfaced when non-zero, so a healthy line stays as short as it was.
+    ...(summary.deliveryFailed > 0 ? { deliveryFailed: summary.deliveryFailed } : {}),
+    ...(summary.unrouted > 0 ? { unrouted: summary.unrouted } : {}),
     errors: summary.errors,
   });
 
