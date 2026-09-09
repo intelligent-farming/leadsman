@@ -13,6 +13,34 @@ const { parseConfig, ConfigError } = require('../dist/config.js');
 const { loadRules } = require('../dist/registry.js');
 const params = require('../dist/params.js');
 
+// A complete SoundingContext with nothing in it. Every field the engine supplies is
+// present and empty, so a rule reaching for one gets the "nothing configured, nothing
+// in the store" answer rather than a TypeError — which is the difference between a test
+// that proves a rule handles an empty deployment and one that proves the stub is stale.
+function stubCtx(overrides = {}) {
+  const state = new Map();
+  return {
+    query: async () => [],
+    params: {},
+    openDevEuis: new Set(),
+    openSubjects: new Set(),
+    kind: 'test',
+    now: new Date(),
+    // Null rather than absent: `needs` is what excuses a rule from running at all, and
+    // a rule that ignores it should fail here rather than in the field.
+    gateways: null,
+    engine: { postmasterStartTime: null, previousRunAt: null, hostAddress: null },
+    state: {
+      get: async (key) => state.get(key) ?? null,
+      set: async (key, value) => {
+        state.set(key, { value, seenAt: new Date().toISOString() });
+      },
+    },
+    log: { debug() {}, info() {}, warn() {}, error() {} },
+    ...overrides,
+  };
+}
+
 test('parseConfig accepts a minimal config and applies defaults', () => {
   const cfg = parseConfig({ checks: [{ rule: 'device-silent' }] });
   assert.equal(cfg.schedule, '*/15 * * * *');
@@ -327,6 +355,13 @@ test('the example config keeps only universally-safe checks enabled by default',
         // Network layer: read ChirpStack's own tables, and two of them keep working
         // when the payload codec is broken.
         'device-log-error', 'status-battery-low', 'status-margin-low', 'join-churn',
+        // Site, gateway and host: a fault at these layers surfaces as a pile of device
+        // alerts that each name a healthy sensor, so leaving them off by default means
+        // the noisy diagnosis is the only one anyone gets. None needs a threshold that
+        // depends on crop or equipment, and the three that read ChirpStack's gateway API
+        // report `skipped` rather than firing when no connection is configured.
+        'fleet-silent', 'gateway-silent', 'host-restarted', 'host-address-changed',
+        'gateway-deaf', 'gateway-never-seen',
       ].includes(kind),
       `"${kind}" is enabled by default but needs deployment-specific tuning`,
     );
@@ -385,14 +420,7 @@ test('rules either run on their own defaults or explain what configuration they 
   const rules = loadRules();
   const results = [];
   for (const [id, rule] of rules) {
-    const ctx = {
-      query: async () => [],
-      params: { ...rule.defaultParams },
-      openDevEuis: new Set(),
-      kind: id,
-      now: new Date(),
-      log: { debug() {}, info() {}, warn() {}, error() {} },
-    };
+    const ctx = stubCtx({ params: { ...rule.defaultParams }, kind: id });
     results.push(
       rule.run(ctx).then(
         (findings) => ({ id, ok: true, findings }),
@@ -769,4 +797,629 @@ test('an empty destinations map is refused', () => {
     () => parseConfig({ checks: [], notify: { destinations: {} } }),
     (err) => err instanceof ConfigError && /destinations is empty/.test(err.message),
   );
+});
+
+// ── site, gateway and host checks ────────────────────────────────────────────
+// These are the checks that report the layers underneath a device. The behaviour
+// worth pinning is mostly about when they stay QUIET: each one has a way of being
+// wrong that would fire on a healthy deployment, and that is what these cover.
+
+test('fleet-silent raises one site alert, not one per device', async () => {
+  const rule = loadRules().get('fleet-silent');
+  let call = 0;
+  const ctx = stubCtx({
+    params: { ...rule.defaultParams },
+    query: async () => {
+      call += 1;
+      // First query is the fleet aggregate, second is the join probe.
+      if (call === 1) {
+        return [{
+          devices: '12',
+          last_uplink: '2026-09-09T06:00:00.000Z',
+          silent_minutes: '145',
+          uplinks_in_window: '0',
+        }];
+      }
+      return [{ last_join: null, joins_recent: '0' }];
+    },
+  });
+
+  const findings = await rule.run(ctx);
+  assert.equal(findings.length, 1, 'twelve silent devices must be one alert');
+  assert.equal(findings[0].subject.kind, 'site');
+  assert.equal(findings[0].devEui, undefined, 'a site alert has no DevEUI');
+  assert.match(findings[0].summary, /any of 12 devices/);
+  assert.match(findings[0].summary, /2\.4h/);
+  assert.equal(findings[0].detail.joinsSinceThreshold, 0);
+});
+
+test('fleet-silent stays quiet when anything at all is arriving', async () => {
+  const rule = loadRules().get('fleet-silent');
+  const ctx = stubCtx({
+    params: { ...rule.defaultParams },
+    query: async () => [{
+      devices: '12',
+      last_uplink: '2026-09-09T08:00:00.000Z',
+      silent_minutes: '2',
+      uplinks_in_window: '40',
+    }],
+  });
+  assert.deepEqual(await rule.run(ctx), []);
+});
+
+test('fleet-silent ignores a fleet too small to have a shared cause', async () => {
+  // With one device, "the fleet is silent" and "that device is silent" are the same
+  // statement, and device-silent says it better.
+  const rule = loadRules().get('fleet-silent');
+  const ctx = stubCtx({
+    params: { ...rule.defaultParams },
+    query: async () => [{
+      devices: '1',
+      last_uplink: '2026-09-09T06:00:00.000Z',
+      silent_minutes: '600',
+      uplinks_in_window: '0',
+    }],
+  });
+  assert.deepEqual(await rule.run(ctx), []);
+});
+
+test('fleet-silent points at the payload path when joins are still landing', async () => {
+  // Joins arriving means the radio path is up, which is a completely different fault
+  // from silence on everything — worth not sending someone to check the gateway.
+  const rule = loadRules().get('fleet-silent');
+  let call = 0;
+  const ctx = stubCtx({
+    params: { ...rule.defaultParams },
+    query: async () => {
+      call += 1;
+      if (call === 1) {
+        return [{ devices: '8', last_uplink: '2026-09-09T06:00:00.000Z', silent_minutes: '90', uplinks_in_window: '0' }];
+      }
+      return [{ last_join: '2026-09-09T07:50:00.000Z', joins_recent: '3' }];
+    },
+  });
+  const findings = await rule.run(ctx);
+  assert.equal(findings.length, 1);
+  assert.match(findings[0].summary, /joins are still arriving/);
+  assert.equal(findings[0].detail.joinsSinceThreshold, 3);
+});
+
+test('gateway-silent names the gateway and counts the devices behind it', async () => {
+  const rule = loadRules().get('gateway-silent');
+  const ctx = stubCtx({
+    params: { ...rule.defaultParams },
+    query: async () => [
+      // Silent for hours, was carrying nine devices.
+      { gateway_id: '0016C001F1E2D3C4', first_seen: '2026-09-02T00:00:00.000Z',
+        last_seen: '2026-09-09T02:00:00.000Z', silent_minutes: '360',
+        receptions: '4200', devices: '9' },
+      // Still forwarding, so this is one gateway down rather than a site outage.
+      { gateway_id: '0016c001aaaabbbb', first_seen: '2026-09-02T00:00:00.000Z',
+        last_seen: '2026-09-09T07:58:00.000Z', silent_minutes: '2',
+        receptions: '5100', devices: '11' },
+    ],
+  });
+
+  const findings = await rule.run(ctx);
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].subject.kind, 'gateway');
+  assert.equal(findings[0].subject.id, '0016c001f1e2d3c4', 'gateway EUIs are lowercased');
+  assert.match(findings[0].summary, /6h/);
+  assert.match(findings[0].summary, /carrying 9 devices/);
+  assert.equal(findings[0].detail.gatewaysStillActive, 1);
+});
+
+test('gateway-silent leaves a total blackout to fleet-silent', async () => {
+  // Every gateway silent at once is one site event, not N gateway faults. Without this,
+  // a quiet fleet also reads as every gateway failing simultaneously.
+  const rule = loadRules().get('gateway-silent');
+  const ctx = stubCtx({
+    params: { ...rule.defaultParams },
+    query: async () => [
+      { gateway_id: 'aaaa000000000001', first_seen: '2026-09-02T00:00:00.000Z',
+        last_seen: '2026-09-09T02:00:00.000Z', silent_minutes: '360', receptions: '900', devices: '4' },
+      { gateway_id: 'aaaa000000000002', first_seen: '2026-09-02T00:00:00.000Z',
+        last_seen: '2026-09-09T02:05:00.000Z', silent_minutes: '355', receptions: '800', devices: '5' },
+    ],
+  });
+  assert.deepEqual(await rule.run(ctx), []);
+});
+
+test('gateway-silent ignores a gateway that only ever passed through', async () => {
+  const rule = loadRules().get('gateway-silent');
+  const ctx = stubCtx({
+    params: { ...rule.defaultParams },
+    query: async () => [
+      // Three receptions, below minReceptions: a neighbour's unit or a survey handheld.
+      { gateway_id: 'bbbb000000000001', first_seen: '2026-09-02T00:00:00.000Z',
+        last_seen: '2026-09-02T00:10:00.000Z', silent_minutes: '9000', receptions: '3', devices: '1' },
+      { gateway_id: 'aaaa000000000002', first_seen: '2026-09-02T00:00:00.000Z',
+        last_seen: '2026-09-09T07:59:00.000Z', silent_minutes: '1', receptions: '800', devices: '5' },
+    ],
+  });
+  assert.deepEqual(await rule.run(ctx), []);
+});
+
+test('host-restarted reports the monitoring gap, not the uptime', async () => {
+  const rule = loadRules().get('host-restarted');
+  const restartedAt = new Date(Date.now() - 6 * 60_000);          // 6 minutes ago
+  const lastRun = new Date(restartedAt.getTime() - 390 * 60_000);  // 6.5h before that
+  const ctx = stubCtx({
+    params: { ...rule.defaultParams },
+    engine: {
+      postmasterStartTime: restartedAt.toISOString(),
+      previousRunAt: lastRun.toISOString(),
+      hostAddress: null,
+    },
+  });
+
+  const findings = await rule.run(ctx);
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].subject.kind, 'engine');
+  assert.match(findings[0].summary, /restarted 6m ago/);
+  assert.match(findings[0].summary, /6\.5h/);
+  // The gap runs to the restart, not to now: time since the restart is time the engine
+  // has been back and working.
+  assert.equal(findings[0].detail.monitoringGapMinutes, 390);
+});
+
+test('host-restarted stays quiet on a fresh install and on a quick recreate', async () => {
+  const rule = loadRules().get('host-restarted');
+  const restartedAt = new Date(Date.now() - 60_000).toISOString();
+
+  // No prior sounding: a new deployment, not an outage. Must not open with an alert.
+  const fresh = stubCtx({
+    params: { ...rule.defaultParams },
+    engine: { postmasterStartTime: restartedAt, previousRunAt: null, hostAddress: null },
+  });
+  assert.deepEqual(await rule.run(fresh), []);
+
+  // A container recreate during an upgrade restarts Postgres and is not an incident.
+  const recreate = stubCtx({
+    params: { ...rule.defaultParams },
+    engine: {
+      postmasterStartTime: restartedAt,
+      previousRunAt: new Date(Date.now() - 3 * 60_000).toISOString(),
+      hostAddress: null,
+    },
+  });
+  assert.deepEqual(await rule.run(recreate), []);
+
+  // A restart older than the reporting window is no longer news.
+  const old = stubCtx({
+    params: { ...rule.defaultParams },
+    engine: {
+      postmasterStartTime: new Date(Date.now() - 10 * 3600_000).toISOString(),
+      previousRunAt: new Date(Date.now() - 20 * 3600_000).toISOString(),
+      hostAddress: null,
+    },
+  });
+  assert.deepEqual(await rule.run(old), []);
+});
+
+test('host-address-changed records the first address silently, then reports a change', async () => {
+  const rule = loadRules().get('host-address-changed');
+  const store = new Map();
+  const state = {
+    get: async (k) => store.get(k) ?? null,
+    set: async (k, v) => { store.set(k, { value: v, seenAt: new Date().toISOString() }); },
+  };
+
+  // First sighting: nothing to compare against, so a fresh install must stay quiet.
+  const first = stubCtx({
+    params: { ...rule.defaultParams },
+    engine: { postmasterStartTime: null, previousRunAt: null, hostAddress: '192.168.1.42' },
+    state,
+  });
+  assert.deepEqual(await rule.run(first), []);
+
+  // The lease moves.
+  const moved = stubCtx({
+    params: { ...rule.defaultParams },
+    engine: { postmasterStartTime: null, previousRunAt: null, hostAddress: '192.168.1.57' },
+    state,
+  });
+  const findings = await rule.run(moved);
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].subject.kind, 'engine');
+  assert.equal(findings[0].severity, undefined);
+  assert.match(findings[0].summary, /192\.168\.1\.42 to 192\.168\.1\.57/);
+  assert.match(findings[0].summary, /must be re-pointed/);
+  assert.equal(findings[0].detail.previousAddress, '192.168.1.42');
+
+  // Still open on the next sounding: re-pointing gateways is manual work, and an alert
+  // that resolved itself fifteen minutes later would be gone before anyone acted on it.
+  const later = stubCtx({
+    params: { ...rule.defaultParams },
+    engine: { postmasterStartTime: null, previousRunAt: null, hostAddress: '192.168.1.57' },
+    state,
+  });
+  const again = await rule.run(later);
+  assert.equal(again.length, 1);
+  assert.equal(again[0].detail.previousAddress, '192.168.1.42');
+});
+
+test('host-address-changed stops reporting once the change is stale', async () => {
+  const rule = loadRules().get('host-address-changed');
+  const store = new Map([
+    ['address', { value: '10.0.0.9', seenAt: new Date().toISOString() }],
+    ['change', {
+      value: JSON.stringify({
+        previous: '10.0.0.4',
+        current: '10.0.0.9',
+        at: new Date(Date.now() - 100 * 3600_000).toISOString(),
+      }),
+      seenAt: new Date().toISOString(),
+    }],
+  ]);
+  const ctx = stubCtx({
+    params: { ...rule.defaultParams },  // openForHours: 72
+    engine: { postmasterStartTime: null, previousRunAt: null, hostAddress: '10.0.0.9' },
+    state: {
+      get: async (k) => store.get(k) ?? null,
+      set: async (k, v) => { store.set(k, { value: v, seenAt: new Date().toISOString() }); },
+    },
+  });
+  assert.deepEqual(await rule.run(ctx), []);
+});
+
+test('the chirpstack-backed checks skip themselves rather than reporting nothing', async () => {
+  // `needs` is what the engine reads to mark these skipped. A rule that ignored it and
+  // returned [] would be indistinguishable from a healthy gateway fleet.
+  const rules = loadRules();
+  for (const id of ['gateway-deaf', 'gateway-never-seen']) {
+    assert.ok(rules.get(id).needs.includes('chirpstack'), `${id} must declare needs`);
+  }
+  assert.ok(rules.get('host-address-changed').needs.includes('hostAddress'));
+});
+
+test('gateway-deaf needs the site to be busy before blaming one gateway', async () => {
+  // A gateway can hear nothing because nothing is in range yet. If the rest of the site
+  // is also quiet, this gateway is not evidence of anything.
+  const rule = loadRules().get('gateway-deaf');
+  const fresh = new Date(Date.now() - 60_000).toISOString();
+  const gateways = {
+    listGateways: async () => [
+      { gatewayId: '0016c001f1e2d3c4', name: 'north-mast', description: null,
+        createdAt: '2026-01-01T00:00:00.000Z', lastSeenAt: fresh, state: 'ONLINE' },
+    ],
+  };
+
+  // Site quiet: no alert.
+  const quiet = stubCtx({ params: { ...rule.defaultParams }, gateways, query: async () => [] });
+  assert.deepEqual(await rule.run(quiet), []);
+
+  // Site busy on another gateway, this one deaf: alert.
+  const busy = stubCtx({
+    params: { ...rule.defaultParams },
+    gateways,
+    query: async () => [
+      { gateway_id: 'aaaa000000000002', first_seen: '2026-09-01T00:00:00.000Z',
+        last_seen: fresh, silent_minutes: '1', receptions: '900', devices: '6' },
+    ],
+  });
+  const findings = await rule.run(busy);
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].subject.id, '0016c001f1e2d3c4');
+  assert.match(findings[0].summary, /online .* but has received nothing/);
+  assert.equal(findings[0].detail.backhaul, 'up');
+});
+
+test('gateway-never-seen respects the grace period for a not-yet-installed gateway', async () => {
+  const rule = loadRules().get('gateway-never-seen');
+  const mk = (createdAt) => ({
+    listGateways: async () => [
+      { gatewayId: 'ccdd000000000001', name: 'south-mast', description: null,
+        createdAt, lastSeenAt: null, state: 'NEVER_SEEN' },
+    ],
+  });
+
+  // Registered an hour ago: somebody is probably still up a ladder.
+  const recent = stubCtx({
+    params: { ...rule.defaultParams },
+    gateways: mk(new Date(Date.now() - 3600_000).toISOString()),
+  });
+  assert.deepEqual(await rule.run(recent), []);
+
+  // Registered three days ago and still never connected: something went wrong.
+  const stale = stubCtx({
+    params: { ...rule.defaultParams },
+    gateways: mk(new Date(Date.now() - 72 * 3600_000).toISOString()),
+    engine: { postmasterStartTime: null, previousRunAt: null, hostAddress: '192.168.1.57' },
+  });
+  const findings = await rule.run(stale);
+  assert.equal(findings.length, 1);
+  assert.match(findings[0].summary, /never connected/);
+  assert.match(findings[0].summary, /this host is at 192\.168\.1\.57/);
+  assert.equal(findings[0].detail.expectedHost, '192.168.1.57');
+});
+
+test('gateway-flapping distinguishes repeated dropouts from one clean outage', async () => {
+  const rule = loadRules().get('gateway-flapping');
+  const row = (over) => ({
+    gateway_id: 'aaaa000000000001',
+    last_seen: '2026-09-09T07:55:00.000Z',
+    active_buckets: '80',
+    gap_buckets: '16',
+    dropouts: '8',
+    receptions: '4000',
+    ...over,
+  });
+
+  // Eight dropouts across the window: flapping.
+  const flapping = stubCtx({ params: { ...rule.defaultParams }, query: async () => [row()] });
+  const findings = await rule.run(flapping);
+  assert.equal(findings.length, 1);
+  assert.match(findings[0].summary, /dropped out 8 times/);
+  assert.equal(findings[0].detail.dropouts, 8);
+
+  // Same lost time, one continuous gap: not flapping, and gateway-silent's business.
+  const oneOutage = stubCtx({
+    params: { ...rule.defaultParams },
+    query: async () => [row({ dropouts: '1', gap_buckets: '16' })],
+  });
+  assert.deepEqual(await rule.run(oneOutage), []);
+
+  // Mostly absent rather than flapping: broken, or never really installed.
+  const mostlyGone = stubCtx({
+    params: { ...rule.defaultParams },
+    query: async () => [row({ active_buckets: '6', gap_buckets: '90', dropouts: '5' })],
+  });
+  assert.deepEqual(await rule.run(mostlyGone), []);
+});
+
+test('gateway-time-unsynced ignores a gateway that never reported a timestamp', async () => {
+  // Some gateway models and ChirpStack versions do not supply one at all. Treating that
+  // as a lost GPS lock would flag every gateway on such a deployment, forever.
+  const rule = loadRules().get('gateway-time-unsynced');
+  const never = stubCtx({
+    params: { ...rule.defaultParams },
+    query: async () => [{
+      gateway_id: 'aaaa000000000001', receptions: '900', timestamped: '0',
+      max_skew: null, avg_skew: null, last_seen: '2026-09-09T07:00:00.000Z',
+    }],
+  });
+  assert.deepEqual(await rule.run(never), []);
+
+  // Had a lock, mostly lost it: that is the fault.
+  const lost = stubCtx({
+    params: { ...rule.defaultParams },
+    query: async () => [{
+      gateway_id: 'aaaa000000000001', receptions: '900', timestamped: '90',
+      max_skew: null, avg_skew: null, last_seen: '2026-09-09T07:00:00.000Z',
+    }],
+  });
+  const findings = await rule.run(lost);
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].detail.trigger, 'missing-timestamps');
+  assert.match(findings[0].summary, /10% of receptions carried a timestamp/);
+});
+
+test('gateway-redundancy-lost only reports a decline, never a site that never had any', async () => {
+  const rule = loadRules().get('gateway-redundancy-lost');
+  const row = (over) => ({
+    dev_eui: 'a84041000181d9e2',
+    device_name: 'soil-north-01',
+    historical_max: '3',
+    recent_max: '1',
+    recent_uplinks: '200',
+    historical_uplinks: '2800',
+    ...over,
+  });
+
+  const declined = stubCtx({ params: { ...rule.defaultParams }, query: async () => [row()] });
+  const findings = await rule.run(declined);
+  assert.equal(findings.length, 1);
+  assert.match(findings[0].summary, /now reaching 1 gateway \(was 3/);
+  assert.match(findings[0].summary, /one gateway failure will cut it off/);
+
+  // A single-gateway deployment: never had redundancy, so has not lost any.
+  const alwaysOne = stubCtx({
+    params: { ...rule.defaultParams },
+    query: async () => [row({ historical_max: '1' })],
+  });
+  assert.deepEqual(await rule.run(alwaysOne), []);
+});
+
+test('gateway-redundancy-lost refuses parameters that cannot mean anything', () => {
+  const rule = loadRules().get('gateway-redundancy-lost');
+  return Promise.all([
+    assert.rejects(
+      () => rule.run(stubCtx({ params: { ...rule.defaultParams, recentHours: 400 } })),
+      /must be shorter than historyHours/,
+    ),
+    assert.rejects(
+      () => rule.run(stubCtx({
+        params: { ...rule.defaultParams, minGateways: 3, minHistoricalGateways: 2 },
+      })),
+      /cannot lose redundancy it never had/,
+    ),
+  ]);
+});
+
+// ── suppression ──────────────────────────────────────────────────────────────
+
+const { activeSuppressions } = require('../dist/suppress.js');
+
+test('suppression mutes a downstream kind only while its cause is open', () => {
+  const ruleOfKind = new Map([
+    ['fleet-silent', 'fleet-silent'],
+    ['device-silent', 'device-silent'],
+    ['soil-moisture-low', 'measurement-threshold'],
+  ]);
+  const rules = [{ while: ['fleet-silent'], mute: ['device-silent'], enabled: true }];
+
+  // Cause open: the downstream kind is muted, and the cause is named.
+  const muted = activeSuppressions(rules, new Set(['fleet-silent', 'device-silent']), ruleOfKind);
+  assert.equal(muted.get('device-silent'), 'fleet-silent');
+  assert.equal(muted.size, 1);
+
+  // Cause resolved: nothing is muted, which is what releases held alerts.
+  assert.equal(activeSuppressions(rules, new Set(['device-silent']), ruleOfKind).size, 0);
+});
+
+test('suppression matches a rule id, covering every instance of a generic rule', () => {
+  // A config commonly runs a dozen measurement-missing instances under their own names.
+  // Naming the rule has to cover all of them, or the list would need maintaining forever.
+  const ruleOfKind = new Map([
+    ['gateway-silent', 'gateway-silent'],
+    ['soil-moisture-missing', 'measurement-missing'],
+    ['climate-fields-missing', 'measurement-missing'],
+    ['pipe-pressure-low', 'measurement-threshold'],
+  ]);
+  const muted = activeSuppressions(
+    [{ while: ['gateway-silent'], mute: ['measurement-missing'], enabled: true }],
+    new Set(['gateway-silent']),
+    ruleOfKind,
+  );
+  assert.deepEqual([...muted.keys()].sort(), ['climate-fields-missing', 'soil-moisture-missing']);
+  assert.equal(muted.has('pipe-pressure-low'), false);
+});
+
+test('suppression can never mute the alert that explains everything else', () => {
+  // However the config is written. Silencing the cause would leave the storm suppressed
+  // and nothing at all delivered — strictly worse than no suppression.
+  const ruleOfKind = new Map([['fleet-silent', 'fleet-silent'], ['device-silent', 'device-silent']]);
+  const muted = activeSuppressions(
+    [{ while: ['fleet-silent'], mute: ['fleet-silent', 'device-silent'], enabled: true }],
+    new Set(['fleet-silent']),
+    ruleOfKind,
+  );
+  assert.equal(muted.has('fleet-silent'), false);
+  assert.equal(muted.get('device-silent'), 'fleet-silent');
+});
+
+test('suppression is off when disabled or unconfigured', () => {
+  const ruleOfKind = new Map([['device-silent', 'device-silent']]);
+  const open = new Set(['fleet-silent']);
+  assert.equal(activeSuppressions(undefined, open, ruleOfKind).size, 0);
+  assert.equal(activeSuppressions([], open, ruleOfKind).size, 0);
+  assert.equal(
+    activeSuppressions(
+      [{ while: ['fleet-silent'], mute: ['device-silent'], enabled: false }],
+      open,
+      ruleOfKind,
+    ).size,
+    0,
+  );
+});
+
+test('suppression is on by default, and "suppress": [] is how you turn it off', () => {
+  // The one default-on behaviour that withholds anything, so the default is worth
+  // pinning: an existing config gets it without being edited, and can opt out in a line.
+  const withDefaults = parseConfig({ checks: [{ rule: 'device-silent' }] });
+  assert.ok(withDefaults.suppress.length > 0);
+  const edges = withDefaults.suppress.map((s) => `${s.while.join('+')}->${s.mute.join('+')}`);
+  assert.deepEqual(edges, ['fleet-silent->device-silent', 'gateway-silent->device-silent']);
+
+  assert.deepEqual(parseConfig({ suppress: [], checks: [{ rule: 'device-silent' }] }).suppress, []);
+});
+
+test('a malformed suppress block is refused with the shape it wanted', () => {
+  assert.throws(
+    () => parseConfig({ suppress: {}, checks: [] }),
+    (err) => err instanceof ConfigError && /\{while: \[\.\.\.\], mute: \[\.\.\.\]\}/.test(err.message),
+  );
+  assert.throws(
+    () => parseConfig({ suppress: [{ while: [], mute: ['x'] }], checks: [] }),
+    (err) => err instanceof ConfigError && /while must be a non-empty array/.test(err.message),
+  );
+});
+
+// ── gateway scope ────────────────────────────────────────────────────────────
+
+const { resolveGatewayScope, inGatewayScope } = require('../dist/scope.js');
+
+test('gateway scope is case-insensitive and ignore beats only', () => {
+  // EUIs get typed by hand, out of a label or a QR code, in whatever case the vendor
+  // printed. Matching on case would make ignoreGateways silently not work.
+  const scope = resolveGatewayScope({
+    gateways: ['0016C001F1E2D3C4', 'AAAA000000000002'],
+    ignoreGateways: ['AAAA000000000002'],
+  });
+  assert.ok(inGatewayScope(scope, '0016c001f1e2d3c4'));
+  assert.ok(inGatewayScope(scope, '0016C001F1E2D3C4'));
+  assert.equal(inGatewayScope(scope, 'aaaa000000000002'), false, 'ignore wins over only');
+  assert.equal(inGatewayScope(scope, 'bbbb000000000003'), false, 'not in the only list');
+
+  // Empty scope means every gateway.
+  assert.ok(inGatewayScope(resolveGatewayScope({}), 'anything'));
+});
+
+// ── host address resolution ──────────────────────────────────────────────────
+
+const { resolveHostAddress } = require('../dist/host.js');
+
+test('the host address is rejected unless it is a bare host', () => {
+  // The value comes from a file another program writes. A bad one would produce an alert
+  // claiming the gateways' address changed, which is the exact false alarm to avoid.
+  const at = (address) => resolveHostAddress({ address, configFile: null });
+  assert.equal(at('192.168.1.57'), '192.168.1.57');
+  assert.equal(at('  192.168.1.57  '), '192.168.1.57', 'trimmed');
+  assert.equal(at('farm-edge.local'), 'farm-edge.local');
+  assert.equal(at('[fd00::1]'), '[fd00::1]', 'bracketed IPv6 is a host');
+
+  assert.equal(at(''), null);
+  assert.equal(at('   '), null);
+  assert.equal(at('http://192.168.1.57'), null, 'a scheme is not a host');
+  assert.equal(at('192.168.1.57:1700'), null, 'a port is not part of the address');
+  assert.equal(at('192.168.1.57/24'), null);
+  assert.equal(at(undefined), null);
+  assert.equal(resolveHostAddress(undefined), null);
+});
+
+test('pointing at the shared config file enables both things it supplies', () => {
+  // Subtle and worth pinning: the provisioner's config.json carries the API key AND
+  // gatewayBridgeHost, so naming it has to enable host-address-changed too. Requiring a
+  // second opt-in would make that check silently skip on exactly the stack it was
+  // written for — and a skipped check looks the same as a healthy site.
+  const prev = process.env.LEADSMAN_CHIRPSTACK_CONFIG;
+  try {
+    process.env.LEADSMAN_CHIRPSTACK_CONFIG = '/shared/config.json';
+    const cfg = parseConfig({ checks: [{ rule: 'host-address-changed' }] });
+    assert.equal(cfg.chirpstack.configFile, '/shared/config.json');
+    assert.equal(cfg.hostAddress.configFile, '/shared/config.json');
+    assert.equal(cfg.hostAddress.configKey, 'gatewayBridgeHost');
+  } finally {
+    if (prev === undefined) delete process.env.LEADSMAN_CHIRPSTACK_CONFIG;
+    else process.env.LEADSMAN_CHIRPSTACK_CONFIG = prev;
+  }
+
+  // Neither configured: both absent, and the checks that need them are skipped rather
+  // than run blind.
+  const bare = parseConfig({ checks: [{ rule: 'host-address-changed' }] });
+  assert.equal(bare.chirpstack, undefined);
+  assert.equal(bare.hostAddress, undefined);
+});
+
+test('an enabled check that will be skipped is reported by verify, as a warning', async () => {
+  // The runtime symptom of an unconfigured gateway check is "ran, found nothing", which
+  // is indistinguishable from a healthy fleet. Saying so at deploy time is the fix.
+  const { verify } = require('../dist/verify.js');
+  const rules = loadRules();
+  const store = {
+    verifyConnection: async () => ({ database: 'x', user: 'y', version: 'z' }),
+    hasSchema: async () => true,
+    describeTables: async () =>
+      new Map([
+        ['public.event_up', new Set(['dev_eui', 'device_name', 'time', 'rx_info', 'object'])],
+        ['leadsman.engine_state', new Set(['key', 'value', 'seen_at'])],
+        ['leadsman.run', new Set(['finished_at'])],
+      ]),
+    describePublicSchema: async () => new Map([['event_up', new Set(['dev_eui'])]]),
+  };
+
+  const report = await verify(
+    parseConfig({ checks: [{ rule: 'gateway-deaf' }, { rule: 'host-address-changed' }] }),
+    rules,
+    store,
+  );
+  // Warnings, not errors: skipping cleanly is the designed behaviour, so this must not
+  // stop `serve` from starting.
+  assert.equal(report.ok, true);
+  const skips = report.problems.filter((p) => /will be SKIPPED/.test(p.message));
+  assert.equal(skips.length, 2);
+  assert.ok(skips.every((p) => p.severity === 'warning'));
+  assert.match(skips.find((p) => p.where === 'checks.gateway-deaf').message, /chirpstack/);
+  assert.match(skips.find((p) => p.where === 'checks.host-address-changed').message, /host address/);
 });

@@ -108,3 +108,96 @@ export function scopeLabel(scope: DeviceScope): string | null {
 export function scopeFrom(ctx: SoundingContext): DeviceScope {
   return resolveScope(ctx.params);
 }
+
+/* -------------------------------------------------------------------------- */
+/* Gateway scoping                                                            */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Which gateways a check considers.
+ *
+ * Separate from DeviceScope rather than folded into it, because the two axes narrow
+ * different things and combining them would let a config say something meaningless —
+ * a device profile does not select gateways.
+ *
+ * The interesting parameter is `ignoreGateways`. A gateway inventory built from
+ * `rx_info` includes whatever has ever forwarded an uplink, which on a bench or during
+ * commissioning means test gateways, a colleague's handheld, and anything else that
+ * briefly appeared. Those raise a silence alert forever after, because they are silent
+ * and were once seen. Naming them here is how they stop.
+ */
+export interface GatewayScope {
+  /** Exact gateway EUIs to consider. Empty means every gateway seen. */
+  only: string[];
+  /** Exact gateway EUIs to skip. Applied after `only`. */
+  ignore: string[];
+}
+
+export const ANY_GATEWAY: GatewayScope = { only: [], ignore: [] };
+
+/** Parameters every gateway check exposes, so scoping reads the same everywhere. */
+export const GATEWAY_SCOPE_PARAMS = {
+  /**
+   * Restrict to these gateway EUIs (16 hex characters, case-insensitive). Empty means
+   * every gateway the event store has seen.
+   */
+  gateways: [] as string[],
+  /**
+   * Gateway EUIs to ignore — decommissioned units, and test gateways that appeared once
+   * and would otherwise be reported silent forever.
+   */
+  ignoreGateways: [] as string[],
+};
+
+/** Gateway EUIs are compared lowercase, matching how rx_info and the API report them. */
+function euiList(params: Record<string, unknown>, key: string): string[] {
+  const raw = params[key];
+  if (raw === null || raw === undefined) return [];
+  const list = Array.isArray(raw) ? raw : [raw];
+  return list.map((v, i) => {
+    if (typeof v !== 'string' || v.length === 0) {
+      throw new Error(`${key}[${i}] must be a non-empty gateway EUI string`);
+    }
+    return v.trim().toLowerCase();
+  });
+}
+
+export function resolveGatewayScope(params: Record<string, unknown>): GatewayScope {
+  return { only: euiList(params, 'gateways'), ignore: euiList(params, 'ignoreGateways') };
+}
+
+/**
+ * SQL predicate for a gateway scope, plus the values to bind.
+ *
+ * Same constant-shape approach as scopeClause: both parameters are always referenced so
+ * the statement text does not change with configuration. Consumes two positional
+ * parameters starting at `startIndex`.
+ */
+export function gatewayScopeClause(
+  scope: GatewayScope,
+  startIndex: number,
+  column = 'gateway_id',
+): { sql: string; values: unknown[] } {
+  const i = startIndex;
+  return {
+    sql:
+      `AND (cardinality($${i}::text[]) = 0 OR ${column} = ANY($${i}::text[])) ` +
+      `AND NOT (${column} = ANY($${i + 1}::text[]))`,
+    values: [scope.only, scope.ignore],
+  };
+}
+
+/** Filter an in-memory list, for checks whose gateways come from the API rather than SQL. */
+export function inGatewayScope(scope: GatewayScope, gatewayId: string): boolean {
+  const id = gatewayId.toLowerCase();
+  if (scope.only.length > 0 && !scope.only.includes(id)) return false;
+  return !scope.ignore.includes(id);
+}
+
+/** Human-readable gateway scope, for alert detail and log lines. */
+export function gatewayScopeLabel(scope: GatewayScope): string | null {
+  const parts: string[] = [];
+  if (scope.only.length > 0) parts.push(`gateways: ${scope.only.join(', ')}`);
+  if (scope.ignore.length > 0) parts.push(`ignoring: ${scope.ignore.join(', ')}`);
+  return parts.length > 0 ? parts.join('; ') : null;
+}

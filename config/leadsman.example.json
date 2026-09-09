@@ -1,17 +1,21 @@
 {
-  "//": "The full menu. Copy to config/leadsman.json, then enable what applies to your deployment. Most entries ship disabled because a sensible threshold depends on your crop, region, and equipment \u2014 enabling everything at once produces noise, not signal. No credentials here: the database URL comes from LEADSMAN_DATABASE_URL and the webhook token from LEADSMAN_WEBHOOK_TOKEN, so this file is safe to commit.",
-  "//units": "Every threshold below is in the normalized codec vocabulary's units, which are guaranteed by @intelligent-farming/lorawan-codec-normalization: \u00b0C, %, m/s, mm, mm/h, hPa, ppm, ppb, \u00b5g/m\u00b3, lux, W/m\u00b2, \u00b5mol/m\u00b2/s, dS/m, \u00b5S/cm, mg/L, mV, NTU, V, A, W, L, Wh, mm/s, g, Hz, dB, \u00b5m, g/h, degrees. See docs/vocabulary.md for every path.",
+  "//": "The full menu. Copy to config/leadsman.json, then enable what applies to your deployment. Most entries ship disabled because a sensible threshold depends on your crop, region, and equipment — enabling everything at once produces noise, not signal. No credentials here: the database URL comes from LEADSMAN_DATABASE_URL and the webhook token from LEADSMAN_WEBHOOK_TOKEN, so this file is safe to commit.",
+  "//units": "Every threshold below is in the normalized codec vocabulary's units, which are guaranteed by @intelligent-farming/lorawan-codec-normalization: °C, %, m/s, mm, mm/h, hPa, ppm, ppb, µg/m³, lux, W/m², µmol/m²/s, dS/m, µS/cm, mg/L, mV, NTU, V, A, W, L, Wh, mm/s, g, Hz, dB, µm, g/h, degrees. See docs/vocabulary.md for every path.",
   "schedule": "*/15 * * * *",
   "timezone": "America/Chicago",
   "statementTimeoutMs": 15000,
   "maxChecksPerRun": 64,
-  "//delivery": "NO DELIVERY BY DEFAULT \u2014 with no `notify` block, alerts are recorded and nothing is pushed. `leadsman status` and the leadsman.open_alert view show them. To deliver, add a notify block naming destinations and routing the two alert classes: \"notify\": {\"destinations\": {\"oncall\": {\"provider\": \"twilio\", \"to\": [\"+15125550123\"]}, \"agent\": {\"webhookUrl\": \"http://localhost:8644/hermes/agent\", \"webhookAuth\": \"hmac\"}}, \"routing\": {\"fact\": \"oncall\", \"situation\": \"agent\"}}. Providers: webhook, twilio, telegram, signal. Credentials come from the environment only \u2014 see the Environment table in the README.",
+  "//delivery": "NO DELIVERY BY DEFAULT — with no `notify` block, alerts are recorded and nothing is pushed. `leadsman status` and the leadsman.open_alert view show them. To deliver, add a notify block naming destinations and routing the two alert classes: \"notify\": {\"destinations\": {\"oncall\": {\"provider\": \"twilio\", \"to\": [\"+15125550123\"]}, \"agent\": {\"webhookUrl\": \"http://localhost:8644/hermes/agent\", \"webhookAuth\": \"hmac\"}}, \"routing\": {\"fact\": \"oncall\", \"situation\": \"agent\"}}. Providers: webhook, twilio, telegram, signal, slack. Every message leads \"Alert from <name>: \"; set LEADSMAN_INSTANCE_NAME (or notify.instanceName) to name this edge device, so several devices can share one channel. Unnamed installs report as \"Leadsman\". Credentials come from the environment only — see the Environment table in the README.",
+  "//suppress": "SUPPRESSION IS ON BY DEFAULT, and is the only default-on behaviour in this file that withholds anything. While a fleet-silent or gateway-silent alert is open, device-silent alerts are recorded with detail.suppressedBy and NOT delivered — because a gateway outage makes every device behind it look silent, and those alerts each name a sensor that is working fine. Nothing is dropped: they stay in `leadsman status` and leadsman.open_alert throughout, and any that is still open when the outage alert resolves is delivered then, so a node that really is dead is still reported. Override with e.g. \"suppress\": [{\"while\": [\"fleet-silent\"], \"mute\": [\"device-silent\", \"signal-degraded\"]}], where each `mute` entry matches a check's `as` name OR its rule id. Set \"suppress\": [] to deliver every alert regardless of cause.",
+  "//heartbeat": "NO HEARTBEAT BY DEFAULT. The one fault this engine cannot report is its own: while the host is down, Leadsman is down, and nothing is raised at all — a six-hour power cut looks exactly like a quiet night. A heartbeat inverts that, pushing a liveness ping off the box after every sounding so something external can alarm when the pings stop. That receiver must be somewhere the outage cannot reach; a watchdog on the same edge device dies with it. Add \"heartbeat\": {\"url\": \"https://hc-ping.example/abc123\", \"auth\": \"none\"} — or point it at a Hermes route with \"auth\": \"hmac\" and set LEADSMAN_WEBHOOK_TOKEN_HEARTBEAT. Also settable as LEADSMAN_HEARTBEAT_URL, and testable with `leadsman test-notify`. host-restarted reports the same outage retrospectively; the two are complements, and a deployment that cares about outages wants both.",
+  "//chirpstack": "OPTIONAL, and only gateway-deaf and gateway-never-seen use it. rx_info tells you which gateways ARE forwarding, which covers a gateway that stopped. It cannot show a gateway that is connected but hearing nothing, or one registered and never heard from — both are simply absent from the telemetry, indistinguishable from a gateway that was never installed. Those need the network server's own registry. Set LEADSMAN_CHIRPSTACK_CONFIG=/shared/config.json (the file intelligent-farming-stack's provisioner writes, holding chirpStackUrl + apiKey + tenantId — the same one leftenant reads), or add \"chirpstack\": {\"url\": \"http://chirpstack-rest-api:8090\", \"tenantId\": \"...\", \"configFile\": \"/shared/config.json\"}. The API key is read ONLY from that file, never from here, so this config stays committable. Unconfigured, those two checks report `skipped` in leadsman.run rather than quietly finding nothing.",
+  "//hostAddress": "OPTIONAL, and only host-address-changed uses it — but it is what turns \"the site is dark\" into \"the address moved from X to Y, re-point the gateways\". Leadsman cannot discover this itself: it runs in a bridged container, where the only visible addresses are on the docker network. It must be injected. Defaults to reading `gatewayBridgeHost` from the same /shared/config.json as `chirpstack` above, which is literally the address the stack detected on the host and handed to gateways. Or set LEADSMAN_HOST_ADDRESS directly. Unconfigured, the check is skipped.",
   "checks": [
     {
-      "//": "\u2550\u2550\u2550 FLEET HEALTH \u2014 enabled by default. These need no crop-specific tuning and catch the failures that make every other check blind. \u2550\u2550\u2550"
+      "//": "═══ FLEET HEALTH — enabled by default. These need no crop-specific tuning and catch the failures that make every other check blind. ═══"
     },
     {
-      "//": "Devices that stopped reporting. The one check a purely event-driven engine cannot do \u2014 you cannot trigger on a message that never arrived.",
+      "//": "Devices that stopped reporting. The one check a purely event-driven engine cannot do — you cannot trigger on a message that never arrived.",
       "rule": "device-silent",
       "enabled": true,
       "params": {
@@ -36,7 +40,7 @@
       }
     },
     {
-      "//": "Uplinks arriving but nothing decodes \u2014 a missing or broken payload codec. Silent under every other check because the radio link is healthy.",
+      "//": "Uplinks arriving but nothing decodes — a missing or broken payload codec. Silent under every other check because the radio link is healthy.",
       "rule": "decode-failure",
       "enabled": true,
       "params": {
@@ -46,7 +50,7 @@
       }
     },
     {
-      "//": "A field silently vanished from the codec output while uplinks keep decoding. Without this, every check on that field just stops matching the device and nothing fires \u2014 silence looks identical to health. Add one instance per measurement you actually depend on.",
+      "//": "A field silently vanished from the codec output while uplinks keep decoding. Without this, every check on that field just stops matching the device and nothing fires — silence looks identical to health. Add one instance per measurement you actually depend on.",
       "rule": "measurement-missing",
       "as": "soil-moisture-missing",
       "enabled": true,
@@ -61,7 +65,7 @@
       }
     },
     {
-      "//": "Leading indicator of coverage loss \u2014 warns before a node goes silent. Tune to your gateway layout before enabling, or it will be noisy.",
+      "//": "Leading indicator of coverage loss — warns before a node goes silent. Tune to your gateway layout before enabling, or it will be noisy.",
       "rule": "signal-degraded",
       "enabled": false,
       "params": {
@@ -72,7 +76,7 @@
       }
     },
     {
-      "//": "\u2550\u2550\u2550 NETWORK LAYER \u2014 faults that never appear in event_up \u2550\u2550\u2550 Every check above reads decoded telemetry. These read the other tables ChirpStack's integration writes, and they catch devices that look perfectly healthy in event_up. Enabled by default: they need no crop- or site-specific tuning, and two of them keep working when the payload codec is broken."
+      "//": "═══ NETWORK LAYER — faults that never appear in event_up ═══ Every check above reads decoded telemetry. These read the other tables ChirpStack's integration writes, and they catch devices that look perfectly healthy in event_up. Enabled by default: they need no crop- or site-specific tuning, and two of them keep working when the payload codec is broken."
     },
     {
       "//": "ChirpStack's own diagnosis, from event_log: codec failures, MIC errors, OTAA failures. The only check that reports what the network server explicitly recorded rather than inferring it. Filters on level (2 = ERROR) rather than a code allowlist, so a code added by a future ChirpStack version still reaches you with its own description. Code 7 is excluded because frame-counter retransmission is normal LoRaWAN behaviour that every healthy device logs.",
@@ -88,7 +92,7 @@
       }
     },
     {
-      "//": "Battery percentage from the LoRaWAN MAC layer (DevStatusAns), not the payload codec. This is the check that still works when decoding is broken \u2014 exactly when a flat battery would otherwise go unnoticed, because every codec-based check has already gone quiet. Mains-powered nodes and devices reporting battery_level_unavailable are skipped rather than thresholded. Note the two-week window: status events arrive on the device profile's DevStatusReq interval, often daily or less.",
+      "//": "Battery percentage from the LoRaWAN MAC layer (DevStatusAns), not the payload codec. This is the check that still works when decoding is broken — exactly when a flat battery would otherwise go unnoticed, because every codec-based check has already gone quiet. Mains-powered nodes and devices reporting battery_level_unavailable are skipped rather than thresholded. Note the two-week window: status events arrive on the device profile's DevStatusReq interval, often daily or less.",
       "rule": "status-battery-low",
       "enabled": true,
       "params": {
@@ -100,7 +104,7 @@
       }
     },
     {
-      "//": "Demodulation margin from DevStatusAns \u2014 how well the device can hear the GATEWAY. signal-degraded measures the opposite direction. Asymmetry is common, and a low margin breaks everything that needs a downlink: ADR cannot retune the device, confirmed uplinks never get acked, and actuator commands never arrive. An early warning for join-churn and downlink-unacked.",
+      "//": "Demodulation margin from DevStatusAns — how well the device can hear the GATEWAY. signal-degraded measures the opposite direction. Asymmetry is common, and a low margin breaks everything that needs a downlink: ADR cannot retune the device, confirmed uplinks never get acked, and actuator commands never arrive. An early warning for join-churn and downlink-unacked.",
       "rule": "status-margin-low",
       "enabled": true,
       "params": {
@@ -111,7 +115,7 @@
       }
     },
     {
-      "//": "Repeated rejoins. Each one discards queued downlinks and resets ADR, so the device restarts at its slowest data rate. Judged on joins relative to uplinks as well as joins alone \u2014 a device that joins more often than it reports is effectively down, however few joins that is in absolute terms. Usually a power-cycling device, a failing downlink path, or a key mismatch after re-provisioning.",
+      "//": "Repeated rejoins. Each one discards queued downlinks and resets ADR, so the device restarts at its slowest data rate. Judged on joins relative to uplinks as well as joins alone — a device that joins more often than it reports is effectively down, however few joins that is in absolute terms. Usually a power-cycling device, a failing downlink path, or a key mismatch after re-provisioning.",
       "rule": "join-churn",
       "enabled": true,
       "params": {
@@ -122,7 +126,7 @@
       }
     },
     {
-      "//": "Confirmed downlinks that were never acknowledged \u2014 a command you sent did not land. Silent in the telemetry: a valve that failed to open produces no anomalous reading, and a scheduler assuming success moves on. Disabled by default because event_ack only receives rows for CONFIRMED downlinks; enable it if you actuate anything.",
+      "//": "Confirmed downlinks that were never acknowledged — a command you sent did not land. Silent in the telemetry: a valve that failed to open produces no anomalous reading, and a scheduler assuming success moves on. Disabled by default because event_ack only receives rows for CONFIRMED downlinks; enable it if you actuate anything.",
       "rule": "downlink-unacked",
       "enabled": false,
       "params": {
@@ -132,7 +136,104 @@
       }
     },
     {
-      "//": "\u2550\u2550\u2550 FROST AND HEAT \u2014 temperature arrives at five different vocabulary paths depending on sensor type, so every entry lists all of them and uses whichever a device reports. \u2550\u2550\u2550"
+      "//": "═══ SITE, GATEWAY AND HOST HEALTH ═══ Every check above reports something wrong with a device. These report the layers underneath one — the gateway that carries it, the network server, the box this engine runs on — and they exist because a fault down there surfaces as dozens of device alerts that each name a healthy sensor. Enabled by default: they need no crop- or site-specific tuning, and the three that read ChirpStack's gateway API skip themselves cleanly when no connection is configured."
+    },
+    {
+      "//": "Nothing arriving from anything. The check that answers an outage in one sounding instead of three hours, and as one alert against the site instead of one per device. device-silent cannot do this job: its threshold has to tolerate the slowest device in the fleet, and its subject is always a sensor. Suppresses device-silent while open — see the `suppress` block above.",
+      "rule": "fleet-silent",
+      "enabled": true,
+      "params": {
+        "silentMinutes": 30,
+        "inventoryHours": 168,
+        "minDevices": 2
+      }
+    },
+    {
+      "//": "One gateway of several has stopped forwarding. Invisible before this existed, because no check read a gateway identifier — the symptom was a handful of device-silent alerts naming sensors that were all working. Add any transient or decommissioned gateway EUIs to ignoreGateways, or they are reported silent until the inventory window forgets them.",
+      "rule": "gateway-silent",
+      "enabled": true,
+      "params": {
+        "silentMinutes": 60,
+        "inventoryHours": 168,
+        "minReceptions": 20,
+        "requireAnotherActive": true,
+        "ignoreGateways": []
+      }
+    },
+    {
+      "//": "The edge device rebooted, and how long nothing was being watched. The only check that makes a power cut visible after the fact — while the host is down this engine is down, so nothing else can report it. Pair it with a `heartbeat` block, which is the only thing that can raise an alarm DURING the outage rather than after.",
+      "rule": "host-restarted",
+      "enabled": true,
+      "params": {
+        "withinMinutes": 120,
+        "minGapMinutes": 15
+      }
+    },
+    {
+      "//": "This host is no longer at the address the gateways were told to forward to — the DHCP-lease-after-a-power-cut failure. Gateways never rediscover their network server, so all of them are orphaned until each is re-pointed by hand. Needs an address source (LEADSMAN_HOST_ADDRESS, or the stack's /shared/config.json); skipped, not silent, when there is none.",
+      "rule": "host-address-changed",
+      "enabled": true,
+      "params": {
+        "openForHours": 72
+      }
+    },
+    {
+      "//": "Gateway online and hearing nothing: dead concentrator, disconnected antenna, water in the feeder. Structurally invisible to every rx_info check, because a gateway that receives nothing leaves no trace to read — which is why this one needs ChirpStack's gateway API. Skipped when no `chirpstack` connection is configured.",
+      "rule": "gateway-deaf",
+      "enabled": true,
+      "params": {
+        "onlineWithinMinutes": 15,
+        "lookbackHours": 6,
+        "maxReceptions": 0,
+        "minPeerReceptions": 20
+      }
+    },
+    {
+      "//": "Registered in ChirpStack, never connected — the commissioning mistake, and the state a re-pointed gateway lands in when its new address is mistyped. The grace period is there because registering a gateway before installing it is the normal order of work.",
+      "rule": "gateway-never-seen",
+      "enabled": true,
+      "params": {
+        "graceMinutes": 1440
+      }
+    },
+    {
+      "//": "A gateway that keeps dropping out and coming back: failing PoE, chewed ethernet, a solar site browning out at dawn. Uplinks arriving during each gap are lost silently, since LoRaWAN uplinks are never retried. DISABLED because bucketMinutes must be comfortably longer than your fleet's uplink interval — at 15 minutes a fleet reporting hourly would be reported as flapping constantly.",
+      "rule": "gateway-flapping",
+      "enabled": false,
+      "params": {
+        "lookbackHours": 24,
+        "bucketMinutes": 15,
+        "minDropouts": 4,
+        "minPresenceRatio": 0.3,
+        "minReceptions": 20
+      }
+    },
+    {
+      "//": "Devices that used to reach several gateways and now reach one. The failure has already happened; the device just has not been cut off yet. signal-degraded cannot see it — the surviving link may be excellent. DISABLED because the right minimum is a property of your site plan, and a single-gateway deployment would raise it for the whole fleet.",
+      "rule": "gateway-redundancy-lost",
+      "enabled": false,
+      "params": {
+        "minGateways": 2,
+        "historyHours": 336,
+        "recentHours": 24,
+        "minHistoricalGateways": 2,
+        "minRecentUplinks": 10,
+        "minHistoricalUplinks": 50
+      }
+    },
+    {
+      "//": "A gateway that stopped keeping accurate time, by GPS or otherwise. Breaks Class-B, downlink windows and geolocation while uplinks keep flowing, so it surfaces as downlink-unacked and join-churn on the wrong devices. DISABLED pending verification: which time fields rx_info carries varies by ChirpStack and gateway firmware version. Run the jsonb_object_keys query in src/gateway.ts first.",
+      "rule": "gateway-time-unsynced",
+      "enabled": false,
+      "params": {
+        "lookbackHours": 24,
+        "minTimestampedRatio": 0.5,
+        "maxSkewSeconds": 10,
+        "minReceptions": 50
+      }
+    },
+    {
+      "//": "═══ FROST AND HEAT — temperature arrives at five different vocabulary paths depending on sensor type, so every entry lists all of them and uses whichever a device reports. ═══"
     },
     {
       "//": "Current temperature approaching freezing.",
@@ -210,10 +311,10 @@
       }
     },
     {
-      "//": "\u2550\u2550\u2550 WIND \u2014 wind.speed is always m/s after normalization (knots \u00d7 0.514444). Point at a gust field if your station provides one; otherwise measurement-peak recovers the gust from the window. \u2550\u2550\u2550"
+      "//": "═══ WIND — wind.speed is always m/s after normalization (knots × 0.514444). Point at a gust field if your station provides one; otherwise measurement-peak recovers the gust from the window. ═══"
     },
     {
-      "//": "Sustained wind \u2014 spray drift, vent closing. 12 m/s \u2248 27 mph.",
+      "//": "Sustained wind — spray drift, vent closing. 12 m/s ≈ 27 mph.",
       "rule": "measurement-threshold",
       "as": "wind-advisory",
       "enabled": false,
@@ -229,7 +330,7 @@
       }
     },
     {
-      "//": "Gusts. Catches a peak between uplinks that an averaged latest-reading check would miss entirely. 17 m/s \u2248 38 mph.",
+      "//": "Gusts. Catches a peak between uplinks that an averaged latest-reading check would miss entirely. 17 m/s ≈ 38 mph.",
       "rule": "measurement-peak",
       "as": "wind-gust",
       "enabled": false,
@@ -245,7 +346,7 @@
       }
     },
     {
-      "//": "Damaging wind. 25 m/s \u2248 56 mph \u2014 secure equipment, expect structural damage.",
+      "//": "Damaging wind. 25 m/s ≈ 56 mph — secure equipment, expect structural damage.",
       "rule": "measurement-peak",
       "as": "wind-damaging",
       "enabled": false,
@@ -277,10 +378,10 @@
       }
     },
     {
-      "//": "\u2550\u2550\u2550 RAIN \u2550\u2550\u2550"
+      "//": "═══ RAIN ═══"
     },
     {
-      "//": "Rainfall intensity \u2014 field access, erosion, spray windows.",
+      "//": "Rainfall intensity — field access, erosion, spray windows.",
       "rule": "measurement-threshold",
       "as": "heavy-rain",
       "enabled": false,
@@ -296,7 +397,7 @@
       }
     },
     {
-      "//": "Peak intensity anywhere in the window \u2014 a cloudburst between uplinks.",
+      "//": "Peak intensity anywhere in the window — a cloudburst between uplinks.",
       "rule": "measurement-peak",
       "as": "rain-burst",
       "enabled": false,
@@ -312,7 +413,7 @@
       }
     },
     {
-      "//": "\u2550\u2550\u2550 SOIL AND IRRIGATION \u2550\u2550\u2550"
+      "//": "═══ SOIL AND IRRIGATION ═══"
     },
     {
       "rule": "measurement-threshold",
@@ -330,7 +431,7 @@
       }
     },
     {
-      "//": "Waterlogging \u2014 root-zone oxygen loss after over-irrigation or heavy rain.",
+      "//": "Waterlogging — root-zone oxygen loss after over-irrigation or heavy rain.",
       "rule": "measurement-threshold",
       "as": "soil-waterlogged",
       "enabled": false,
@@ -409,7 +510,7 @@
       }
     },
     {
-      "//": "\u2550\u2550\u2550 TANK AND WATER LEVEL \u2014 level arrives as a percentage, a volume, a depth, or an ullage distance depending on the sensor. Order the candidates by what you prefer to threshold on. \u2550\u2550\u2550"
+      "//": "═══ TANK AND WATER LEVEL — level arrives as a percentage, a volume, a depth, or an ullage distance depending on the sensor. Order the candidates by what you prefer to threshold on. ═══"
     },
     {
       "rule": "measurement-threshold",
@@ -465,7 +566,7 @@
       }
     },
     {
-      "//": "\u2550\u2550\u2550 WATER METERING \u2014 counters need different treatment from instantaneous readings: 'unchanged' is normal most of the time. \u2550\u2550\u2550"
+      "//": "═══ WATER METERING — counters need different treatment from instantaneous readings: 'unchanged' is normal most of the time. ═══"
     },
     {
       "//": "Burst pipe, stuck float valve, trough left running. The total climbs steadily while every other check stays quiet.",
@@ -486,7 +587,7 @@
       }
     },
     {
-      "//": "No water used when it should have been \u2014 failed pump, closed valve, seized meter. Only enable on meters where consumption is genuinely expected in the window; never on rain.cumulative, where flat means dry weather.",
+      "//": "No water used when it should have been — failed pump, closed valve, seized meter. Only enable on meters where consumption is genuinely expected in the window; never on rain.cumulative, where flat means dry weather.",
       "rule": "counter-stalled",
       "as": "water-meter-stalled",
       "enabled": false,
@@ -517,7 +618,7 @@
       }
     },
     {
-      "//": "\u2550\u2550\u2550 WATER QUALITY \u2014 livestock troughs, ponds, hydroponic reservoirs. \u2550\u2550\u2550"
+      "//": "═══ WATER QUALITY — livestock troughs, ponds, hydroponic reservoirs. ═══"
     },
     {
       "rule": "measurement-threshold",
@@ -567,7 +668,7 @@
       }
     },
     {
-      "//": "water.ec is \u00b5S/cm here (soil.ec is dS/m \u2014 different units, same concept).",
+      "//": "water.ec is µS/cm here (soil.ec is dS/m — different units, same concept).",
       "rule": "measurement-threshold",
       "as": "water-ec-high",
       "enabled": false,
@@ -577,7 +678,7 @@
         ],
         "min": null,
         "max": 2000,
-        "unit": " \u00b5S/cm",
+        "unit": " µS/cm",
         "clearMargin": 100,
         "lookbackHours": 24
       }
@@ -600,10 +701,10 @@
       }
     },
     {
-      "//": "\u2550\u2550\u2550 AIR QUALITY AND GREENHOUSE CLIMATE \u2550\u2550\u2550"
+      "//": "═══ AIR QUALITY AND GREENHOUSE CLIMATE ═══"
     },
     {
-      "//": "CO2 too high \u2014 ventilation failure in a closed house, or a storage-room hazard.",
+      "//": "CO2 too high — ventilation failure in a closed house, or a storage-room hazard.",
       "rule": "measurement-threshold",
       "as": "co2-high",
       "enabled": false,
@@ -619,7 +720,7 @@
       }
     },
     {
-      "//": "CO2 too low \u2014 enrichment system has stopped in a greenhouse running above ambient.",
+      "//": "CO2 too low — enrichment system has stopped in a greenhouse running above ambient.",
       "rule": "measurement-threshold",
       "as": "co2-enrichment-failed",
       "enabled": false,
@@ -661,7 +762,7 @@
         ],
         "min": null,
         "max": 55,
-        "unit": " \u00b5g/m\u00b3",
+        "unit": " µg/m³",
         "clearMargin": 10,
         "lookbackHours": 6
       }
@@ -682,7 +783,7 @@
       }
     },
     {
-      "//": "\u2550\u2550\u2550 PLANT AND DISEASE \u2550\u2550\u2550"
+      "//": "═══ PLANT AND DISEASE ═══"
     },
     {
       "//": "Prolonged leaf wetness is the primary driver of fungal infection periods. Threshold plus duration is the real model; this is the threshold half.",
@@ -711,14 +812,14 @@
         ],
         "direction": "falling",
         "maxRatePerHour": 20,
-        "unit": "\u00b5m",
+        "unit": "µm",
         "lookbackHours": 12,
         "minSamples": 6,
         "minSpanHours": 4
       }
     },
     {
-      "//": "Sap flow collapsing during daylight means the plant has closed down \u2014 severe water stress or root damage.",
+      "//": "Sap flow collapsing during daylight means the plant has closed down — severe water stress or root damage.",
       "rule": "measurement-threshold",
       "as": "sap-flow-low",
       "enabled": false,
@@ -734,7 +835,7 @@
       }
     },
     {
-      "//": "\u2550\u2550\u2550 EQUIPMENT HEALTH \u2550\u2550\u2550"
+      "//": "═══ EQUIPMENT HEALTH ═══"
     },
     {
       "//": "Pump and motor bearing wear shows up in velocity RMS long before failure.",
@@ -764,13 +865,13 @@
         ],
         "min": null,
         "max": 15,
-        "unit": "\u00b0",
+        "unit": "°",
         "clearMargin": 3,
         "lookbackHours": 12
       }
     },
     {
-      "//": "Machine hour meter not advancing during a shift \u2014 equipment down or the meter failed.",
+      "//": "Machine hour meter not advancing during a shift — equipment down or the meter failed.",
       "rule": "counter-stalled",
       "as": "runtime-stalled",
       "enabled": false,
@@ -801,7 +902,7 @@
       }
     },
     {
-      "//": "\u2550\u2550\u2550 BOOLEAN ALARMS \u2014 flags rather than numbers. Each resolves when the flag reads false again. \u2550\u2550\u2550"
+      "//": "═══ BOOLEAN ALARMS — flags rather than numbers. Each resolves when the flag reads false again. ═══"
     },
     {
       "rule": "boolean-alarm",
@@ -891,10 +992,10 @@
       }
     },
     {
-      "//": "\u2550\u2550\u2550 ASSET TRACKING \u2550\u2550\u2550"
+      "//": "═══ ASSET TRACKING ═══"
     },
     {
-      "//": "Box fence: replace the bounds with your property corners. Use shape 'radius' with a tight radiusMetres for a fixed asset that should never move \u2014 that is a theft alarm.",
+      "//": "Box fence: replace the bounds with your property corners. Use shape 'radius' with a tight radiusMetres for a fixed asset that should never move — that is a theft alarm.",
       "rule": "geofence-breach",
       "as": "asset-left-property",
       "enabled": false,

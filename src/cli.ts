@@ -22,12 +22,14 @@ import { join } from 'node:path';
 import { Client } from 'pg';
 import { ConfigError, databaseUrlFromEnv, loadConfig } from './config';
 import { Store, type RaisedAlert } from './db';
+import { heartbeatSecretFromEnv, sendHeartbeat } from './heartbeat';
 import { createLogger } from './logger';
 import { loadRules, RuleLoadError } from './registry';
 import { notifyRaised } from './notify';
 import { runSounding } from './runner';
 import { serve } from './scheduler';
 import { verify } from './verify';
+import { version } from './version';
 
 interface Args {
   command: string;
@@ -103,7 +105,8 @@ Commands:
   serve                Stay resident and sound on the configured schedule
   status               Show currently open alerts
   migrate              Apply migrations/*.sql (needs an owner-role URL)
-  test-notify          Send a synthetic alert to every destination (no database needed)
+  test-notify          Send a synthetic alert to every destination, and one heartbeat
+                       ping if configured (no database needed)
   version              Print the engine version
 
 Options:
@@ -112,7 +115,7 @@ Options:
       --dry-run        run: evaluate and report without writing or notifying
       --run-on-start   serve: take a sounding immediately instead of waiting
       --json           Machine-readable output where supported
-      --to <name>      test-notify: only this destination
+      --to <name>      test-notify: only this destination, or "heartbeat"
 
 Environment:
   LEADSMAN_DATABASE_URL   Postgres URL for the engine role (required)
@@ -271,9 +274,26 @@ async function cmdStatus(args: Args): Promise<number> {
     }
     process.stdout.write(`${open.length} open alert(s):\n\n`);
     for (const a of open) {
-      const sent = a.notified_at ? 'notified' : 'pending';
+      // Suppressed is its own state, not a flavour of pending: "pending" invites you to
+      // wait for a text that is deliberately not coming, so say which alert is holding
+      // it back instead.
+      const sent = a.notified_at
+        ? 'notified'
+        : a.suppressed_at
+          ? 'suppressed'
+          : 'pending';
+      // Gateway, site and engine alerts have no DevEUI. Showing the subject kind keeps
+      // "0016c001f1e2d3c4" from reading as a sensor when it is a gateway. Site and
+      // engine have exactly one instance each, so their id carries no information and
+      // the kind alone is the clearer label.
+      const subject =
+        a.subject_kind === 'device'
+          ? a.subject_id
+          : a.subject_kind === 'gateway'
+            ? `gateway:${a.subject_name ?? a.subject_id}`
+            : a.subject_kind;
       process.stdout.write(
-        `  [${a.severity}] ${a.kind}  ${a.dev_eui}  (${sent})\n    ${a.summary}\n` +
+        `  [${a.severity}] ${a.kind}  ${subject}  (${sent})\n    ${a.summary}\n` +
           `    since ${a.raised_at}\n\n`,
       );
     }
@@ -336,36 +356,58 @@ async function cmdMigrate(): Promise<number> {
 }
 
 /**
- * Package version, read from package.json at runtime.
- *
- * Read rather than compiled in so it cannot drift from what npm or the image actually
- * shipped — a hardcoded string is exactly the thing that goes stale and then misreports
- * which config features are supported. dist/ sits one level below the package root, and
- * this build is CommonJS, so __dirname is the right anchor.
- */
-function version(): string {
-  try {
-    const raw = readFileSync(join(__dirname, '..', 'package.json'), 'utf8');
-    return (JSON.parse(raw) as { version?: string }).version ?? 'unknown';
-  } catch {
-    return 'unknown';
-  }
-}
-
-/**
  * Send a synthetic alert through the real delivery path.
  *
  * Deliberately needs no database. Setting up Telegram (bot token + a chat id you have to go
- * and find), Signal (a signal-cli-rest-api you host and register), or Twilio (a key and a
- * verified recipient) is fiddly, and the alternative to this command is waiting for a real
- * alert to discover you got one field wrong. Nothing is written: the store is a stub, so no
- * alert row is created and no notified_at is stamped.
+ * and find), Signal (a signal-cli-rest-api you host and register), Twilio (a key and a
+ * verified recipient), or Slack (an app, a bot scope, and a channel the bot is in) is fiddly,
+ * and the alternative to this command is waiting for a real alert to discover you got one
+ * field wrong. Nothing is written: the store is a stub, so no alert row is created and no
+ * notified_at is stamped.
  */
 async function cmdTestNotify(args: Args): Promise<number> {
   const config = loadConfig(args.config);
   const log = createLogger();
 
+  // The heartbeat is worth testing here more than anything else in this command. It is
+  // the only signal that survives the edge device being off, so a misconfigured one is
+  // discovered either now or during the outage it was meant to report.
+  let heartbeatFailed = 0;
+  if (config.heartbeat && (args.to === null || args.to === 'heartbeat')) {
+    process.stdout.write(`sending heartbeat to ${config.heartbeat.url} ... `);
+    const hb = await sendHeartbeat(
+      config.heartbeat,
+      {
+        schema: 'leadsman.heartbeat/1',
+        ...(config.notify?.instanceName ? { instance: config.notify.instanceName } : {}),
+        sentAt: new Date().toISOString(),
+        version: version(),
+        soundingMs: 0,
+        checksRun: 0,
+        checksErrored: 0,
+        openAlerts: 0,
+        suppressedAlerts: 0,
+      },
+      log,
+      heartbeatSecretFromEnv(),
+    );
+    if (hb.delivered) {
+      process.stdout.write('delivered\n');
+    } else {
+      heartbeatFailed = 1;
+      process.stdout.write(`FAILED (${hb.detail ?? 'see the warning above'})\n`);
+    }
+  }
+  if (args.to === 'heartbeat') {
+    if (!config.heartbeat) {
+      process.stderr.write('no heartbeat block in the config — nothing to test.\n');
+      return 2;
+    }
+    return heartbeatFailed > 0 ? 1 : 0;
+  }
+
   if (!config.notify) {
+    if (config.heartbeat) return heartbeatFailed > 0 ? 1 : 0;
     process.stderr.write(
       'no notify block in the config — nothing to test. Add notify.destinations first.\n',
     );
@@ -386,6 +428,9 @@ async function cmdTestNotify(args: Args): Promise<number> {
     id: 'test',
     ruleId: 'test-notify',
     kind: 'test-notify',
+    subjectKind: 'device',
+    subjectId: '0000000000000000',
+    subjectName: 'leadsman test',
     devEui: '0000000000000000',
     deviceName: 'leadsman test',
     severity: 'info',
@@ -420,11 +465,17 @@ async function cmdTestNotify(args: Args): Promise<number> {
     }
   }
 
-  if (failed > 0) {
-    process.stdout.write(`\n${failed} of ${targets.length} destination(s) failed\n`);
+  if (failed > 0 || heartbeatFailed > 0) {
+    process.stdout.write(
+      `\n${failed} of ${targets.length} destination(s) failed` +
+        (heartbeatFailed > 0 ? ', and the heartbeat failed' : '') +
+        '\n',
+    );
     return 1;
   }
-  process.stdout.write(`\n${targets.length} destination(s) ok\n`);
+  process.stdout.write(
+    `\n${targets.length} destination(s) ok${config.heartbeat ? ', heartbeat ok' : ''}\n`,
+  );
   return 0;
 }
 

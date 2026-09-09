@@ -57,9 +57,40 @@ CREATE TABLE IF NOT EXISTS event_ack (
 TRUNCATE event_up, event_join, event_status, event_log, event_ack;
 
 -- Good radio conditions by default, so signal-degraded stays quiet unless intended.
-CREATE OR REPLACE FUNCTION rx(rssi numeric DEFAULT -95, snr numeric DEFAULT 9.5)
+--
+-- Every reception now names the gateway that took it, because the gateway checks derive
+-- their whole inventory from this field — without an id they see no gateways at all and
+-- would report nothing while appearing to pass. `gw` defaults to GW_MAIN so all the
+-- existing fixtures below keep working unchanged.
+--
+-- snake_case `gateway_id` is what ChirpStack's PostgreSQL integration writes (its Rust
+-- structs serialize snake_case); the MQTT path emits camelCase `gatewayId` for the same
+-- field. The queries read either, and this fixture uses the form the event store
+-- actually stores.
+-- Drop the two-argument form this replaced. CREATE OR REPLACE only replaces a matching
+-- signature, so without this an older database (or the other fixture applied first)
+-- keeps both overloads and a bare rx() call fails as ambiguous.
+DROP FUNCTION IF EXISTS rx(numeric, numeric);
+
+CREATE OR REPLACE FUNCTION rx(
+  rssi numeric DEFAULT -95,
+  snr  numeric DEFAULT 9.5,
+  gw   text    DEFAULT 'aaaa000000000001'
+)
 RETURNS jsonb LANGUAGE sql IMMUTABLE AS
-$$ SELECT jsonb_build_array(jsonb_build_object('rssi', rssi, 'snr', snr)) $$;
+$$ SELECT jsonb_build_array(
+     jsonb_build_object('gateway_id', gw, 'rssi', rssi, 'snr', snr)) $$;
+
+-- Two gateways hearing the same uplink, for the redundancy check.
+CREATE OR REPLACE FUNCTION rx2(
+  gw_a text DEFAULT 'aaaa000000000001',
+  gw_b text DEFAULT 'aaaa000000000002',
+  rssi numeric DEFAULT -95
+)
+RETURNS jsonb LANGUAGE sql IMMUTABLE AS
+$$ SELECT jsonb_build_array(
+     jsonb_build_object('gateway_id', gw_a, 'rssi', rssi,     'snr', 9.5),
+     jsonb_build_object('gateway_id', gw_b, 'rssi', rssi - 12, 'snr', 4.0)) $$;
 
 -- ══ 00xx fleet health ════════════════════════════════════════════════════════
 
@@ -437,3 +468,71 @@ SELECT now() - make_interval(mins => 20 * g),
        jsonb_build_object('battery', 3.9,
          'metering', jsonb_build_object('water', jsonb_build_object('total', 5000.0 - (g - 1) * 40.0))), rx()
 FROM generate_series(1, 12) g;
+
+-- ══ b0xx gateway and site faults ═════════════════════════════════════════════
+--
+-- These faults belong to a GATEWAY, not to a device, which is the reason alerts grew a
+-- subject. Each fixture below therefore has two jobs: make the gateway look wrong, and
+-- keep the device carrying it looking right — otherwise the device checks fire too and
+-- the fixture cannot prove that the gateway check is the one that caught it.
+--
+-- Gateway inventory in this fixture:
+--   aaaa000000000001  GW_MAIN     the default on every uplink above; must stay healthy
+--   aaaa000000000002  GW_SECOND   a second receiver, for redundancy
+--   aaaa0000000000f0  GW_SILENT   forwarded for a while, then stopped
+--   aaaa0000000000f1  GW_FLAPPING present in bursts with real gaps between them
+
+-- GW_MAIN's continuous baseline.
+--
+-- Load-bearing, not filler. Every gateway check judges continuity from receptions, and
+-- the fixtures above are clustered in the last few hours — so without a steady series
+-- GW_MAIN has empty buckets further back and gets reported as flapping, which would make
+-- the gateway checks look broken when the fixture is what is wrong. Ten-minute uplinks
+-- across a full day keep it unambiguously present.
+INSERT INTO event_up (time, dev_eui, device_name, device_profile_name, object, rx_info)
+SELECT now() - make_interval(mins => 10 * g),
+       '00000000000000b3', 'gw-baseline-node', 'net-v1',
+       jsonb_build_object('battery', 3.9), rx()
+FROM generate_series(0, 144) g;
+
+-- gateway-silent: GW_SILENT carried this node until 5.6h ago and has forwarded nothing
+-- since, while GW_MAIN keeps working.
+--
+-- Five-minute spacing so every 15-minute bucket in its run is occupied: a gateway that
+-- was continuously present and then stopped is silent, not flapping, and the fixture has
+-- to distinguish the two or it proves nothing about either check.
+INSERT INTO event_up (time, dev_eui, device_name, device_profile_name, object, rx_info)
+SELECT now() - make_interval(mins => 330 + 5 * g),
+       '00000000000000b1', 'gw-orphan-node', 'net-v1',
+       jsonb_build_object('battery', 3.9), rx(-95, 9.5, 'aaaa0000000000f0')
+FROM generate_series(1, 30) g;
+
+-- The same node still reporting through GW_MAIN, so the DEVICE is healthy while its
+-- former gateway is not. Without this it would also trip device-silent, and the fixture
+-- would be asserting the storm rather than the fix.
+INSERT INTO event_up (time, dev_eui, device_name, device_profile_name, object, rx_info)
+SELECT now() - make_interval(mins => 5 * g),
+       '00000000000000b1', 'gw-orphan-node', 'net-v1',
+       jsonb_build_object('battery', 3.9), rx()
+FROM generate_series(0, 18) g;
+
+-- gateway-flapping: GW_FLAPPING appears in six one-hour bursts separated by half-hour
+-- gaps — 5 dropout-and-recovery cycles, about 70% present.
+--
+-- The shape is the whole point. The same total downtime in one continuous gap is an
+-- outage (gateway-silent's business); spread across repeated cycles it is failing
+-- hardware, and only the second is what this fixture represents. Its most recent
+-- reception is now, so the gateway is not silent and the device behind it is not either.
+INSERT INTO event_up (time, dev_eui, device_name, device_profile_name, object, rx_info)
+SELECT now() - make_interval(mins => (g / 12) * 90 + (g % 12) * 5),
+       '00000000000000b2', 'gw-flap-node', 'net-v1',
+       jsonb_build_object('battery', 3.9), rx(-95, 9.5, 'aaaa0000000000f1')
+FROM generate_series(0, 71) g;
+
+-- A node heard by two gateways throughout: the control for gateway-redundancy-lost,
+-- which must not fire on a device whose coverage never declined.
+INSERT INTO event_up (time, dev_eui, device_name, device_profile_name, object, rx_info)
+SELECT now() - make_interval(mins => 10 * g),
+       '00000000000000b4', 'gw-redundant-node', 'net-v1',
+       jsonb_build_object('battery', 3.9), rx2()
+FROM generate_series(0, 100) g;

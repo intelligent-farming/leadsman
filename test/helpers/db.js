@@ -114,15 +114,19 @@ exports.setup = async function setup(name) {
     );
   `);
 
-  // The migration is idempotent, so applying it here is safe whether or not the
-  // caller already ran `leadsman migrate`.
+  // Every migration, in order, exactly as `leadsman migrate` applies them — rather
+  // than a hardcoded 001. A test database built from one migration silently lacks
+  // whatever later ones add, and the failure surfaces as "column does not exist" from
+  // inside unrelated cases rather than as "the harness is out of date".
+  //
+  // They are all idempotent, so this is safe whether or not the caller already ran
+  // migrate. 002 indexes the event_* tables, which exist by now from the DDL above.
   const fs = require('node:fs');
   const path = require('node:path');
-  const migration = fs.readFileSync(
-    path.join(__dirname, '..', '..', 'migrations', '001_leadsman_schema.sql'),
-    'utf8',
-  );
-  await db.query(migration);
+  const dir = path.join(__dirname, '..', '..', 'migrations');
+  for (const file of fs.readdirSync(dir).filter((f) => f.endsWith('.sql')).sort()) {
+    await db.query(fs.readFileSync(path.join(dir, file), 'utf8'));
+  }
 
   const store = new Store({
     connectionString: scratchUrl.toString(), statementTimeoutMs: 15_000,
@@ -140,7 +144,9 @@ exports.teardown = async function teardown({ db, store, admin, dbName }) {
 
 exports.reset = async function reset(db) {
   await db.query('TRUNCATE event_up, event_join, event_status, event_log, event_ack');
-  await db.query('TRUNCATE leadsman.alert, leadsman.run');
+  // engine_state included: it is the one place a check remembers something across
+  // soundings, so leaving it behind would let one case decide another's outcome.
+  await db.query('TRUNCATE leadsman.alert, leadsman.run, leadsman.engine_state');
 };
 
 /**
@@ -170,14 +176,35 @@ exports.uplink = async function uplink(db, {
 };
 
 /** A minimal SoundingContext backed by the real store. */
-exports.ctx = function ctx(store, { params = {}, openDevEuis = new Set(), kind = 'test' } = {}) {
+exports.ctx = function ctx(
+  store,
+  {
+    params = {},
+    openDevEuis = new Set(),
+    kind = 'test',
+    // Null by default, so a check declaring `needs` sees the unconfigured case unless a
+    // test deliberately supplies one.
+    gateways = null,
+    engine = { postmasterStartTime: null, previousRunAt: null, hostAddress: null },
+  } = {},
+) {
   const lines = [];
   return {
     query: (sql, values) => store.query(sql, values),
     params,
     openDevEuis,
+    // The same set under both names — for a device check the subject ids ARE the DevEUIs.
+    openSubjects: openDevEuis,
     kind,
     now: new Date(),
+    gateways,
+    engine,
+    // Backed by the real table, so a check's cross-sounding memory is exercised against
+    // Postgres rather than a Map. Namespaced by kind, exactly as the runner does it.
+    state: {
+      get: (key) => store.getEngineState(`${kind}:${key}`),
+      set: (key, value) => store.setEngineState(`${kind}:${key}`, value),
+    },
     log: {
       debug: (m, meta) => lines.push(['debug', m, meta]),
       info: (m, meta) => lines.push(['info', m, meta]),

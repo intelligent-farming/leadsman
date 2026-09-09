@@ -58,6 +58,14 @@ const EXPECTED = [
   ['00000000000000a5', 'commands-failing'],
 ];
 
+// Faults that belong to something other than a device. Listed separately because they
+// are keyed by subject rather than DevEUI — which is the whole point of them: pinning a
+// gateway outage on one of the devices behind it is what this set exists to stop.
+const EXPECTED_INFRA = [
+  ['gateway', 'aaaa0000000000f0', 'gateway-silent'],
+  ['gateway', 'aaaa0000000000f1', 'gateway-flapping'],
+];
+
 // Controls. Any alert on one of these is a check firing where it should not.
 const HEALTHY = [
   '00000000000000ff', // healthy soil node
@@ -67,7 +75,19 @@ const HEALTHY = [
   '00000000000000a6', // mains-powered: battery figure is meaningless, must be ignored
   '00000000000000a7', // device reports battery_level_unavailable
   '00000000000000af', // healthy across every network table (code-7 noise only)
+  // The gateway fixtures' own devices. Each is deliberately healthy: the fault is in
+  // the gateway carrying it, and a device alert here would mean the gateway check is
+  // reporting the wrong subject — the exact confusion these checks exist to remove.
+  '00000000000000b1', // its former gateway went silent; it still reports via GW_MAIN
+  '00000000000000b2', // behind the flapping gateway, still reporting
+  '00000000000000b3', // GW_MAIN's continuity baseline
+  '00000000000000b4', // heard by two gateways throughout
 ];
+
+// Gateways that must never be reported. GW_MAIN carries almost the whole fixture, so an
+// alert against it means a gateway check is misreading continuity rather than finding a
+// fault.
+const HEALTHY_GATEWAYS = ['aaaa000000000001', 'aaaa000000000002'];
 
 function sounding() {
   execFileSync(process.execPath, ['dist/cli.js', 'run'], {
@@ -82,7 +102,10 @@ async function main() {
 
   const open = async () => {
     const { rows } = await db.query(
-      'SELECT kind, dev_eui, severity, summary, detail FROM leadsman.open_alert ORDER BY kind, dev_eui',
+      `SELECT kind, subject_kind, subject_id, subject_name, dev_eui, severity, summary,
+              detail, suppressed_at
+         FROM leadsman.open_alert
+        ORDER BY kind, subject_kind, subject_id`,
     );
     return rows;
   };
@@ -91,14 +114,34 @@ async function main() {
 
   // ── every seeded fault raised exactly one alert from the intended check ──────
   for (const [devEui, kind] of EXPECTED) {
-    const match = alerts.filter((a) => a.dev_eui === devEui && a.kind === kind);
+    const match = alerts.filter(
+      (a) => a.subject_kind === 'device' && a.subject_id === devEui && a.kind === kind,
+    );
     assert.equal(match.length, 1, `expected exactly one open "${kind}" alert for ${devEui}`);
+    // A device alert must still populate dev_eui, so anything reading it before subjects
+    // existed keeps working.
+    assert.equal(match[0].dev_eui, devEui, `${kind}/${devEui} must still carry dev_eui`);
   }
   console.log(`ok — ${EXPECTED.length} seeded faults each raised one alert`);
 
+  // ── the gateway faults were reported against the GATEWAY ────────────────────
+  for (const [subjectKind, subjectId, kind] of EXPECTED_INFRA) {
+    const match = alerts.filter(
+      (a) => a.subject_kind === subjectKind && a.subject_id === subjectId && a.kind === kind,
+    );
+    assert.equal(
+      match.length, 1,
+      `expected exactly one open "${kind}" alert for ${subjectKind} ${subjectId}`,
+    );
+    // Not smuggled through dev_eui: a gateway EUI is also 16 hex characters and would
+    // have fitted there perfectly, filing the outage against a device that does not exist.
+    assert.equal(match[0].dev_eui, null, `${kind} must not claim a DevEUI`);
+  }
+  console.log(`ok — ${EXPECTED_INFRA.length} gateway faults reported against the gateway`);
+
   // ── the healthy controls raised nothing ─────────────────────────────────────
   for (const devEui of HEALTHY) {
-    const noise = alerts.filter((a) => a.dev_eui === devEui);
+    const noise = alerts.filter((a) => a.subject_kind === 'device' && a.subject_id === devEui);
     assert.equal(
       noise.length,
       0,
@@ -106,17 +149,55 @@ async function main() {
         `over-firing: ${noise.map((a) => a.kind).join(', ')}`,
     );
   }
-  console.log(`ok — ${HEALTHY.length} healthy controls raised nothing`);
+  for (const gatewayId of HEALTHY_GATEWAYS) {
+    const noise = alerts.filter((a) => a.subject_kind === 'gateway' && a.subject_id === gatewayId);
+    assert.equal(
+      noise.length, 0,
+      `healthy gateway ${gatewayId} raised ${noise.length} alert(s): ` +
+        `${noise.map((a) => a.kind).join(', ')}`,
+    );
+  }
+  // Traffic is flowing throughout the fixture, so a site-level alert here would mean
+  // fleet-silent is misreading a busy store as a dark one.
+  assert.equal(
+    alerts.filter((a) => a.subject_kind === 'site').length, 0,
+    'fleet-silent must stay quiet while uplinks are arriving',
+  );
+  console.log(
+    `ok — ${HEALTHY.length} healthy devices, ${HEALTHY_GATEWAYS.length} healthy gateways ` +
+      'and the site raised nothing',
+  );
 
   // ── no alerts beyond the expected set ───────────────────────────────────────
-  const expectedKeys = new Set(EXPECTED.map(([d, k]) => `${d}|${k}`));
-  const unexpected = alerts.filter((a) => !expectedKeys.has(`${a.dev_eui}|${a.kind}`));
+  const expectedKeys = new Set([
+    ...EXPECTED.map(([d, k]) => `device|${d}|${k}`),
+    ...EXPECTED_INFRA.map(([sk, si, k]) => `${sk}|${si}|${k}`),
+  ]);
+  const unexpected = alerts.filter(
+    (a) => !expectedKeys.has(`${a.subject_kind}|${a.subject_id}|${a.kind}`),
+  );
   assert.equal(
     unexpected.length,
     0,
-    `unexpected alerts: ${unexpected.map((a) => `${a.kind}/${a.dev_eui}`).join(', ')}`,
+    `unexpected alerts: ${unexpected.map((a) => `${a.kind}/${a.subject_kind}:${a.subject_id}`).join(', ')}`,
   );
   console.log(`ok — no alerts outside the expected set (${alerts.length} total)`);
+
+  // ── suppression ─────────────────────────────────────────────────────────────
+  // GW_SILENT is open, and suppression is on by default, so the device-silent alert is
+  // recorded and withheld rather than pushed. This is the storm not happening: one
+  // gateway alert delivered, the device alerts held with an explanation attached.
+  const silentDevice = alerts.find(
+    (a) => a.kind === 'device-silent' && a.subject_id === '0000000000000001',
+  );
+  assert.ok(silentDevice.suppressed_at, 'device-silent must be withheld while a gateway is silent');
+  assert.equal(
+    silentDevice.detail.suppressedBy, 'gateway-silent',
+    'and must record which alert explains it',
+  );
+  const gatewayAlert = alerts.find((a) => a.kind === 'gateway-silent');
+  assert.equal(gatewayAlert.suppressed_at, null, 'the explaining alert is never itself withheld');
+  console.log('ok — a gateway outage withholds its downstream device alerts, with the reason');
 
   // ── multi-path resolution ───────────────────────────────────────────────────
   // The single frost-risk entry lists ["air.temperature", "temperature", ...].
@@ -185,9 +266,9 @@ async function main() {
   assert.equal(alerts.length, before, 'a second sounding must not raise duplicate alerts');
 
   const { rows: dupes } = await db.query(
-    `SELECT dev_eui, kind, count(*) AS n
+    `SELECT subject_kind, subject_id, kind, count(*) AS n
        FROM leadsman.alert WHERE resolved_at IS NULL
-      GROUP BY dev_eui, kind HAVING count(*) > 1`,
+      GROUP BY subject_kind, subject_id, kind HAVING count(*) > 1`,
   );
   assert.equal(dupes.length, 0, 'the partial unique index must prevent duplicate open alerts');
   console.log('ok — repeated soundings deduplicate');

@@ -106,21 +106,36 @@ CREATE INDEX IF NOT EXISTS run_errors_idx
 -- ── open_alert ────────────────────────────────────────────────────────────────
 -- The read surface. Point a notifier, a dashboard, or an agent at this rather
 -- than at the base table so the resolved-row filter lives in one place.
-CREATE OR REPLACE VIEW leadsman.open_alert AS
-SELECT id,
-       rule_id,
-       kind,
-       dev_eui,
-       device_name,
-       severity,
-       summary,
-       detail,
-       raised_at,
-       last_seen_at,
-       notified_at,
-       now() - raised_at AS open_for
-FROM leadsman.alert
-WHERE resolved_at IS NULL;
+-- Created only when absent, deliberately NOT with CREATE OR REPLACE.
+--
+-- `leadsman migrate` re-runs every file in order on every invocation — these
+-- migrations are re-runnable desired-state scripts, not append-only history. 003
+-- widens this view with the subject columns, and Postgres refuses to drop columns
+-- from an existing view, so an unguarded CREATE OR REPLACE here would fail the
+-- whole sequence on the second run. Whichever migration defines the widest shape
+-- owns the definition; this one just makes sure a fresh database has one.
+DO $view$
+BEGIN
+  IF to_regclass('leadsman.open_alert') IS NULL THEN
+    EXECUTE $sql$
+      CREATE VIEW leadsman.open_alert AS
+      SELECT id,
+             rule_id,
+             kind,
+             dev_eui,
+             device_name,
+             severity,
+             summary,
+             detail,
+             raised_at,
+             last_seen_at,
+             notified_at,
+             now() - raised_at AS open_for
+      FROM leadsman.alert
+      WHERE resolved_at IS NULL
+    $sql$;
+  END IF;
+END $view$;
 
 COMMENT ON VIEW leadsman.open_alert IS
   'Currently-breaching alerts. Read this instead of leadsman.alert directly.';

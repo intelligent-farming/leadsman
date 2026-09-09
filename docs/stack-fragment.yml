@@ -38,12 +38,54 @@
 #      docker compose run --rm leadsman verify
 #      docker compose up -d leadsman
 #
+# ── gateway checks and the host address ───────────────────────────────────────
+#
+# The `shared:/shared:ro` mount below is what enables gateway-deaf, gateway-never-seen
+# and host-address-changed. It needs nothing new from the stack: the provisioner already
+# writes /shared/config.json on every start with `chirpStackUrl`, `apiKey`, `tenantId`
+# and `gatewayBridgeHost`, and leftenant and mock-sensors already read the same file.
+#
+#   - LEADSMAN_CHIRPSTACK_CONFIG points at it for the gateway API. rx_info shows which
+#     gateways ARE forwarding; it cannot show one that is connected but hearing nothing,
+#     or one registered and never heard from, because both are simply absent from the
+#     telemetry. Those need the network server's registry.
+#   - `gatewayBridgeHost` is the host LAN address setup.sh detects and hands to gateways.
+#     Comparing it against the previous sounding's value is how a DHCP change after a
+#     power cut is reported as a cause rather than inferred from silence.
+#
+# The API key is read only from that file, never from the Leadsman config, so
+# config/leadsman.json stays committable. Without the mount, those three checks report
+# `skipped` in leadsman.run rather than quietly finding nothing.
+#
+# Caveat worth knowing: the file is refreshed when the stack is brought up through
+# setup.sh. A bare `docker compose up` can leave a stale gatewayBridgeHost, in which case
+# host-address-changed compares two stale values and stays quiet — it under-reports
+# rather than raising a false alarm.
+#
+# ── heartbeat ─────────────────────────────────────────────────────────────────
+#
+# Set LEADSMAN_HEARTBEAT_URL to have the engine POST a liveness ping after every
+# sounding. This is the only signal that survives the edge device being off: while the
+# host is down Leadsman is down, so nothing inside the stack can report the outage, and
+# a six-hour power cut produces no alerts at all. Point it somewhere the outage cannot
+# reach — a hosted ping receiver, or a Hermes route on different hardware. A watchdog on
+# this same box dies with it.
+#
+# `host-restarted` reports the same outage retrospectively, from the event store's
+# postmaster start time versus the last recorded sounding. The two are complements.
+#
+#   docker compose run --rm leadsman test-notify --to heartbeat
+#
 # ── notification ──────────────────────────────────────────────────────────────
 #
-# Set notify.destinations in the config: a messaging platform (twilio/telegram/signal)
+# Set notify.destinations in the config: a messaging platform (twilio/telegram/signal/slack)
 # for alerts a person should read, or a webhook for a Hermes route. Route `fact` alerts
 # to the messaging destination and `situation` alerts to an agent route — for routine
 # threshold alerts a Hermes route with `deliver_only: true` costs zero LLM tokens.
+#
+# Set LEADSMAN_INSTANCE_NAME per host when more than one edge device reports into the
+# same channel — every message leads "Alert from <name>: ", and an unnamed install
+# reports as "Alert from Leadsman".
 
   leadsman:
     # Swap `build:` for `image:` once this is published to a registry.
@@ -59,11 +101,23 @@
       LEADSMAN_MIGRATE_URL: >-
         postgres://${EVENTS_POSTGRES_USER:-events}:${EVENTS_POSTGRES_PASSWORD:-changeme}@events-postgres:5432/${EVENTS_POSTGRES_DB:-chirpstack_events}
       LEADSMAN_CONFIG: /etc/leadsman/leadsman.json
+      # Names this edge device in every alert it delivers, defaulting to "Leadsman".
+      # Leave unset for a single-site install; set it once two devices share a channel.
+      LEADSMAN_INSTANCE_NAME: ${LEADSMAN_INSTANCE_NAME:-}
       LEADSMAN_LOG_LEVEL: ${LEADSMAN_LOG_LEVEL:-info}
       LEADSMAN_LOG_FORMAT: json
       LEADSMAN_WEBHOOK_TOKEN: ${LEADSMAN_WEBHOOK_TOKEN:-}
+      # Gateway API + host address, both from the provisioner's shared config file.
+      # Comment out to run without the gateway checks; they skip cleanly.
+      LEADSMAN_CHIRPSTACK_CONFIG: /shared/config.json
+      # Liveness ping. Unset means no heartbeat — see the note above for why an
+      # outage-proof receiver has to live off this box.
+      LEADSMAN_HEARTBEAT_URL: ${LEADSMAN_HEARTBEAT_URL:-}
     volumes:
       - ./config:/etc/leadsman:ro
+      # Read-only: chirpStackUrl + apiKey + tenantId + gatewayBridgeHost, written by
+      # the provisioner on every start. Same mount leftenant and mock-sensors use.
+      - shared:/shared:ro
     depends_on:
       events-postgres:
         condition: service_healthy

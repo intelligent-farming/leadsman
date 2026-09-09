@@ -13,12 +13,20 @@
  *   twilio    SMS via Twilio's REST API
  *   telegram  a Telegram bot message
  *   signal    Signal via a signal-cli-rest-api instance you run
+ *   slack     a Slack bot message posted to a channel
  *
  * The providers are deliberately thin: render one line, make one POST, and let the existing
  * lifecycle do the rest. There is no send queue and no retry loop, because there does not
  * need to be — a failed delivery leaves notified_at null, so the next sounding picks the
  * alert up again. Provider credentials come from the environment only, so a config naming a
  * Twilio destination is still safe to commit.
+ *
+ * Every message names its sender: `Alert from <name>: <alert>`, where the name is
+ * `notify.instanceName` (normally LEADSMAN_INSTANCE_NAME) and falls back to "Leadsman" when
+ * the deployment is unnamed. That is what lets several edge devices share one channel or
+ * group chat — the rest of the line is identical between two devices watching the same kind
+ * of sensor, so without the name a recipient cannot tell which site is dry. Webhook receivers
+ * get a configured name as the payload's `instance` field instead of a prefix.
  *
  * Only *newly raised* alerts are sent. An alert that stays open across many soundings is
  * delivered once, which is the whole point of the raise/resolve lifecycle — and the reason a
@@ -104,12 +112,23 @@ export function resolveDestination(
 }
 
 /** Body posted per alert. Flat and small — a receiver can map it straight to a template. */
-function payload(alert: RaisedAlert): Record<string, unknown> {
+function payload(alert: RaisedAlert, instanceName?: string): Record<string, unknown> {
   return {
-    schema: 'leadsman.alert/1',
+    // /2 adds the three subject fields to /1 and changes nothing else. Every /1 field
+    // keeps its name and meaning, and devEui is still the DevEUI for a device alert, so a
+    // receiver written against /1 keeps working — it will simply see null where the
+    // subject is a gateway, the site, or the engine.
+    schema: 'leadsman.alert/2',
+    // Which edge device raised it, when the deployment is named. Omitted entirely rather than
+    // sent as null when it is not, so an existing receiver sees byte-identical bodies and the
+    // schema version does not have to move for an additive optional field.
+    ...(instanceName ? { instance: instanceName } : {}),
     id: alert.id,
     rule: alert.ruleId,
     kind: alert.kind,
+    subjectKind: alert.subjectKind,
+    subjectId: alert.subjectId,
+    subjectName: alert.subjectName,
     devEui: alert.devEui,
     deviceName: alert.deviceName,
     severity: alert.severity,
@@ -169,7 +188,9 @@ export async function notifyRaised(
     }
     warnIfUnsigned(dest, name, log);
     for (const alert of group) {
-      await deliver(alert, dest, name, store, log, outcome, config.messaging);
+      await deliver(
+        alert, dest, name, store, log, outcome, config.messaging, config.instanceName,
+      );
     }
   }
   return outcome;
@@ -196,11 +217,17 @@ function warnIfUnsigned(dest: NotifyDestination, name: string, log: Logger): voi
  *
  * The check summaries were written to be readable on their own — that was the point of making
  * every one of them a sentence rather than a metric dump — so this adds only what a recipient
- * needs to triage: the severity, and the alert kind as the identifier to quote when asking
- * about it. Typically lands near 90 characters, inside a single SMS segment.
+ * needs to triage: who is reporting, the severity, and the alert kind as the identifier to
+ * quote when asking about it. Typically lands near 100 characters, inside a single SMS
+ * segment.
  */
-export function renderMessage(alert: RaisedAlert): string {
-  return `Leadsman [${alert.severity.toUpperCase()}] ${alert.kind}: ${alert.summary}`;
+export function renderMessage(alert: RaisedAlert, instanceName?: string): string {
+  // The sender leads the line, and it is the *only* field that differs between two devices
+  // running the same check — "[CRITICAL] battery-low: node-3 3.15V" says nothing about which
+  // barn to walk to. Unnamed deployments fall back to "Leadsman" so the sender is never blank
+  // and there is exactly one message format to read, named or not.
+  const from = instanceName?.trim() || 'Leadsman';
+  return `Alert from ${from}: [${alert.severity.toUpperCase()}] ${alert.kind}: ${alert.summary}`;
 }
 
 interface SendResult {
@@ -214,12 +241,13 @@ interface SendResult {
 async function sendWebhook(
   alert: RaisedAlert,
   dest: NotifyDestination,
+  instanceName: string | undefined,
   signal: AbortSignal,
 ): Promise<SendResult> {
   if (!dest.webhookUrl) return { ok: false, detail: 'no webhookUrl configured' };
   // Serialize once: the signature covers these exact bytes, so re-stringifying for the
   // request body could produce a different string and a signature that never validates.
-  const body = JSON.stringify(payload(alert));
+  const body = JSON.stringify(payload(alert, instanceName));
   const headers: Record<string, string> = { 'content-type': 'application/json' };
   const auth = dest.webhookAuth ?? 'bearer';
 
@@ -253,9 +281,10 @@ async function sendTwilio(
   alert: RaisedAlert,
   dest: NotifyDestination,
   creds: NonNullable<MessagingCredentials['twilio']>,
+  instanceName: string | undefined,
   signal: AbortSignal,
 ): Promise<SendResult> {
-  const text = renderMessage(alert);
+  const text = renderMessage(alert, instanceName);
   const url =
     `${creds.baseUrl ?? 'https://api.twilio.com'}/2010-04-01/Accounts/` +
     `${encodeURIComponent(creds.accountSid)}/Messages.json`;
@@ -297,6 +326,7 @@ async function sendTelegram(
   alert: RaisedAlert,
   dest: NotifyDestination,
   creds: NonNullable<MessagingCredentials['telegram']>,
+  instanceName: string | undefined,
   signal: AbortSignal,
 ): Promise<SendResult> {
   const url = `${creds.baseUrl ?? 'https://api.telegram.org'}/bot${creds.botToken}/sendMessage`;
@@ -305,7 +335,7 @@ async function sendTelegram(
     headers: { 'content-type': 'application/json' },
     // No parse_mode: alert summaries contain characters Markdown would choke on (underscores
     // in paths, > in transitions), and a formatting error would reject the whole message.
-    body: JSON.stringify({ chat_id: dest.chatId, text: renderMessage(alert) }),
+    body: JSON.stringify({ chat_id: dest.chatId, text: renderMessage(alert, instanceName) }),
     signal,
   });
   // Telegram answers in an envelope: {"ok":false,"description":"..."}. It usually pairs that
@@ -329,6 +359,58 @@ async function sendTelegram(
 }
 
 /**
+ * Slack's `text` is parsed as mrkdwn, so `&`, `<` and `>` are metacharacters — `<` in
+ * particular opens Slack's link syntax, so an unescaped summary can render as garbage or
+ * swallow the rest of the line. Alert summaries are full of both: `>` in transitions and `<`
+ * in comparisons ("battery 3.15V (raise <=3.4V)").
+ *
+ * This is the Slack analogue of the no-parse_mode decision on sendTelegram — a formatting
+ * artifact in a critical alert is worse than plain text, so the metacharacters are neutered
+ * rather than the message being handed over for interpretation. Order matters: `&` first, or
+ * it would re-escape the ampersands the other two replacements introduce.
+ */
+function escapeSlackText(text: string): string {
+  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+/** Slack bot message via chat.postMessage. One POST per channel. */
+async function sendSlack(
+  alert: RaisedAlert,
+  dest: NotifyDestination,
+  creds: NonNullable<MessagingCredentials['slack']>,
+  instanceName: string | undefined,
+  signal: AbortSignal,
+): Promise<SendResult> {
+  const res = await fetch(`${creds.baseUrl ?? 'https://slack.com'}/api/chat.postMessage`, {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${creds.botToken}`,
+      'content-type': 'application/json; charset=utf-8',
+    },
+    body: JSON.stringify({
+      channel: dest.channel,
+      text: escapeSlackText(renderMessage(alert, instanceName)),
+    }),
+    signal,
+  });
+  // Slack answers a *rejected* message with HTTP 200 and {"ok":false,"error":"..."}. The
+  // envelope is the authoritative signal, exactly as with Telegram: trusting the status alone
+  // would stamp notified_at on an alert nobody received, and because no sounding retries a
+  // stamped alert it would be lost permanently. Errors worth recognising in the log:
+  // channel_not_found, not_in_channel, invalid_auth, ratelimited.
+  let envelope: { ok?: boolean; error?: string } | null = null;
+  try {
+    envelope = (await res.json()) as { ok?: boolean; error?: string };
+  } catch {
+    /* non-JSON body; fall back to the status */
+  }
+  if (!res.ok || envelope?.ok === false) {
+    return { ok: false, status: res.status, detail: envelope?.error ?? '' };
+  }
+  return { ok: true };
+}
+
+/**
  * Signal via signal-cli-rest-api, which you run yourself — Signal has no hosted send API.
  * Its /v2/send takes all recipients at once, so this is a single POST.
  */
@@ -336,13 +418,14 @@ async function sendSignal(
   alert: RaisedAlert,
   dest: NotifyDestination,
   creds: NonNullable<MessagingCredentials['signal']>,
+  instanceName: string | undefined,
   signal: AbortSignal,
 ): Promise<SendResult> {
   const res = await fetch(`${creds.baseUrl}/v2/send`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
-      message: renderMessage(alert),
+      message: renderMessage(alert, instanceName),
       number: creds.from,
       recipients: dest.to ?? [],
     }),
@@ -374,6 +457,7 @@ async function deliver(
   log: Logger,
   outcome: NotifyOutcome,
   messaging?: MessagingCredentials,
+  instanceName?: string,
 ): Promise<void> {
   outcome.attempted += 1;
   const controller = new AbortController();
@@ -386,20 +470,25 @@ async function deliver(
     if (provider === 'twilio') {
       const creds = messaging?.twilio;
       result = creds
-        ? await sendTwilio(alert, dest, creds, controller.signal)
+        ? await sendTwilio(alert, dest, creds, instanceName, controller.signal)
         : { ok: false, detail: 'twilio credentials not configured' };
     } else if (provider === 'telegram') {
       const creds = messaging?.telegram;
       result = creds
-        ? await sendTelegram(alert, dest, creds, controller.signal)
+        ? await sendTelegram(alert, dest, creds, instanceName, controller.signal)
         : { ok: false, detail: 'telegram credentials not configured' };
     } else if (provider === 'signal') {
       const creds = messaging?.signal;
       result = creds
-        ? await sendSignal(alert, dest, creds, controller.signal)
+        ? await sendSignal(alert, dest, creds, instanceName, controller.signal)
         : { ok: false, detail: 'signal credentials not configured' };
+    } else if (provider === 'slack') {
+      const creds = messaging?.slack;
+      result = creds
+        ? await sendSlack(alert, dest, creds, instanceName, controller.signal)
+        : { ok: false, detail: 'slack credentials not configured' };
     } else {
-      result = await sendWebhook(alert, dest, controller.signal);
+      result = await sendWebhook(alert, dest, instanceName, controller.signal);
     }
 
     if (!result.ok) {

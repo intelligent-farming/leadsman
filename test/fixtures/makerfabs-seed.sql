@@ -32,9 +32,22 @@ CREATE TABLE IF NOT EXISTS event_status (time timestamptz, dev_eui text);
 
 TRUNCATE event_up;
 
-CREATE OR REPLACE FUNCTION rx(rssi numeric DEFAULT -95, snr numeric DEFAULT 9.5)
+-- Same signature as seed.sql's rx(), deliberately.
+--
+-- CI applies both fixtures to the same database, and CREATE OR REPLACE only replaces a
+-- matching signature — a two-argument version alongside a three-argument one leaves two
+-- overloads, and a bare rx() call then fails with "function rx() is not unique". Dropping
+-- the older two-argument form makes this safe in either order.
+DROP FUNCTION IF EXISTS rx(numeric, numeric);
+
+CREATE OR REPLACE FUNCTION rx(
+  rssi numeric DEFAULT -95,
+  snr  numeric DEFAULT 9.5,
+  gw   text    DEFAULT 'aaaa000000000001'
+)
 RETURNS jsonb LANGUAGE sql IMMUTABLE AS
-$$ SELECT jsonb_build_array(jsonb_build_object('rssi', rssi, 'snr', snr)) $$;
+$$ SELECT jsonb_build_array(
+     jsonb_build_object('gateway_id', gw, 'rssi', rssi, 'snr', snr)) $$;
 
 -- ══ AGLWSM02 — makerfabs/soil-monitor ════════════════════════════════════════
 -- Shape: {make, model, battery, soil:{moisture, temperature, ec, pH}, transmitInterval}

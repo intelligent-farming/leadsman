@@ -117,7 +117,9 @@ jobs:
         run: psql "$LEADSMAN_DATABASE_URL" -q -f test/fixtures/makerfabs-seed.sql
 
       - name: Clear alert state between fixtures
-        run: psql "$LEADSMAN_DATABASE_URL" -q -c "TRUNCATE leadsman.alert, leadsman.run;"
+        # engine_state included: it is the one place a check remembers something across
+        # soundings, so leaving it would let the first fixture decide the second's outcome.
+        run: psql "$LEADSMAN_DATABASE_URL" -q -c "TRUNCATE leadsman.alert, leadsman.run, leadsman.engine_state;"
 
       - name: Makerfabs AgroSense config raises the expected alerts
         env:

@@ -9,9 +9,13 @@
 //     evidence the breach ended, and silently closing alerts would turn a database
 //     hiccup into "everything is fine". This is the single most dangerous thing the
 //     engine could get wrong, and it had no test.
-//   - Delivery failures must leave the alert pending so the next sounding retries it —
-//     the design deliberately has no separate retry queue.
-//   - Only newly-raised alerts notify. An alert open for a week must not re-send.
+//   - Delivery failures must leave the alert pending AND the next sounding must actually
+//     retry it — the design deliberately has no separate retry queue. Asserting the NULL
+//     notified_at alone was not enough: delivery once read only freshly-raised alerts, so
+//     a pending one was in fact never offered again.
+//   - An alert already delivered must not re-send while it stays open.
+//   - Suppression withholds delivery without losing the alert, and releases it when the
+//     alert that explained it resolves.
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -251,6 +255,10 @@ if (!h.available) {
   /** A throwaway HTTP endpoint that records what it received. */
   async function receiver(handler) {
     const received = [];
+    // Sockets are tracked so close() can destroy them. `fetch` keeps connections alive,
+    // so server.close() alone waits on an idle keep-alive socket and never resolves —
+    // which would hang the test rather than fail it.
+    const sockets = new Set();
     const server = http.createServer((req, res) => {
       let body = '';
       req.on('data', (c) => { body += c; });
@@ -259,16 +267,25 @@ if (!h.available) {
         handler(req, res, received);
       });
     });
+    server.on('connection', (sock) => {
+      sockets.add(sock);
+      sock.on('close', () => sockets.delete(sock));
+    });
     await new Promise((r) => server.listen(0, '127.0.0.1', r));
     return {
       url: `http://127.0.0.1:${server.address().port}/hook`,
       received,
-      close: () => new Promise((r) => server.close(r)),
+      close: () => new Promise((r) => {
+        server.close(r);
+        for (const sock of sockets) sock.destroy();
+      }),
     };
   }
 
   const raised = (id, devEui) => ({
-    id: String(id), ruleId: 'r', kind: 'r', devEui, deviceName: null,
+    id: String(id), ruleId: 'r', kind: 'r',
+    subjectKind: 'device', subjectId: devEui, subjectName: null,
+    devEui, deviceName: null,
     severity: 'warning', summary: `${devEui} unhappy`, detail: { v: 1 },
     raisedAt: new Date().toISOString(),
   });
@@ -292,8 +309,10 @@ if (!h.available) {
       assert.ok(after[0].notified_at, 'notified_at must be stamped on success');
 
       // The payload is the documented contract; a receiver templates against it.
-      assert.equal(hook.received[0].body.schema, 'leadsman.alert/1');
+      assert.equal(hook.received[0].body.schema, 'leadsman.alert/2');
       assert.equal(hook.received[0].body.devEui, 'aa');
+      assert.equal(hook.received[0].body.subjectKind, 'device');
+      assert.equal(hook.received[0].body.subjectId, 'aa');
       assert.equal(hook.received[0].body.severity, 'warning');
     } finally {
       await hook.close();
@@ -418,7 +437,7 @@ if (!h.available) {
     }
   });
 
-  test('notifier: only NEWLY raised alerts are delivered', async () => {
+  test('notifier: an alert already delivered is not delivered again while it stays open', async () => {
     const rule = fakeRule('r', async () => [finding('aa')]);
     const hook = await receiver((req, res) => { res.writeHead(204); res.end(); });
     try {
@@ -452,6 +471,306 @@ if (!h.available) {
     assert.equal(summary.raised, 1);
     assert.equal(summary.delivered, 0);
     assert.equal((await openAlerts()).length, 1);
+  });
+
+  test('notifier: a failed delivery IS retried on the next sounding', async () => {
+    // The retry the docs have always promised, which for a long time did not happen.
+    // Delivery used to work from reconcile's newly-inserted rows: on the second
+    // sounding the ON CONFLICT took the DO UPDATE branch, so the alert was no longer
+    // "new", its NULL notified_at was never revisited, and it was never offered again.
+    // A storm that throttled Twilio or Slack lost those alerts permanently.
+    //
+    // Delivery now reads the pending set — open, unnotified, unsuppressed — so the only
+    // record of delivery is notified_at, and anything lacking one is tried again.
+    let attempts = 0;
+    const hook = await receiver((req, res) => {
+      attempts += 1;
+      // Fail the first attempt, accept the second.
+      if (attempts === 1) { res.writeHead(500); res.end(); return; }
+      res.writeHead(204); res.end();
+    });
+    try {
+      const rule = fakeRule('r', async () => [finding('aa')]);
+      const cfg = {
+        schedule: '* * * * *',
+        statementTimeoutMs: 15_000,
+        notify: {
+          destinations: { hook: { webhookUrl: hook.url, timeoutMs: 2000 } },
+          defaultDestination: 'hook',
+        },
+        checks: [{ rule: 'r', as: 'r', enabled: true }],
+      };
+      const opts = {
+        config: cfg, rules: new Map([['r', rule]]), store: env.store, log: h.quietLogger(),
+      };
+
+      const first = await runSounding(opts);
+      assert.equal(first.delivered, 0);
+      assert.equal(first.deliveryFailed, 1);
+      assert.equal((await openAlerts())[0].notified_at, null);
+
+      const second = await runSounding(opts);
+      assert.equal(second.raised, 0, 'still the same open alert, not a new one');
+      assert.equal(second.delivered, 1, 'the pending alert is offered again');
+      assert.ok((await openAlerts())[0].notified_at, 'and stamped once it lands');
+
+      // A third sounding must not send a third time.
+      const third = await runSounding(opts);
+      assert.equal(third.delivered, 0);
+      assert.equal(attempts, 2, 'exactly two POSTs: one failed, one succeeded');
+    } finally {
+      await hook.close();
+    }
+  });
+
+  // ── suppression ────────────────────────────────────────────────────────────
+  // The pure matching logic is covered in the smoke suite. These cover the part that
+  // needs a database: that a withheld alert is recorded rather than dropped, and that it
+  // is delivered if it is still open when its cause resolves.
+
+  const suppressCfg = (hookUrl, extra = {}) => ({
+    schedule: '* * * * *',
+    statementTimeoutMs: 15_000,
+    suppress: [{ while: ['cause'], mute: ['downstream'], enabled: true }],
+    notify: {
+      destinations: { hook: { webhookUrl: hookUrl, timeoutMs: 2000 } },
+      defaultDestination: 'hook',
+    },
+    checks: [
+      { rule: 'cause', as: 'cause', enabled: true },
+      { rule: 'downstream', as: 'downstream', enabled: true },
+    ],
+    ...extra,
+  });
+
+  test('suppression records the muted alert and withholds only the delivery', async () => {
+    const hook = await receiver((req, res) => { res.writeHead(204); res.end(); });
+    try {
+      const summary = await runSounding({
+        config: suppressCfg(hook.url),
+        rules: new Map([
+          ['cause', fakeRule('cause', async () => [finding('site')])],
+          ['downstream', fakeRule('downstream', async () => [finding('aa')])],
+        ]),
+        store: env.store,
+        log: h.quietLogger(),
+      });
+
+      assert.equal(summary.raised, 2, 'both alerts are raised');
+      assert.equal(summary.suppressed, 1);
+      assert.equal(summary.delivered, 1, 'only the cause is delivered');
+      assert.equal(hook.received.length, 1);
+      assert.equal(hook.received[0].body.kind, 'cause');
+
+      // Recorded, visible, and explained — not dropped.
+      const rows = await env.store.query(
+        `SELECT kind, suppressed_at, detail->>'suppressedBy' AS by, notified_at
+           FROM leadsman.alert WHERE kind = 'downstream'`,
+      );
+      assert.equal(rows.length, 1);
+      assert.ok(rows[0].suppressed_at, 'suppressed_at is stamped');
+      assert.equal(rows[0].by, 'cause', 'and says what withheld it');
+      assert.equal(rows[0].notified_at, null, 'never delivered');
+    } finally {
+      await hook.close();
+    }
+  });
+
+  test('suppression releases a still-open alert when its cause resolves', async () => {
+    // The property that makes muting safe enough to be on by default: a node that
+    // really is dead is reported once the outage explaining it away has cleared.
+    const hook = await receiver((req, res) => { res.writeHead(204); res.end(); });
+    try {
+      let causeBreaching = true;
+      const rules = new Map([
+        ['cause', fakeRule('cause', async () => (causeBreaching ? [finding('site')] : []))],
+        ['downstream', fakeRule('downstream', async () => [finding('aa')])],
+      ]);
+      const opts = {
+        config: suppressCfg(hook.url), rules, store: env.store, log: h.quietLogger(),
+      };
+
+      const first = await runSounding(opts);
+      assert.equal(first.suppressed, 1);
+      assert.equal(first.delivered, 1);
+
+      // The cause clears; the downstream alert is still breaching.
+      causeBreaching = false;
+      const second = await runSounding(opts);
+      assert.equal(second.released, 1, 'suppression lifts in the same sounding');
+      assert.equal(second.delivered, 1, 'and the held alert goes out');
+      assert.equal(hook.received.length, 2);
+      assert.equal(hook.received[1].body.kind, 'downstream');
+
+      const rows = await env.store.query(
+        `SELECT suppressed_at, notified_at, detail ? 'suppressedBy' AS still_marked
+           FROM leadsman.alert WHERE kind = 'downstream'`,
+      );
+      assert.equal(rows[0].suppressed_at, null, 'no longer suppressed');
+      assert.equal(rows[0].still_marked, false, 'and the explanation is cleared');
+      assert.ok(rows[0].notified_at);
+    } finally {
+      await hook.close();
+    }
+  });
+
+  test('suppression withholds nothing when the downstream alert resolves with its cause', async () => {
+    // The common case: the devices were never broken, so their alerts resolve alongside
+    // the outage and are never delivered at all. This is the storm not happening.
+    const hook = await receiver((req, res) => { res.writeHead(204); res.end(); });
+    try {
+      let breaching = true;
+      const rules = new Map([
+        ['cause', fakeRule('cause', async () => (breaching ? [finding('site')] : []))],
+        ['downstream', fakeRule('downstream', async () => (breaching ? [finding('aa')] : []))],
+      ]);
+      const opts = {
+        config: suppressCfg(hook.url), rules, store: env.store, log: h.quietLogger(),
+      };
+
+      await runSounding(opts);
+      breaching = false;
+      const second = await runSounding(opts);
+
+      assert.equal(second.resolved, 2, 'both resolve');
+      assert.equal(second.delivered, 0);
+      assert.equal(hook.received.length, 1, 'the downstream alert was never sent');
+    } finally {
+      await hook.close();
+    }
+  });
+
+  test('"suppress": [] delivers the storm, which is the documented opt-out', async () => {
+    const hook = await receiver((req, res) => { res.writeHead(204); res.end(); });
+    try {
+      const summary = await runSounding({
+        config: suppressCfg(hook.url, { suppress: [] }),
+        rules: new Map([
+          ['cause', fakeRule('cause', async () => [finding('site')])],
+          ['downstream', fakeRule('downstream', async () => [finding('aa')])],
+        ]),
+        store: env.store,
+        log: h.quietLogger(),
+      });
+      assert.equal(summary.suppressed, 0);
+      assert.equal(summary.delivered, 2);
+    } finally {
+      await hook.close();
+    }
+  });
+
+  // ── subjects ───────────────────────────────────────────────────────────────
+
+  test('a gateway and a device can hold the same id without colliding', async () => {
+    // Dedup is keyed on (subject_kind, subject_id, kind). A gateway EUI and a DevEUI are
+    // both 16 hex characters and can legitimately coincide, so subject_kind has to be
+    // part of the key — otherwise one would resolve the other away every sounding.
+    const same = '0016c001f1e2d3c4';
+    const summary = await sound(
+      [
+        fakeRule('dev', async () => [{ devEui: same, summary: 'device unhappy' }]),
+        fakeRule('gw', async () => [
+          { subject: { kind: 'gateway', id: same, name: 'north-mast' }, summary: 'gateway unhappy' },
+        ]),
+      ],
+      [
+        { rule: 'dev', as: 'dev', enabled: true },
+        { rule: 'gw', as: 'gw', enabled: true },
+      ],
+    );
+    assert.equal(summary.raised, 2);
+
+    const rows = await env.store.query(
+      `SELECT subject_kind, subject_id, dev_eui, device_name, subject_name
+         FROM leadsman.alert ORDER BY subject_kind`,
+    );
+    assert.equal(rows.length, 2);
+
+    // The device row keeps dev_eui populated, so consumers predating subjects work on.
+    const device = rows.find((r) => r.subject_kind === 'device');
+    assert.equal(device.dev_eui, same);
+
+    // The gateway row leaves it NULL rather than filing a gateway fault against a
+    // device that does not exist.
+    const gateway = rows.find((r) => r.subject_kind === 'gateway');
+    assert.equal(gateway.subject_id, same);
+    assert.equal(gateway.dev_eui, null);
+    assert.equal(gateway.device_name, null);
+    assert.equal(gateway.subject_name, 'north-mast');
+  });
+
+  test('a check writes and reads its own state across soundings, namespaced by kind', async () => {
+    // Two instances of one rule must not share memory — that is what would make a
+    // per-site threshold in one instance overwrite another's.
+    const seen = [];
+    const remember = {
+      id: 'remember',
+      description: 'test rule that remembers something across soundings',
+      defaultSeverity: 'info',
+      defaultRouting: 'fact',
+      defaultParams: {},
+      requires: [{ table: 'event_up', columns: ['dev_eui'] }],
+      async run(ctx) {
+        seen.push([ctx.kind, (await ctx.state.get('v'))?.value ?? null]);
+        await ctx.state.set('v', ctx.kind);
+        return [];
+      },
+    };
+
+    const opts = {
+      config: {
+        schedule: '* * * * *',
+        statementTimeoutMs: 15_000,
+        checks: [
+          { rule: 'remember', as: 'one', enabled: true },
+          { rule: 'remember', as: 'two', enabled: true },
+        ],
+      },
+      rules: new Map([['remember', remember]]),
+      store: env.store,
+      log: h.quietLogger(),
+    };
+
+    await runSounding(opts);
+    await runSounding(opts);
+
+    assert.deepEqual(seen, [
+      ['one', null], ['two', null],       // nothing remembered yet
+      ['one', 'one'], ['two', 'two'],     // each sees only its own
+    ]);
+  });
+
+  test('--dry-run writes no check state, so the next real sounding still sees the change', async () => {
+    // A dry run that recorded a new host address would make the real sounding afterwards
+    // find no difference and report nothing — the outage would go unexplained.
+    const rule = {
+      id: 'drystate',
+      description: 'test rule that records something in its own state',
+      defaultSeverity: 'info',
+      defaultRouting: 'fact',
+      defaultParams: {},
+      requires: [{ table: 'event_up', columns: ['dev_eui'] }],
+      async run(ctx) {
+        await ctx.state.set('v', 'written');
+        return [];
+      },
+    };
+    const opts = {
+      config: {
+        schedule: '* * * * *',
+        statementTimeoutMs: 15_000,
+        checks: [{ rule: 'drystate', as: 'drystate', enabled: true }],
+      },
+      rules: new Map([['drystate', rule]]),
+      store: env.store,
+      log: h.quietLogger(),
+    };
+
+    await runSounding({ ...opts, dryRun: true });
+    assert.equal(await env.store.getEngineState('drystate:v'), null);
+
+    await runSounding(opts);
+    assert.equal((await env.store.getEngineState('drystate:v')).value, 'written');
   });
 
   // ── operational guarantees ──────────────────────────────────────────────────
@@ -540,14 +859,18 @@ if (!h.available) {
     // `verify` does this at startup for the configured checks; this covers every rule in
     // the registry, including ones no shipped config enables yet.
     const { loadRules } = require('../dist/registry.js');
-    const live = await env.store.describePublicSchema();
+    // Both schemas, and the same unqualified-means-public rule verify applies: most
+    // checks read ChirpStack's event tables in public, and a few read Leadsman's own in
+    // the leadsman schema.
+    const live = await env.store.describeTables(['public', 'leadsman']);
     const problems = [];
     for (const [id, rule] of loadRules()) {
       for (const req of rule.requires) {
-        const cols = live.get(req.table);
-        if (!cols) { problems.push(`${id}: table ${req.table} missing`); continue; }
+        const qualified = req.table.includes('.') ? req.table : `public.${req.table}`;
+        const cols = live.get(qualified);
+        if (!cols) { problems.push(`${id}: table ${qualified} missing`); continue; }
         for (const col of req.columns) {
-          if (!cols.has(col)) problems.push(`${id}: ${req.table}.${col} missing`);
+          if (!cols.has(col)) problems.push(`${id}: ${qualified}.${col} missing`);
         }
       }
     }

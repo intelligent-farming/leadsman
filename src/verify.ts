@@ -55,6 +55,7 @@ export async function verify(
     });
   }
 
+  const tables = await store.describeTables(['public', 'leadsman']);
   const live = await store.describePublicSchema();
   if (live.size === 0) {
     problems.push({
@@ -92,6 +93,27 @@ export async function verify(
       continue;
     }
 
+    // A check that will be skipped for want of configuration. Worth saying at deploy
+    // time, because the runtime symptom is a check that runs and finds nothing — which
+    // is indistinguishable from a healthy fleet, and is exactly the confusion the
+    // gateway checks exist to remove. A warning, not an error: skipping cleanly is the
+    // designed behaviour, and an operator may well not want the gateway API.
+    for (const need of rule.needs ?? []) {
+      const configured =
+        need === 'chirpstack' ? config.chirpstack !== undefined : config.hostAddress !== undefined;
+      if (configured) continue;
+      problems.push({
+        severity: 'warning',
+        where: `checks.${kind}`,
+        message:
+          need === 'chirpstack'
+            ? 'will be SKIPPED: no chirpstack connection configured. Set ' +
+              'LEADSMAN_CHIRPSTACK_CONFIG (or a chirpstack block) to enable it'
+            : 'will be SKIPPED: no host address source configured. Set ' +
+              'LEADSMAN_HOST_ADDRESS (or a hostAddress block) to enable it',
+      });
+    }
+
     // Unknown params are almost always typos, and a typo'd threshold silently
     // falls back to the default, which is the kind of bug that looks like the
     // check "not working" for weeks.
@@ -108,8 +130,11 @@ export async function verify(
     }
 
     for (const req of rule.requires) {
-      const cols = live.get(req.table);
-      const tableKey = `table:${req.table}`;
+      // An unqualified name means public, where ChirpStack's event tables live. A check
+      // reading Leadsman's own tables qualifies them (`leadsman.run`).
+      const qualified = req.table.includes('.') ? req.table : `public.${req.table}`;
+      const cols = tables.get(qualified);
+      const tableKey = `table:${qualified}`;
 
       if (!cols) {
         if (!reported.has(tableKey)) {
@@ -117,21 +142,21 @@ export async function verify(
           problems.push({
             severity: 'error',
             where: `rule.${rule.id}`,
-            message: `table public.${req.table} does not exist or is not readable`,
+            message: `table ${qualified} does not exist or is not readable`,
           });
         }
         continue;
       }
 
       for (const col of req.columns) {
-        const colKey = `column:${req.table}.${col}`;
+        const colKey = `column:${qualified}.${col}`;
         if (!cols.has(col) && !reported.has(colKey)) {
           reported.add(colKey);
           problems.push({
             severity: 'error',
             where: `rule.${rule.id}`,
             message:
-              `column public.${req.table}.${col} does not exist — this ChirpStack ` +
+              `column ${qualified}.${col} does not exist — this ChirpStack ` +
               `version may name it differently; adjust the check's SQL`,
           });
         }
