@@ -28,7 +28,7 @@ import { loadRules, RuleLoadError } from './registry';
 import { notifyRaised } from './notify';
 import { runSounding } from './runner';
 import { serve } from './scheduler';
-import { verify } from './verify';
+import { lintConfig, verify } from './verify';
 import { version } from './version';
 
 interface Args {
@@ -100,6 +100,7 @@ Usage: leadsman <command> [options]
 
 Commands:
   list                 List available checks and their parameters
+  lint                 Validate the config alone — no database needed
   verify               Validate config and database schema (no writes)
   run                  Take one sounding and exit
   serve                Stay resident and sound on the configured schedule
@@ -154,6 +155,50 @@ async function cmdList(args: Args): Promise<number> {
     process.stdout.write('\n');
   }
   return 0;
+}
+
+/**
+ * Everything `verify` checks that does not need a database.
+ *
+ * Exists because the config file is the part of a deployment most likely to be
+ * hand-edited and least likely to be tested, and the only tool that could check one
+ * required a reachable Postgres. That left operator configs — including this
+ * project's own bench config — machine-checked by nothing at all, while the two
+ * committed example configs were covered by unit tests they were not.
+ *
+ * Runs in a pre-commit hook, in CI, or on a laptop with no stack running.
+ */
+async function cmdLint(args: Args): Promise<number> {
+  const config = loadConfig(args.config);
+  const rules = loadRules({ extraDir: args.rulesDir });
+  const problems = await lintConfig(config, rules);
+  const errors = problems.filter((p) => p.severity === 'error').length;
+  const warnings = problems.length - errors;
+
+  if (args.json) {
+    process.stdout.write(
+      `${JSON.stringify({ ok: errors === 0, checks: config.checks.length, problems }, null, 2)}\n`,
+    );
+    return errors === 0 ? 0 : 1;
+  }
+
+  process.stdout.write(
+    `config: ${args.config}\n` +
+      `checks: ${config.checks.length} (${config.checks.filter((c) => c.enabled).length} enabled)\n\n`,
+  );
+  if (problems.length === 0) {
+    process.stdout.write('no problems found\n');
+  } else {
+    for (const p of problems) {
+      process.stdout.write(
+        `${p.severity === 'error' ? 'ERROR  ' : 'WARNING'} ${p.where}: ${p.message}\n`,
+      );
+    }
+    process.stdout.write(`\n${errors} error(s), ${warnings} warning(s)\n`);
+  }
+  // Warnings do not fail the command: "will be SKIPPED" is a legitimate deployment
+  // state, and a lint that exits non-zero for it cannot be used as a gate.
+  return errors === 0 ? 0 : 1;
 }
 
 async function cmdVerify(args: Args): Promise<number> {
@@ -485,6 +530,8 @@ async function main(): Promise<number> {
   switch (args.command) {
     case 'list':
       return cmdList(args);
+    case 'lint':
+      return cmdLint(args);
     case 'verify':
       return cmdVerify(args);
     case 'run':

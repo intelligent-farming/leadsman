@@ -26,8 +26,8 @@
  * open alert rather than notifying on every uplink.
  */
 
-import { int } from '../params';
-import { latestBooleans, pathsLabel, resolvePaths } from '../measurement';
+import { int, optNum, round } from '../params';
+import { booleanDwell, latestBooleans, pathsLabel, resolvePaths } from '../measurement';
 import { resolveScope, SCOPE_PARAMS } from '../scope';
 import type { Finding, Rule } from '../types';
 
@@ -53,6 +53,25 @@ const rule: Rule = {
     lookbackHours: 24,
     /** Wording for the alert summary, e.g. "leak detected". */
     label: 'alarm asserted',
+    /**
+     * Require the flag to have been asserted continuously this long before raising.
+     * 0 fires on the latest reading, which is the original behaviour and the right one
+     * for a leak or smoke detector — those are worth a text the instant they assert.
+     *
+     * Set it for everything that is normal briefly and expensive for long: a cold-store
+     * door, a pump, an irrigation valve. Three minutes open is someone fetching a
+     * pallet; three hours open is a ruined load, and the flag reads the same in both.
+     *
+     * Measured from the first asserted reading of the CURRENT run, so it understates by
+     * up to one reporting interval, and a flag asserted in a single reading is zero.
+     */
+    minDurationMinutes: 0,
+    /**
+     * A reporting gap longer than this breaks the run. A device that went silent and
+     * came back asserted was not observed asserted throughout. Only consulted when
+     * `minDurationMinutes` is set.
+     */
+    maxGapHours: 1,
     /** Narrow this check to part of the fleet — see src/scope.ts. */
     ...SCOPE_PARAMS,
   },
@@ -71,30 +90,83 @@ const rule: Rule = {
     }
     const trueValues = rawTrue.map((v) => String(v));
 
+    const minDurationMinutes = optNum(ctx.params, 'minDurationMinutes') ?? 0;
+    const maxGapHours = optNum(ctx.params, 'maxGapHours') ?? 1;
+    if (minDurationMinutes < 0) throw new Error('minDurationMinutes must not be negative');
+    if (maxGapHours <= 0) throw new Error('maxGapHours must be positive');
+    if (minDurationMinutes >= lookbackHours * 60) {
+      throw new Error(
+        `minDurationMinutes (${minDurationMinutes}) must be less than lookbackHours ` +
+          `(${lookbackHours}h) — a run cannot outlast the window it is measured in`,
+      );
+    }
+
     const scope = resolveScope(ctx.params);
-    const readings = await latestBooleans(ctx, paths, lookbackHours, trueValues, scope);
-    if (readings.length === 0) {
+
+    // Without a duration requirement this stays the one-query check it has always
+    // been. The dwell path costs a second scan of the window, so it is not paid for
+    // by deployments that did not ask for it.
+    if (minDurationMinutes === 0) {
+      const readings = await latestBooleans(ctx, paths, lookbackHours, trueValues, scope);
+      if (readings.length === 0) {
+        ctx.log.debug('no device reports any candidate path', { paths: pathsLabel(paths) });
+        return [];
+      }
+
+      return readings
+        .filter((r) => r.value)
+        .map((r) => {
+          const name = r.deviceName ?? r.devEui;
+          return {
+            devEui: r.devEui,
+            deviceName: r.deviceName,
+            summary: `${name}: ${label} (${r.matchedPath} = ${r.raw})`,
+            detail: {
+              measurement: r.matchedPath,
+              rawValue: r.raw,
+              trueValues,
+              candidatePaths: pathsLabel(paths),
+              readingAt: r.at,
+            },
+          };
+        });
+    }
+
+    const runs = await booleanDwell(ctx, paths, lookbackHours, trueValues, maxGapHours, scope);
+    if (runs.length === 0) {
       ctx.log.debug('no device reports any candidate path', { paths: pathsLabel(paths) });
       return [];
     }
 
-    return readings
-      .filter((r) => r.value)
-      .map((r) => {
-        const name = r.deviceName ?? r.devEui;
-        return {
-          devEui: r.devEui,
-          deviceName: r.deviceName,
-          summary: `${name}: ${label} (${r.matchedPath} = ${r.raw})`,
-          detail: {
-            measurement: r.matchedPath,
-            rawValue: r.raw,
-            trueValues,
-            candidatePaths: pathsLabel(paths),
-            readingAt: r.at,
-          },
-        };
+    const findings: Finding[] = [];
+    for (const r of runs) {
+      if (!r.asserted) continue;
+      const minutes = r.hours * 60;
+      // An open alert keeps its raise. The flag already proved it could hold, and
+      // re-imposing the duration every sounding would clear it the moment the run is
+      // recomputed a sample short.
+      if (!ctx.openDevEuis.has(r.devEui) && minutes < minDurationMinutes) continue;
+
+      const name = r.deviceName ?? r.devEui;
+      findings.push({
+        devEui: r.devEui,
+        deviceName: r.deviceName,
+        summary:
+          `${name}: ${label} for ${round(minutes, 0)} min ` +
+          `(${r.matchedPath} = ${r.raw}, raises at ${minDurationMinutes} min)`,
+        detail: {
+          measurement: r.matchedPath,
+          rawValue: r.raw,
+          assertedMinutes: round(minutes, 1),
+          requiredMinutes: minDurationMinutes,
+          samples: r.samples,
+          startedAt: r.startedAt,
+          candidatePaths: pathsLabel(paths),
+          readingAt: r.lastAt,
+        },
       });
+    }
+    return findings;
   },
 };
 

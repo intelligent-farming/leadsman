@@ -76,6 +76,15 @@
       }
     },
     {
+      "//": "A reading physics does not permit: negative humidity, pH above 14, a byte-order bug turning 21C into 5504C. ENABLED, and it needs no configuration at all — the bounds come from the normalized vocabulary's own schema, 73 paths with a declared physical range. This is a DATA-INTEGRITY check, not an agronomic one: a breach means the sensor or the codec is wrong, and the value has been poisoning every average, trend and accumulation downstream of it. Enable it on day one alongside decode-failure.",
+      "rule": "measurement-implausible",
+      "enabled": true,
+      "params": {
+        "lookbackHours": 24,
+        "minBreaches": 3
+      }
+    },
+    {
       "//": "═══ NETWORK LAYER — faults that never appear in event_up ═══ Every check above reads decoded telemetry. These read the other tables ChirpStack's integration writes, and they catch devices that look perfectly healthy in event_up. Enabled by default: they need no crop- or site-specific tuning, and two of them keep working when the payload codec is broken."
     },
     {
@@ -786,7 +795,7 @@
       "//": "═══ PLANT AND DISEASE ═══"
     },
     {
-      "//": "Prolonged leaf wetness is the primary driver of fungal infection periods. Threshold plus duration is the real model; this is the threshold half.",
+      "//": "Prolonged leaf wetness is the primary driver of fungal infection periods. This is the threshold half of the model — it says wetness is high right now. The duration half is the mold-risk entries below, which is what an infection period actually is.",
       "rule": "measurement-threshold",
       "as": "leaf-wetness-high",
       "enabled": false,
@@ -799,6 +808,60 @@
         "unit": "%",
         "clearMargin": 10,
         "lookbackHours": 12
+      }
+    },
+    {
+      "//": "GRAPES — botrytis bunch rot. Infection needs free water or near-saturation held on the tissue for hours while it is warm enough for the spores to germinate, which is why this is a duration check with a temperature gate and not a humidity threshold. Both halves matter: 90% RH alone fires on every cold clear autumn night and infects nothing, and 20C alone fires every afternoon. The 15-28C gate is the range cited for late-season infection, with the optimum near 21C for berries; four hours is the short end of the published wetness requirement — it is what suffices AT the optimum, where 12-24h is typical across the rest of the band, so this entry is deliberately sensitive — lengthen it if the block reports more risk than it has. DISABLED, and scoped to nothing useful as written: set deviceNamePattern or deviceProfiles to the vineyard's own devices before enabling, or every humidity sensor on the site reports vineyard risk.",
+      "rule": "mold-risk",
+      "as": "grape-botrytis-risk",
+      "enabled": false,
+      "params": {
+        "paths": [
+          "air.relativeHumidity"
+        ],
+        "humidityMin": 90,
+        "humidityMax": null,
+        "temperaturePaths": [
+          "air.temperature",
+          "temperature",
+          "leaf.temperature"
+        ],
+        "temperatureMin": 15,
+        "temperatureMax": 28,
+        "dwellHours": 4,
+        "lookbackHours": 24,
+        "maxGapHours": 2,
+        "minSamples": 4,
+        "clearDwellHours": 1,
+        "unit": "%",
+        "deviceNamePattern": "%vineyard%"
+      }
+    },
+    {
+      "//": "OLIVES — peacock spot (Venturia oleaginea), the wet-season leaf disease that defoliates a grove. It runs cooler and slower than botrytis, and the 10-20C gate is chosen to match the TWELVE-HOUR dwell rather than to bracket germination: conidia germinate from about 5C to 30C with an optimum near 20C, but the minimum wetness needed for infection is 12h only between about 10C and 20C — it rises to 18h at 5C and 24h at 25C. Pairing a 12h dwell with a wider gate would claim infections the wetness never supported. For olive anthracnose, the warmer autumn fruit rot, copy this entry with temperatureMin 18 / temperatureMax 25 and dwellHours 8 rather than widening this one — one entry spanning 10-25C would raise a peacock-spot alert for anthracnose weather and an agent cannot tell them apart from the alert. DISABLED and scoped by name, as above. Where the grove has wetness sensors, add a THIRD entry pointing paths at leaf.wetness with its own humidityMin rather than adding the path here: a wetness percentage and a relative humidity are different quantities and 90 does not mean the same thing in both.",
+      "rule": "mold-risk",
+      "as": "olive-peacock-spot-risk",
+      "enabled": false,
+      "params": {
+        "paths": [
+          "air.relativeHumidity"
+        ],
+        "humidityMin": 90,
+        "humidityMax": null,
+        "temperaturePaths": [
+          "leaf.temperature",
+          "air.temperature",
+          "temperature"
+        ],
+        "temperatureMin": 10,
+        "temperatureMax": 20,
+        "dwellHours": 12,
+        "lookbackHours": 36,
+        "maxGapHours": 3,
+        "minSamples": 6,
+        "clearDwellHours": 3,
+        "unit": "%",
+        "deviceNamePattern": "%olive%"
       }
     },
     {
@@ -832,6 +895,254 @@
         "unit": " g/h",
         "clearMargin": 2,
         "lookbackHours": 6
+      }
+    },
+    {
+      "//": "═══ ACCUMULATION — how much, not how high. Nothing else in this engine integrates over time, and most of the numbers a grower plans against are totals. Read the method parameter carefully: \"integral\" is the area under the curve and is right for anything that is a RATE or a persisting level; \"sum\" adds readings and is right ONLY when each reading is already a per-report quantity. A sum over a rate silently scales with how often the device reports. ═══"
+    },
+    {
+      "//": "GROWING DEGREE DAYS, base 10C, over the last 24h. scale 1/24 converts the C-hours integral into C-days. Reported as info and routed nowhere by default: a daily GDD figure is a planning input, not an alarm. The min bound is the useful half for most operations — a block running COLD against its expected accumulation is the one that will miss its harvest window, and no other rule in this engine can express that. Set min/max from your own phenology model.",
+      "rule": "measurement-accumulation",
+      "as": "growing-degree-days",
+      "enabled": false,
+      "params": {
+        "paths": [
+          "air.temperature",
+          "temperature"
+        ],
+        "method": "integral",
+        "base": 10,
+        "scale": 0.0416667,
+        "min": 8,
+        "max": null,
+        "unit": " GDD",
+        "lookbackHours": 24,
+        "maxGapHours": 3,
+        "minCoverage": 0.8,
+        "minSamples": 6
+      }
+    },
+    {
+      "//": "DAILY LIGHT INTEGRAL for a greenhouse, mol/m2/day from PAR in umol/m2/s. scale 0.0036 = 3600 seconds / 1e6 micromoles. The common minimum target under glass is 10-12; high-light crops want 12-18 and high-wire fruiting vegetables such as tomato and cucumber want 25-30, while low-light crops need only 3-6 — so SET min FROM YOUR CROP, and 12 below is the high-light figure, not a universal one. Below target the crop loses yield silently for weeks and nothing else here would say so. base null because there is no threshold below which light does not count.",
+      "rule": "measurement-accumulation",
+      "as": "daily-light-integral-low",
+      "enabled": false,
+      "params": {
+        "paths": [
+          "air.par"
+        ],
+        "method": "integral",
+        "base": null,
+        "scale": 0.0036,
+        "min": 12,
+        "max": null,
+        "unit": " mol/m²/d",
+        "lookbackHours": 24,
+        "maxGapHours": 2,
+        "minCoverage": 0.9,
+        "minSamples": 12
+      }
+    },
+    {
+      "//": "CHILL ACCUMULATION for deciduous fruit and nuts — almonds, pistachios, cherries, apples. Hours between 0 and 7.2C since dormancy; a warm winter that fails to break dormancy shows up as poor, uneven bloom months later, when nothing can be done about it. Two things make this different from every other check in the file: mode \"total\" adds every cold spell together rather than taking the longest, because chill does not care whether the cold came in one stretch or twelve; and comparison \"atMost\" fires when the dwell FALLS SHORT of the target, which is a direction no other rule can express — a thing that did not happen often enough leaves no reading for a threshold to catch. The numbers below are a 7-day window against a 100-hour target; set both from your own chill model and variety.",
+      "rule": "measurement-dwell",
+      "as": "chill-hours-short",
+      "enabled": false,
+      "activeMonths": [11, 12, 1, 2],
+      "params": {
+        "paths": [
+          "air.temperature",
+          "temperature"
+        ],
+        "min": 0,
+        "max": 7.2,
+        "mode": "total",
+        "comparison": "atMost",
+        "dwellHours": 100,
+        "lookbackHours": 168,
+        "maxGapHours": 3,
+        "minSamples": 100,
+        "clearDwellHours": 10,
+        "unit": "C"
+      }
+    },
+    {
+      "//": "═══ DERIVED QUANTITIES — computed from two readings on the SAME uplink. None of these is on any path, because no sensor emits them. ═══"
+    },
+    {
+      "//": "VAPOUR PRESSURE DEFICIT, kPa. The governing number under glass: it, not humidity, drives transpiration and stomatal closure, and 85% RH means nothing without the temperature beside it. Most crops sit well between 0.4 and 1.2 kPa; above ~1.5 the plant closes down, below ~0.4 it stops transpiring and calcium stops moving. Both bounds are set here because both directions are a real fault.",
+      "rule": "measurement-derived",
+      "as": "vpd-out-of-band",
+      "enabled": false,
+      "params": {
+        "formula": "vpd",
+        "paths": [
+          "air.temperature",
+          "temperature"
+        ],
+        "humidityPaths": [
+          "air.relativeHumidity"
+        ],
+        "min": 0.4,
+        "max": 1.5,
+        "lookbackHours": 6,
+        "clearMargin": 0.1
+      }
+    },
+    {
+      "//": "DELTA-T, the wet-bulb depression, C. The standard spray-suitability metric: below about 2 the droplets do not evaporate and drift onto whatever is downwind, above about 8 they evaporate before they land and the chemical is wasted. Outside 2-8 the spray should not go out. Route this to whoever holds the wand, not to an agent — the number IS the decision.",
+      "rule": "measurement-derived",
+      "as": "delta-t-unsuitable",
+      "enabled": false,
+      "params": {
+        "formula": "deltaT",
+        "paths": [
+          "air.temperature",
+          "temperature"
+        ],
+        "humidityPaths": [
+          "air.relativeHumidity"
+        ],
+        "min": 2,
+        "max": 8,
+        "lookbackHours": 3,
+        "clearMargin": 0.5
+      }
+    },
+    {
+      "//": "TEMPERATURE-HUMIDITY INDEX for livestock. The standard classification is comfort below 68, mild stress 68-72, moderate 72-80 and severe above 80; measured milk yield starts falling around 72, which is why that is the bound set here. Shade, sprinklers and fans are the response. Point the scope at the sensors in the barn or the loafing area rather than a weather station in an open field.",
+      "rule": "measurement-derived",
+      "as": "livestock-heat-stress",
+      "enabled": false,
+      "params": {
+        "formula": "thi",
+        "paths": [
+          "air.temperature",
+          "temperature"
+        ],
+        "humidityPaths": [
+          "air.relativeHumidity"
+        ],
+        "min": null,
+        "max": 72,
+        "lookbackHours": 3,
+        "clearMargin": 2,
+        "deviceNamePattern": "%barn%"
+      }
+    },
+    {
+      "//": "═══ CROSS-DEVICE COMPARISON — one sensor against its neighbours, which is the only way to catch a probe that is plausibly wrong. SCOPE EACH INSTANCE TO ONE COMPARABLE GROUP: comparing a greenhouse probe with a dryland one produces a true statement about two unrelated numbers. One entry per irrigation valve or block is the intended shape. ═══"
+    },
+    {
+      "//": "A soil probe disagreeing with the others on its valve: a drifting sensor, a blocked lateral, an emitter that failed, or a line somebody shut last season and forgot. Every probe is individually within range, so no per-device check can see this. Direction \"below\" because a probe reading drier than its neighbours is the irrigation fault worth a truck roll; set \"either\" to catch leaks too. Reported as a situation — it could equally be the one probe installed at the correct depth.",
+      "rule": "measurement-outlier",
+      "as": "soil-probe-outlier",
+      "enabled": false,
+      "params": {
+        "paths": [
+          "soil.moisture"
+        ],
+        "maxDeviations": 3,
+        "direction": "below",
+        "minAbsoluteDifference": 4,
+        "minGroupSize": 4,
+        "lookbackHours": 24,
+        "minSamples": 6,
+        "unit": "%",
+        "deviceNamePattern": "%valve-7-%"
+      }
+    },
+    {
+      "//": "═══ ACTUATION VERIFICATION — the action happened and nothing followed. downlink-unacked catches a command that was never acknowledged; this catches one that WAS, from a device reporting happily, whose physical effect never arrived. ═══"
+    },
+    {
+      "//": "Water was delivered and the root zone never wetted: a blocked lateral, a clogged dripper, or water running past the root zone down a crack. The operator believes this irrigation happened — the counter advanced and every check is green — and finds out at harvest. Tune responseWindowHours to how long water actually takes to reach your probe depth in your soil (hours in heavy clay), and minChange to comfortably above the probe's noise floor.",
+      "rule": "response-missing",
+      "as": "irrigation-ineffective",
+      "enabled": false,
+      "params": {
+        "paths": [
+          "metering.water.total",
+          "pulse.total"
+        ],
+        "triggerDelta": 500,
+        "responsePaths": [
+          "soil.moisture"
+        ],
+        "direction": "rising",
+        "minChange": 3,
+        "responseWindowHours": 6,
+        "lookbackHours": 48
+      }
+    },
+    {
+      "//": "═══ FORECAST — the only checks here that read the future. They need a top-level \"forecast\" block naming a provider, a centroid lat/lng and an API key; without one they skip cleanly and say so. ONE HTTP CALL per sounding is shared by every entry below, so adding forecast checks costs quota only once. The subject is the SITE, not a device: a forecast is about a place. ═══"
+    },
+    {
+      "//": "FROST TONIGHT. This is the single highest-value check in the file, because it is the only one that arrives in time to matter: a frost alert at 04:10 tells a grower their crop is already frosted, and the same alert at 18:00 the evening before is the difference between running the fans and losing the block. withinHours 14 covers an evening decision through to dawn; activeMonths keeps it quiet through summer.",
+      "rule": "forecast-threshold",
+      "as": "frost-forecast",
+      "enabled": false,
+      "severity": "critical",
+      "activeMonths": [1, 2, 3, 4, 9, 10, 11, 12],
+      "params": {
+        "paths": [
+          "air.temperature"
+        ],
+        "min": 1.5,
+        "max": null,
+        "withinHours": 14,
+        "minHours": 1,
+        "unit": "C"
+      }
+    },
+    {
+      "//": "RAIN BEFORE THE SPRAY DRIES. Residue washes off and the money goes on the ground; on heavy ground it is also the machinery-off-the-block call. Uses the forecast-only path forecast.precipitationProbability rather than rain.intensity, because a 70% chance of rain is the decision input and a predicted 0.4 mm/hour is not.",
+      "rule": "forecast-threshold",
+      "as": "rain-forecast",
+      "enabled": false,
+      "params": {
+        "paths": [
+          "forecast.precipitationProbability"
+        ],
+        "min": null,
+        "max": 60,
+        "withinHours": 8,
+        "minHours": 2,
+        "unit": "%"
+      }
+    },
+    {
+      "//": "HEAT EVENT AHEAD — bring the harvest forward, pre-irrigate, move stock into shade. minHours 3 asks for a sustained afternoon rather than one hour the model overshot.",
+      "rule": "forecast-threshold",
+      "as": "heat-forecast",
+      "enabled": false,
+      "activeMonths": [4, 5, 6, 7, 8, 9, 10],
+      "params": {
+        "paths": [
+          "air.temperature"
+        ],
+        "min": null,
+        "max": 38,
+        "withinHours": 36,
+        "minHours": 3,
+        "unit": "C"
+      }
+    },
+    {
+      "//": "WIND CLOSING THE SPRAY WINDOW. Paired with delta-t-unsuitable above, this is the forecast half of the spray decision: delta-T says whether conditions are right now, this says how long they will stay right.",
+      "rule": "forecast-threshold",
+      "as": "spray-wind-forecast",
+      "enabled": false,
+      "params": {
+        "paths": [
+          "wind.speed"
+        ],
+        "min": null,
+        "max": 8,
+        "withinHours": 6,
+        "minHours": 1,
+        "unit": " m/s"
       }
     },
     {

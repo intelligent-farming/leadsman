@@ -317,6 +317,138 @@ test('boolean-alarm requires at least one truthy value', async () => {
   await assert.rejects(() => rule.run(ctxFor(rule, { trueValues: [] })), /non-empty array/);
 });
 
+// ── mold-risk ────────────────────────────────────────────────────────────────
+// The only rule whose findings cost an LLM invocation by default, so its refusals
+// matter more than most: every one of them is a configuration that fires constantly
+// or never, and both of those are expensive in a different way.
+
+/** One row in the shape bandDwell's SQL returns — numerics arrive from pg as text. */
+function dwellRow(over = {}) {
+  return {
+    dev_eui: 'aa11bb22cc33dd44',
+    device_name: 'vineyard-north',
+    matched_path: 'air.relativeHumidity',
+    hours: '7.5',
+    samples: '9',
+    vmin: '90.4', vmax: '97.1', vavg: '93.8000',
+    gate_min: '16.2', gate_max: '21.4',
+    started_at: '2026-09-21T22:00:00.000Z',
+    ended_at: '2026-09-22T05:30:00.000Z',
+    window_samples: '24',
+    gate_samples: '24',
+    last_sample_at: '2026-09-22T05:30:00.000Z',
+    ...over,
+  };
+}
+
+test('mold-risk refuses a temperature gate with no bounds', async () => {
+  // Paths set but both bounds null admits every reading that merely HAS a temperature.
+  // That looks like a configured gate and behaves like none, which is the worst of both.
+  const rule = loadRules().get('mold-risk');
+  await assert.rejects(
+    () => rule.run(ctxFor(rule, { temperatureMin: null, temperatureMax: null })),
+    /the gate would admit every reading/,
+  );
+});
+
+test('mold-risk refuses a dwell longer than the window it is measured in', async () => {
+  const rule = loadRules().get('mold-risk');
+  await assert.rejects(
+    () => rule.run(ctxFor(rule, { dwellHours: 24, lookbackHours: 24 })),
+    /could\s+never fire/,
+  );
+});
+
+test('mold-risk refuses a humidity band with neither bound', async () => {
+  const rule = loadRules().get('mold-risk');
+  await assert.rejects(
+    () => rule.run(ctxFor(rule, { humidityMin: null, humidityMax: null })),
+    /at least one of "humidityMin" or "humidityMax"/,
+  );
+});
+
+test('mold-risk refuses hysteresis that cancels the dwell requirement', async () => {
+  const rule = loadRules().get('mold-risk');
+  await assert.rejects(
+    () => rule.run(ctxFor(rule, { dwellHours: 4, clearDwellHours: 4 })),
+    /must be less than dwellHours/,
+  );
+});
+
+test('mold-risk raises on a run past the dwell, naming duration and gate range', async () => {
+  const rule = loadRules().get('mold-risk');
+  const findings = await rule.run(ctxFor(rule, { dwellHours: 6 }, [dwellRow()]));
+
+  assert.equal(findings.length, 1);
+  assert.match(findings[0].summary, /vineyard-north/);
+  assert.match(findings[0].summary, /≥90% for 7\.5h/);
+  assert.match(findings[0].summary, /16\.2–21\.4C/);
+  // The run reaches the device's latest reading, so it is still accumulating.
+  assert.match(findings[0].summary, /ongoing/);
+  assert.equal(findings[0].detail.ongoing, true);
+  assert.equal(findings[0].detail.dwellHours, 7.5);
+  assert.equal(findings[0].detail.requiredHours, 6);
+  assert.deepEqual(findings[0].detail.temperatureRange, [16.2, 21.4]);
+});
+
+test('mold-risk reports a run that has already ended as ended, not ongoing', async () => {
+  const rule = loadRules().get('mold-risk');
+  const findings = await rule.run(
+    ctxFor(rule, { dwellHours: 6 }, [
+      dwellRow({ last_sample_at: '2026-09-22T09:00:00.000Z' }),
+    ]),
+  );
+  assert.equal(findings.length, 1);
+  assert.match(findings[0].summary, /ended/);
+  assert.equal(findings[0].detail.ongoing, false);
+});
+
+test('mold-risk ignores a run short of the dwell, and a run with too few samples', async () => {
+  const rule = loadRules().get('mold-risk');
+  assert.deepEqual(
+    await rule.run(ctxFor(rule, { dwellHours: 8 }, [dwellRow()])),
+    [],
+  );
+  // Nine hours is plenty; three readings across them is not a measured nine hours.
+  assert.deepEqual(
+    await rule.run(ctxFor(rule, { dwellHours: 6, minSamples: 4 }, [
+      dwellRow({ hours: '9', samples: '3' }),
+    ])),
+    [],
+  );
+});
+
+test('mold-risk holds an open alert to a shorter run than it took to raise one', async () => {
+  const rule = loadRules().get('mold-risk');
+  // 5h against a 6h dwell: below the raise line, above the 6-2=4h clear line.
+  const rows = [dwellRow({ hours: '5' })];
+
+  const fresh = { ...ctxFor(rule, { dwellHours: 6, clearDwellHours: 2 }, rows) };
+  assert.deepEqual(await rule.run(fresh), [], 'must not raise at 5h');
+
+  const open = {
+    ...ctxFor(rule, { dwellHours: 6, clearDwellHours: 2 }, rows),
+    openDevEuis: new Set(['aa11bb22cc33dd44']),
+  };
+  assert.equal((await rule.run(open)).length, 1, 'an open alert must stay open at 5h');
+});
+
+test('mold-risk warns about devices the temperature gate excludes entirely', async () => {
+  // A humidity sensor with no temperature on the same uplink can never raise this
+  // check. Zero findings then means "blind", not "safe", and the log has to say which.
+  const rule = loadRules().get('mold-risk');
+  const lines = [];
+  const ctx = {
+    ...ctxFor(rule, {}, [dwellRow({ hours: '0', samples: null, gate_samples: '0' })]),
+    log: { debug() {}, info() {}, warn: (m, meta) => lines.push([m, meta]), error() {} },
+  };
+
+  assert.deepEqual(await rule.run(ctx), []);
+  assert.equal(lines.length, 1);
+  assert.match(lines[0][0], /no temperature on the same uplink/);
+  assert.match(lines[0][1].devices, /aa11bb22cc33dd44/);
+});
+
 test('counter-stalled flags a backwards counter as critical', async () => {
   const rule = loadRules().get('counter-stalled');
   const findings = await rule.run(
@@ -352,6 +484,10 @@ test('the example config keeps only universally-safe checks enabled by default',
       [
         // Fleet health: no crop- or site-specific tuning required.
         'device-silent', 'battery-low', 'decode-failure', 'soil-moisture-missing',
+        // Data integrity: the bounds come from the vocabulary schema, so there is
+        // nothing to tune and nothing that could depend on the crop. A breach means
+        // the sensor or the codec is wrong on any farm anywhere.
+        'measurement-implausible',
         // Network layer: read ChirpStack's own tables, and two of them keep working
         // when the payload codec is broken.
         'device-log-error', 'status-battery-low', 'status-margin-low', 'join-churn',
@@ -415,6 +551,8 @@ test('rules either run on their own defaults or explain what configuration they 
   const NEEDS_CONFIG = {
     'measurement-threshold': /at least one of "min" or "max"/,
     'geofence-breach': /requires north, south, east, and west/,
+    'measurement-accumulation': /at least one of "min" or "max"/,
+    'forecast-threshold': /needs: \[forecast\]/,
   };
 
   const rules = loadRules();
@@ -441,6 +579,129 @@ test('rules either run on their own defaults or explain what configuration they 
     }
     assert.equal(all.length, rules.size);
   });
+});
+
+// ── lintConfig / leadsman lint ───────────────────────────────────────────────
+// The database-free half of verify. It exists because a config file is the part of
+// a deployment most likely to be hand-edited and least likely to be tested, and
+// until now the only tool that could check one needed a reachable Postgres.
+
+const { lintConfig } = require('../dist/verify.js');
+
+const lint = async (raw) => lintConfig(parseConfig(raw), loadRules());
+const messages = (problems) => problems.map((p) => `${p.severity} ${p.where}: ${p.message}`);
+
+test('lint catches a parameter combination that can never fire', async () => {
+  // The whole point. Every one of these is a check that runs forever, finds nothing,
+  // and is indistinguishable from a healthy fleet — the failure this engine exists
+  // to remove, reproduced in its own config.
+  const cases = [
+    [{ rule: 'measurement-threshold', as: 'no-bounds', params: { min: null, max: null } },
+      /at least one of "min" or "max"/],
+    [{ rule: 'measurement-dwell', as: 'too-long',
+       params: { comparison: 'atLeast', dwellHours: 400, lookbackHours: 168 } },
+      /could never fire/],
+    [{ rule: 'mold-risk', as: 'open-gate',
+       params: { temperatureMin: null, temperatureMax: null } },
+      /the gate would admit every reading/],
+    [{ rule: 'measurement-accumulation', as: 'zero-scale', params: { min: 5, scale: 0 } },
+      /scale must not be zero/],
+    [{ rule: 'response-missing', as: 'unjudgeable',
+       params: { responseWindowHours: 48, lookbackHours: 48 } },
+      /no trigger could ever be old enough/],
+  ];
+
+  for (const [check, pattern] of cases) {
+    const problems = await lint({ checks: [check] });
+    const errors = problems.filter((p) => p.severity === 'error');
+    assert.equal(errors.length, 1, `${check.as}: expected one error, got ${messages(problems)}`);
+    assert.match(errors[0].message, pattern);
+    assert.match(errors[0].where, new RegExp(`^checks\\.${check.as}`));
+  }
+});
+
+test('lint catches an unknown rule and a typo\'d parameter', async () => {
+  const problems = await lint({
+    checks: [
+      { rule: 'no-such-rule', as: 'ghost' },
+      { rule: 'measurement-threshold', as: 'typo', params: { min: 1, lookbackHrs: 6 } },
+    ],
+  });
+  assert.match(messages(problems).join('\n'), /error checks\.ghost: unknown rule/);
+  // A typo'd parameter silently falls back to the default, which looks like the
+  // check "not working" for weeks.
+  assert.match(messages(problems).join('\n'), /warning checks\.typo\.params: "lookbackHrs"/);
+});
+
+test('lint reports a rule whose prerequisites this config cannot supply', async () => {
+  const withoutForecast = await lint({
+    checks: [{ rule: 'forecast-threshold', as: 'frost', params: {} }],
+  });
+  assert.match(messages(withoutForecast).join(), /no forecast provider configured/);
+  // And says nothing once it is configured — a forecast rule must not also be
+  // reported as a parameter error just because it declines to run without a source.
+  const withForecast = await lint({
+    forecast: { latitude: 38.8, longitude: -122, apiKey: 'k' },
+    checks: [{ rule: 'forecast-threshold', as: 'frost', params: {} }],
+  });
+  assert.deepEqual(messages(withForecast), []);
+});
+
+test('lint flags a gating window that is the same as no window', async () => {
+  const problems = await lint({
+    checks: [{
+      rule: 'device-silent', as: 'all-year',
+      activeMonths: [1,2,3,4,5,6,7,8,9,10,11,12],
+    }],
+  });
+  assert.match(messages(problems).join(), /all twelve months, which is the same as omitting it/);
+});
+
+test('lint passes both shipped example configs', async () => {
+  for (const file of ['../config/leadsman.example.json',
+                      '../config/makerfabs-agrosense.example.json']) {
+    const problems = await lint(require(file));
+    const errors = problems.filter((p) => p.severity === 'error');
+    assert.deepEqual(errors, [], `${file}: ${messages(errors).join('; ')}`);
+  }
+});
+
+test('lint does not run a rule that would need a database to validate', async () => {
+  // The stub context returns no rows, so a rule that gets past its own parameter
+  // validation finds nothing and reports nothing. A clean config must lint clean.
+  const problems = await lint({
+    checks: [
+      { rule: 'device-silent', as: 'silent' },
+      { rule: 'measurement-threshold', as: 'frost', params: { min: 1.5, max: null } },
+      { rule: 'measurement-outlier', as: 'probes', params: { minGroupSize: 4 } },
+      { rule: 'measurement-implausible', as: 'implausible' },
+    ],
+  });
+  assert.deepEqual(messages(problems), []);
+});
+
+test('CLI: lint validates a config with no database configured', () => {
+  const res = cli(['lint', '--config', 'config/leadsman.example.json']);
+  assert.equal(res.status, 0, res.stderr);
+  assert.match(res.stdout, /checks: \d+ \(\d+ enabled\)/);
+});
+
+test('CLI: lint exits 1 on an error but 0 on warnings alone', () => {
+  // Warnings do not fail: "will be SKIPPED" is a legitimate deployment state, and a
+  // gate that rejects it cannot be used in CI.
+  const ok = cli(['lint', '--config', 'config/makerfabs-agrosense.example.json']);
+  assert.equal(ok.status, 0, ok.stdout);
+
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const bad = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'leadsman-lint-')), 'bad.json');
+  fs.writeFileSync(bad, JSON.stringify({
+    checks: [{ rule: 'measurement-threshold', as: 'x', params: { min: null, max: null } }],
+  }));
+  const res = cli(['lint', '--config', bad]);
+  assert.equal(res.status, 1);
+  assert.match(res.stdout, /can never fire/);
 });
 
 // ── CLI contract ─────────────────────────────────────────────────────────────
@@ -669,7 +930,39 @@ test('every rule declares a routing class, and situations stay a small set', () 
   }
   // A guard against drift: every rule moved into 'situation' costs tokens on every fire,
   // so growing this set should be a deliberate act that updates this test.
-  assert.deepEqual(situations.sort(), ['device-silent', 'geofence-breach', 'join-churn']);
+  // mold-risk is the one measurement-shaped rule in the set, and it is here because
+  // acting on it needs the crop stage, the spray history and the forecast — none of
+  // which are in the event store. See the rule header.
+  assert.deepEqual(situations.sort(), [
+    'device-silent', 'geofence-breach', 'join-churn', 'measurement-outlier',
+    'mold-risk', 'response-missing',
+  ]);
+});
+
+test('every situation rule can actually reach an agent route at its own severity', () => {
+  // Found by a fact pass, not by any existing test. Routing consults bySeverity
+  // BEFORE the fact/situation class, so a rule that is `info` AND `situation` is
+  // silenced by the common `{"info": null}` policy before its class is ever read —
+  // it is simultaneously "worth an LLM invocation" and "too trivial to deliver".
+  // measurement-outlier shipped that way for exactly one session.
+  const rules = loadRules();
+  const cfg = {
+    destinations: { oncall: {}, agent: {} },
+    bySeverity: { info: null },
+    routing: { fact: 'oncall', situation: 'agent' },
+    defaultDestination: 'oncall',
+  };
+
+  const unreachable = [];
+  for (const [id, rule] of rules) {
+    if (rule.defaultRouting !== 'situation') continue;
+    const dest = resolveDestination(
+      { severity: rule.defaultSeverity }, { routing: 'situation' }, cfg,
+    );
+    if (dest !== 'agent') unreachable.push(`${id} (${rule.defaultSeverity}) -> ${dest}`);
+  }
+  assert.deepEqual(unreachable, [],
+    'a situation rule whose default severity is silenced can never be interpreted');
 });
 
 test('the generic measurement rules default to fact, not situation', () => {
@@ -679,6 +972,10 @@ test('the generic measurement rules default to fact, not situation', () => {
   for (const id of [
     'measurement-threshold', 'measurement-peak', 'measurement-rate',
     'measurement-stuck', 'measurement-missing', 'counter-spike', 'counter-stalled',
+    // These two are generic mechanisms too, despite the agronomic names in their
+    // docs: one config can use measurement-derived for both a greenhouse VPD alarm
+    // and a livestock THI warning, and the rule cannot know which it is.
+    'measurement-accumulation', 'measurement-derived',
   ]) {
     assert.equal(rules.get(id).defaultRouting, 'fact', `${id} should default to fact`);
   }
@@ -1422,4 +1719,278 @@ test('an enabled check that will be skipped is reported by verify, as a warning'
   assert.ok(skips.every((p) => p.severity === 'warning'));
   assert.match(skips.find((p) => p.where === 'checks.gateway-deaf').message, /chirpstack/);
   assert.match(skips.find((p) => p.where === 'checks.host-address-changed').message, /host address/);
+});
+
+// ── seasonal and diurnal gating ──────────────────────────────────────────────
+// Evaluated by the runner rather than inside a rule, so it applies uniformly to all
+// 34 checks including the gateway and host ones that take no measurement params.
+
+const { outOfSeason } = require('../dist/runner.js');
+
+test('outOfSeason: no window configured means always active', () => {
+  assert.equal(outOfSeason({}, new Date('2026-07-15T12:00:00Z'), 'UTC'), null);
+});
+
+test('outOfSeason: a month outside activeMonths is skipped, and says which', () => {
+  const july = new Date('2026-07-15T12:00:00Z');
+  const frost = { activeMonths: [1, 2, 3, 10, 11, 12] };
+  assert.match(outOfSeason(frost, july, 'UTC'), /month 7 is not in activeMonths/);
+  assert.equal(outOfSeason(frost, new Date('2026-11-15T12:00:00Z'), 'UTC'), null);
+});
+
+test('outOfSeason: a month list that wraps the year end works unchanged', () => {
+  // A southern-hemisphere summer, and a northern dormancy. The engine does not need
+  // to know which, and must not assume a list is contiguous or ascending.
+  const summer = { activeMonths: [11, 12, 1, 2] };
+  assert.equal(outOfSeason(summer, new Date('2026-12-20T12:00:00Z'), 'UTC'), null);
+  assert.equal(outOfSeason(summer, new Date('2026-01-20T12:00:00Z'), 'UTC'), null);
+  assert.match(outOfSeason(summer, new Date('2026-06-20T12:00:00Z'), 'UTC'), /month 6/);
+});
+
+test('outOfSeason: hours are evaluated in the config timezone, not UTC', () => {
+  // 06:00 UTC is 23:00 the previous day in Los Angeles. A frost window expressed in
+  // local night hours would otherwise be wrong by the whole offset every single
+  // night, which is the entire period it is supposed to cover.
+  const night = { activeHours: [22, 23, 0, 1, 2, 3, 4, 5] };
+  const at = new Date('2026-11-15T06:00:00Z'); // 23:00 the previous day in Los Angeles
+  assert.equal(outOfSeason(night, at, 'America/Los_Angeles'), null, '23:00 local is in the window');
+  assert.match(outOfSeason(night, at, 'UTC'), /hour 6 is not in activeHours/, 'UTC would disagree');
+});
+
+test('outOfSeason: midnight is hour 0, not hour 24', () => {
+  // Intl renders midnight as "24" in some locales under hour12:false, which would
+  // make a check configured for [0,1,2] silently skip every midnight.
+  const night = { activeHours: [0] };
+  assert.equal(outOfSeason(night, new Date('2026-11-15T00:30:00Z'), 'UTC'), null);
+});
+
+test('outOfSeason: an unusable timezone falls back to UTC rather than failing', () => {
+  const check = { activeHours: [12] };
+  assert.equal(outOfSeason(check, new Date('2026-11-15T12:30:00Z'), 'Mars/Olympus'), null);
+});
+
+test('parseConfig rejects an empty activeMonths rather than disabling the check', () => {
+  // "activeMonths": [] reads like a placeholder and would silently turn the check off
+  // forever. Refusing it is the difference between a typo and a mystery.
+  assert.throws(
+    () => parseConfig({ checks: [{ rule: 'device-silent', activeMonths: [] }] }),
+    /must not be empty/,
+  );
+});
+
+test('parseConfig validates the range of activeMonths and activeHours', () => {
+  assert.throws(
+    () => parseConfig({ checks: [{ rule: 'device-silent', activeMonths: [0] }] }),
+    /from 1 to 12/,
+  );
+  assert.throws(
+    () => parseConfig({ checks: [{ rule: 'device-silent', activeHours: [24] }] }),
+    /from 0 to 23/,
+  );
+  // Deduplicated and sorted, so a hand-edited list behaves predictably.
+  const cfg = parseConfig({ checks: [{ rule: 'device-silent', activeMonths: [12, 1, 12] }] });
+  assert.deepEqual(cfg.checks[0].activeMonths, [1, 12]);
+});
+
+// ── the forecast config block ────────────────────────────────────────────────
+
+test('parseConfig reads a forecast block and defaults the optional fields', () => {
+  const cfg = parseConfig({
+    checks: [],
+    forecast: { latitude: 38.795, longitude: -121.993, apiKey: 'k' },
+  });
+  assert.equal(cfg.forecast.provider, 'weatherbit');
+  assert.equal(cfg.forecast.hours, 48);
+  assert.equal(cfg.forecast.timeoutMs, 8000);
+});
+
+test('parseConfig rejects coordinates that would silently forecast the wrong place', () => {
+  // A transposed pair, or a string, otherwise fails at 3am against a metered API —
+  // or worse, succeeds and returns a real forecast for another hemisphere.
+  assert.throws(
+    () => parseConfig({ checks: [], forecast: { latitude: 138.5, longitude: -121 } }),
+    /latitude must be between -90 and 90/,
+  );
+  assert.throws(
+    () => parseConfig({ checks: [], forecast: { latitude: '38.5', longitude: -121 } }),
+    /latitude must be a number/,
+  );
+  assert.throws(
+    () => parseConfig({ checks: [], forecast: { latitude: 38.5 } }),
+    /longitude must be a number/,
+  );
+});
+
+test('parseConfig rejects an unknown forecast provider by name', () => {
+  assert.throws(
+    () => parseConfig({ checks: [], forecast: { provider: 'accuweather', latitude: 1, longitude: 2 } }),
+    /must be "weatherbit"/,
+  );
+});
+
+test('a forecast block is required — an env key alone is not consent to call the API', () => {
+  const prev = process.env.LEADSMAN_WEATHERBIT_API_KEY;
+  try {
+    process.env.LEADSMAN_WEATHERBIT_API_KEY = 'k';
+    assert.equal(parseConfig({ checks: [] }).forecast, undefined);
+  } finally {
+    if (prev === undefined) delete process.env.LEADSMAN_WEATHERBIT_API_KEY;
+    else process.env.LEADSMAN_WEATHERBIT_API_KEY = prev;
+  }
+});
+
+// ── the new rules refuse the configurations that can never fire ──────────────
+
+test('measurement-accumulation rejects a scale of zero and a bad coverage fraction', async () => {
+  const rule = loadRules().get('measurement-accumulation');
+  await assert.rejects(() => rule.run(ctxFor(rule, { min: 1, scale: 0 })), /scale must not be zero/);
+  await assert.rejects(
+    () => rule.run(ctxFor(rule, { min: 1, minCoverage: 1.5 })),
+    /minCoverage must be between 0 and 1/,
+  );
+  await assert.rejects(() => rule.run(ctxFor(rule, { min: 1, method: 'average' })), /"integral" or "sum"/);
+});
+
+test('measurement-derived rejects an unknown formula, naming the ones that exist', async () => {
+  const rule = loadRules().get('measurement-derived');
+  await assert.rejects(
+    () => rule.run(ctxFor(rule, { formula: 'humidex' })),
+    /formula must be one of vpd, dewPoint, deltaT, thi, absoluteHumidity/,
+  );
+});
+
+test('measurement-derived computes the published formulas correctly', async () => {
+  const rule = loadRules().get('measurement-derived');
+  const row = (t, rh) => [{
+    dev_eui: 'aa', device_name: 'glasshouse', primary_path: 'air.temperature',
+    secondary_path: 'air.relativeHumidity', primary_value: String(t),
+    secondary_value: String(rh), at: '2026-09-22T12:00:00.000Z',
+  }];
+
+  // 20 °C / 50 % RH: es = 2.3388 kPa, so VPD = 1.169. Textbook worked example.
+  const vpd = await rule.run(ctxFor(rule, { formula: 'vpd', max: 1 }, row(20, 50)));
+  assert.equal(vpd.length, 1);
+  assert.ok(Math.abs(vpd[0].detail.value - 1.169) < 0.005, `got ${vpd[0].detail.value}`);
+
+  // Dew point at 50 % RH and 20 °C is ~9.3 °C.
+  const dew = await rule.run(ctxFor(rule, { formula: 'dewPoint', max: 5 }, row(20, 50)));
+  assert.ok(Math.abs(dew[0].detail.value - 9.3) < 0.1, `got ${dew[0].detail.value}`);
+
+  // At 100 % RH the dew point IS the dry bulb, and delta-T is zero.
+  const saturated = await rule.run(ctxFor(rule, { formula: 'dewPoint', max: 5 }, row(20, 100)));
+  assert.ok(Math.abs(saturated[0].detail.value - 20) < 0.2, `got ${saturated[0].detail.value}`);
+  const dt = await rule.run(ctxFor(rule, { formula: 'deltaT', max: 0.5 }, row(20, 100)));
+  assert.deepEqual(dt, [], 'delta-T at saturation is ~0, which is inside max 0.5');
+
+  // THI 72 is the dairy action line. 25 °C at 50 % RH computes to 71.8 — just UNDER
+  // it, which is the correct answer and worth pinning, since an off-by-a-little
+  // formula would put it the other side of the line an operator acts on.
+  const under = await rule.run(ctxFor(rule, { formula: 'thi', max: 72 }, row(25, 50)));
+  assert.deepEqual(under, [], 'THI at 25C/50% is 71.8, below the action line');
+
+  const thi = await rule.run(ctxFor(rule, { formula: 'thi', max: 72 }, row(26, 60)));
+  assert.equal(thi.length, 1);
+  assert.ok(thi[0].detail.value > 74 && thi[0].detail.value < 75, `got ${thi[0].detail.value}`);
+});
+
+test('measurement-derived skips a pair whose formula cannot produce a number', async () => {
+  // A codec emitting 250 % humidity is measurement-implausible's problem. Producing
+  // NaN here and comparing it to a bound would silently never fire.
+  const rule = loadRules().get('measurement-derived');
+  const findings = await rule.run(ctxFor(rule, { formula: 'vpd', max: 0.1 }, [{
+    dev_eui: 'aa', device_name: null, primary_path: 'air.temperature',
+    secondary_path: 'air.relativeHumidity', primary_value: 'NaN',
+    secondary_value: '50', at: '2026-09-22T12:00:00.000Z',
+  }]));
+  assert.deepEqual(findings, []);
+});
+
+test('measurement-outlier refuses a group too small to have an odd one out', async () => {
+  const rule = loadRules().get('measurement-outlier');
+  await assert.rejects(
+    () => rule.run(ctxFor(rule, { minGroupSize: 2 })),
+    /with two devices there is no majority/,
+  );
+});
+
+test('measurement-dwell allows an atMost target longer than the window', async () => {
+  // A seasonal chill requirement is normally larger than the window it is sampled
+  // over, and refusing that — as the atLeast direction must — would make the whole
+  // accumulate-or-fail direction unusable.
+  const rule = loadRules().get('measurement-dwell');
+  await assert.doesNotReject(
+    () => rule.run(ctxFor(rule, { comparison: 'atMost', dwellHours: 400, lookbackHours: 168 })),
+  );
+  await assert.rejects(
+    () => rule.run(ctxFor(rule, { comparison: 'atLeast', dwellHours: 400, lookbackHours: 168 })),
+    /could never fire/,
+  );
+});
+
+test('response-missing refuses a response window no trigger could outlive', async () => {
+  const rule = loadRules().get('response-missing');
+  await assert.rejects(
+    () => rule.run(ctxFor(rule, { responseWindowHours: 48, lookbackHours: 48 })),
+    /no trigger could ever be old enough to judge/,
+  );
+});
+
+test('forecast-threshold refuses a lead-time window that is empty', async () => {
+  const rule = loadRules().get('forecast-threshold');
+  const withForecast = (over) => ({
+    ...ctxFor(rule, over),
+    forecast: { centroid: { latitude: 0, longitude: 0 }, forecast: async () => ({
+      at: { latitude: 0, longitude: 0 }, locationName: null,
+      retrievedAt: new Date().toISOString(), hours: [],
+    }) },
+  });
+  await assert.rejects(
+    () => rule.run(withForecast({ afterHours: 12, withinHours: 6 })),
+    /the lead-time window would be empty/,
+  );
+  await assert.rejects(
+    () => rule.run(withForecast({ latitude: 38.5, longitude: null })),
+    /must be set together/,
+  );
+});
+
+test('forecast-threshold raises against the site, not a device', async () => {
+  const rule = loadRules().get('forecast-threshold');
+  const hours = [
+    { at: '2026-11-15T02:00:00.000Z', leadHours: 2, values: { 'air.temperature': 4 } },
+    { at: '2026-11-15T04:00:00.000Z', leadHours: 4, values: { 'air.temperature': -2.1 } },
+    { at: '2026-11-15T06:00:00.000Z', leadHours: 6, values: { 'air.temperature': 0.5 } },
+  ];
+  const ctx = {
+    ...ctxFor(rule, { min: 1.5, withinHours: 12, unit: 'C', locationLabel: 'Yolo 12A' }),
+    forecast: { centroid: { latitude: 38.8, longitude: -122 }, forecast: async () => ({
+      at: { latitude: 38.8, longitude: -122 }, locationName: 'Dunnigan',
+      retrievedAt: '2026-11-15T00:00:00.000Z', hours,
+    }) },
+  };
+
+  const found = await rule.run(ctx);
+  assert.equal(found.length, 1, 'one alert for the site, not one per breaching hour');
+  // A forecast is about a place. Pinning it on a device sends someone to look at a
+  // sensor that is working perfectly.
+  assert.deepEqual(found[0].subject, { kind: 'site', id: 'site', name: 'Yolo 12A' });
+  assert.equal(found[0].detail.worstValue, -2.1, 'the summary leads with the worst hour');
+  assert.equal(found[0].detail.leadHours, 4, 'and the lead time is to the FIRST breach');
+  assert.equal(found[0].detail.hoursAffected, 2);
+});
+
+test('forecast-threshold honours minHours, so one overshot hour is not an event', async () => {
+  const rule = loadRules().get('forecast-threshold');
+  const hours = [
+    { at: '2026-07-15T02:00:00.000Z', leadHours: 2, values: { 'air.temperature': 39 } },
+    { at: '2026-07-15T03:00:00.000Z', leadHours: 3, values: { 'air.temperature': 36 } },
+  ];
+  const ctx = {
+    ...ctxFor(rule, { min: null, max: 38, withinHours: 12, minHours: 3 }),
+    forecast: { centroid: { latitude: 0, longitude: 0 }, forecast: async () => ({
+      at: { latitude: 0, longitude: 0 }, locationName: null,
+      retrievedAt: '2026-07-15T00:00:00.000Z', hours,
+    }) },
+  };
+  assert.deepEqual(await rule.run(ctx), []);
 });

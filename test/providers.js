@@ -937,3 +937,200 @@ test('signal: group ids are sent through in the recipients array', async () => {
   api.close();
   assert.deepEqual(JSON.parse(api.seen[0].body).recipients, ['group.dGVzdA==']);
 });
+
+// ── Weatherbit forecast client ───────────────────────────────────────────────
+// Same reasoning as the messaging providers above: the client is only useful if it
+// matches what the vendor actually sends, and the response shape below is copied from
+// a real /v2.0/forecast/hourly call rather than invented. The field names and units
+// are the contract — Weatherbit returns metric under units=M, which is what lets these
+// land on the same vocabulary paths the codecs use with no arithmetic in between.
+
+const { forecastSource, resolveApiKey, ForecastError } = require('../dist/forecast.js');
+
+/** One hour, in Weatherbit's exact shape. */
+const wbHour = (over = {}) => ({
+  timestamp_utc: '2026-09-23T04:00:00',
+  temp: -1.5, rh: 92, wind_spd: 1.4, wind_dir: 200, precip: 0, pres: 1012,
+  solar_rad: 0, dewpt: -2.6, uv: 0, snow: 0, pop: 5, clouds: 9,
+  app_temp: -2.1, wind_gust_spd: 3.4,
+  ...over,
+});
+
+const wbBody = (hours) => JSON.stringify({ city_name: 'Dunnigan', data: hours });
+
+const fcConfig = (port, over = {}) => ({
+  provider: 'weatherbit',
+  latitude: 38.7954, longitude: -121.9932,
+  hours: 48, timeoutMs: 2000,
+  baseUrl: `http://127.0.0.1:${port}`,
+  ...over,
+});
+
+const quiet = { debug() {}, warn() {} };
+
+test('forecast: maps Weatherbit fields onto vocabulary paths, units unchanged', async () => {
+  const srv = await capture((req, res) =>
+    res.writeHead(200, { 'content-type': 'application/json' }).end(wbBody([wbHour()])));
+  try {
+    const fc = await forecastSource(fcConfig(srv.port), 'k', quiet).forecast();
+
+    // The whole point: a forecast temperature and a sensor temperature are the same
+    // path in the same unit, so one threshold means one thing.
+    assert.equal(fc.hours[0].values['air.temperature'], -1.5);
+    assert.equal(fc.hours[0].values['air.relativeHumidity'], 92);
+    assert.equal(fc.hours[0].values['wind.speed'], 1.4);
+    assert.equal(fc.hours[0].values['rain.intensity'], 0);
+    assert.equal(fc.hours[0].values['air.pressure'], 1012);
+    // Concepts with no sensor equivalent get forecast-only paths.
+    assert.equal(fc.hours[0].values['forecast.precipitationProbability'], 5);
+    assert.equal(fc.hours[0].values['forecast.windGust'], 3.4);
+    assert.equal(fc.locationName, 'Dunnigan');
+  } finally { srv.close(); }
+});
+
+test('forecast: requests metric units and the configured point and horizon', async () => {
+  const srv = await capture((req, res) =>
+    res.writeHead(200, { 'content-type': 'application/json' }).end(wbBody([wbHour()])));
+  try {
+    await forecastSource(fcConfig(srv.port, { hours: 12 }), 'secret-key', quiet).forecast();
+    const url = srv.seen[0].url;
+    assert.match(url, /\/v2\.0\/forecast\/hourly\?/);
+    assert.match(url, /lat=38\.7954/);
+    assert.match(url, /lon=-121\.9932/);
+    assert.match(url, /hours=12/);
+    // units=M is load-bearing: without it Weatherbit returns Fahrenheit and mph, and
+    // every threshold in the config silently means something else.
+    assert.match(url, /units=M/);
+  } finally { srv.close(); }
+});
+
+test('forecast: one HTTP call is shared by every caller at the same point', async () => {
+  let hits = 0;
+  const srv = await capture((req, res) => {
+    hits += 1;
+    res.writeHead(200, { 'content-type': 'application/json' }).end(wbBody([wbHour()]));
+  });
+  try {
+    const src = forecastSource(fcConfig(srv.port), 'k', quiet);
+    // Concurrent, to prove the in-flight promise is shared rather than only the
+    // settled value — two checks in the same tick must not race into two requests.
+    await Promise.all([src.forecast(), src.forecast(), src.forecast()]);
+    await src.forecast();
+    assert.equal(hits, 1, 'four calls at the centroid must cost one request');
+
+    await src.forecast({ latitude: 36.7378, longitude: -119.7871 });
+    assert.equal(hits, 2, 'a distinct point costs exactly one more');
+  } finally { srv.close(); }
+});
+
+test('forecast: a missing field is absent, never zero', async () => {
+  // 0 °C and 0 m/s are both real values. A provider that omits a field must not be
+  // read as forecasting freezing — this is the difference between no data and frost.
+  const srv = await capture((req, res) => {
+    const h = wbHour();
+    delete h.temp;
+    delete h.wind_spd;
+    res.writeHead(200, { 'content-type': 'application/json' }).end(wbBody([h]));
+  });
+  try {
+    const fc = await forecastSource(fcConfig(srv.port), 'k', quiet).forecast();
+    assert.equal('air.temperature' in fc.hours[0].values, false);
+    assert.equal('wind.speed' in fc.hours[0].values, false);
+    assert.equal(fc.hours[0].values['air.relativeHumidity'], 92);
+  } finally { srv.close(); }
+});
+
+test('forecast: Weatherbit timestamps are UTC despite carrying no zone suffix', async () => {
+  const srv = await capture((req, res) =>
+    res.writeHead(200, { 'content-type': 'application/json' })
+      .end(wbBody([wbHour({ timestamp_utc: '2026-09-23T04:00:00' })])));
+  try {
+    const fc = await forecastSource(fcConfig(srv.port), 'k', quiet).forecast();
+    // Read as local time this would be wrong by the host's offset, which for a frost
+    // check is the difference between alerting at dusk and alerting after sunrise.
+    assert.equal(fc.hours[0].at, '2026-09-23T04:00:00.000Z');
+  } finally { srv.close(); }
+});
+
+test('forecast: hours are sorted and carry lead time from now', async () => {
+  const now = Date.now();
+  const iso = (h) => new Date(now + h * 3_600_000).toISOString().slice(0, 19);
+  const srv = await capture((req, res) =>
+    res.writeHead(200, { 'content-type': 'application/json' }).end(wbBody([
+      wbHour({ timestamp_utc: iso(5), temp: 5 }),
+      wbHour({ timestamp_utc: iso(1), temp: 1 }),
+      wbHour({ timestamp_utc: iso(3), temp: 3 }),
+    ])));
+  try {
+    const fc = await forecastSource(fcConfig(srv.port), 'k', quiet).forecast();
+    assert.deepEqual(fc.hours.map((h) => h.values['air.temperature']), [1, 3, 5]);
+    assert.ok(Math.abs(fc.hours[0].leadHours - 1) < 0.05);
+  } finally { srv.close(); }
+});
+
+test('forecast: an HTTP error never echoes the URL, which carries the key', async () => {
+  const srv = await capture((req, res) => res.writeHead(403).end('forbidden'));
+  try {
+    const src = forecastSource(fcConfig(srv.port), 'super-secret-key', quiet);
+    await assert.rejects(
+      () => src.forecast(),
+      (err) => {
+        assert.ok(err instanceof ForecastError);
+        assert.match(err.message, /403/);
+        // The key is a query parameter, so an error string that included the URL
+        // would put it into every log line and every alert about the failure.
+        assert.doesNotMatch(err.message, /super-secret-key/);
+        return true;
+      },
+    );
+  } finally { srv.close(); }
+});
+
+test('forecast: a failed fetch is not cached as the answer for the sounding', async () => {
+  let hits = 0;
+  const srv = await capture((req, res) => {
+    hits += 1;
+    if (hits === 1) return res.writeHead(500).end();
+    res.writeHead(200, { 'content-type': 'application/json' }).end(wbBody([wbHour()]));
+  });
+  try {
+    const src = forecastSource(fcConfig(srv.port), 'k', quiet);
+    await assert.rejects(() => src.forecast());
+    // The next check in the same pass gets a real attempt rather than the rejection.
+    const fc = await src.forecast();
+    assert.equal(fc.hours.length, 1);
+  } finally { srv.close(); }
+});
+
+test('forecast: an empty data array is an error, not an empty forecast', async () => {
+  // Silently returning no hours would make every forecast check read "clear" forever.
+  const srv = await capture((req, res) =>
+    res.writeHead(200, { 'content-type': 'application/json' }).end(wbBody([])));
+  try {
+    const src = forecastSource(fcConfig(srv.port), 'k', quiet);
+    await assert.rejects(() => src.forecast(), /no usable hours/);
+  } finally { srv.close(); }
+});
+
+test('forecast: the environment key wins over the config file, and says which', () => {
+  const prev = process.env.LEADSMAN_WEATHERBIT_API_KEY;
+  try {
+    delete process.env.LEADSMAN_WEATHERBIT_API_KEY;
+    assert.deepEqual(resolveApiKey({ apiKey: 'from-file' }), {
+      apiKey: 'from-file', source: 'config',
+    });
+
+    process.env.LEADSMAN_WEATHERBIT_API_KEY = 'from-env';
+    assert.deepEqual(resolveApiKey({ apiKey: 'from-file' }), {
+      apiKey: 'from-env', source: 'env',
+    });
+
+    delete process.env.LEADSMAN_WEATHERBIT_API_KEY;
+    const none = resolveApiKey({});
+    assert.ok('missing' in none);
+    assert.match(none.missing, /LEADSMAN_WEATHERBIT_API_KEY/);
+  } finally {
+    if (prev === undefined) delete process.env.LEADSMAN_WEATHERBIT_API_KEY;
+    else process.env.LEADSMAN_WEATHERBIT_API_KEY = prev;
+  }
+});

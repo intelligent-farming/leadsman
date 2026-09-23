@@ -20,6 +20,7 @@
 
 import { gatewaySource, resolveConnection } from './chirpstack';
 import { Store, type RaisedAlert } from './db';
+import { forecastSource, resolveApiKey } from './forecast';
 import { heartbeatSecretFromEnv, sendHeartbeat } from './heartbeat';
 import { resolveHostAddress } from './host';
 import { notifyRaised, type AlertRoute } from './notify';
@@ -27,9 +28,11 @@ import { subjectOf } from './subject';
 import { applySuppression } from './suppress';
 import { version } from './version';
 import type {
+  CheckConfig,
   CheckResult,
   CheckState,
   EngineFacts,
+  ForecastSource,
   GatewaySource,
   LeadsmanConfig,
   Logger,
@@ -105,6 +108,7 @@ export async function runSounding(options: RunSoundingOptions): Promise<Sounding
   // skipped below, which reads very differently from a check that ran and found nothing.
   const engine = await gatherEngineFacts(config, store, log);
   const { gateways, chirpstackMissing } = buildGatewaySource(config, log);
+  const { forecast, forecastMissing } = buildForecastSource(config, log);
 
   for (const check of enabled) {
     const kind = check.as ?? check.rule;
@@ -129,10 +133,31 @@ export async function runSounding(options: RunSoundingOptions): Promise<Sounding
       continue;
     }
 
+    // Out of season, or out of hours. Recorded as `skipped` for the same reason an
+    // unconfigured prerequisite is: a frost check that returned nothing in July is
+    // indistinguishable from one that ran and found no frost, and only one of those
+    // means the check is working.
+    const dormant = outOfSeason(check, checkStart, config.timezone);
+    if (dormant) {
+      const result: CheckResult = {
+        ruleId: rule.id,
+        kind,
+        status: 'skipped',
+        findings: 0,
+        raised: 0,
+        resolved: 0,
+        durationMs: 0,
+      };
+      results.push(result);
+      checkLog.debug('check skipped — outside its active window', { reason: dormant });
+      if (!dryRun) await store.recordRun(result, checkStart);
+      continue;
+    }
+
     // A check whose prerequisites are not configured is skipped, not run. Running it
     // would return no findings, which is indistinguishable from a healthy fleet — the
     // precise confusion this whole area of the engine exists to remove.
-    const unmet = unmetNeeds(rule, { gateways, hostAddress: engine.hostAddress });
+    const unmet = unmetNeeds(rule, { gateways, forecast, hostAddress: engine.hostAddress });
     if (unmet) {
       const result: CheckResult = {
         ruleId: rule.id,
@@ -144,10 +169,13 @@ export async function runSounding(options: RunSoundingOptions): Promise<Sounding
         durationMs: 0,
       };
       results.push(result);
-      checkLog.warn('check skipped — not configured', {
-        needs: unmet,
-        reason: unmet === 'chirpstack' ? chirpstackMissing ?? 'no chirpstack block' : 'no host address source',
-      });
+      const reason =
+        unmet === 'chirpstack'
+          ? chirpstackMissing ?? 'no chirpstack block'
+          : unmet === 'forecast'
+            ? forecastMissing ?? 'no forecast block'
+            : 'no host address source';
+      checkLog.warn('check skipped — not configured', { needs: unmet, reason });
       if (!dryRun) await store.recordRun(result, checkStart);
       continue;
     }
@@ -165,6 +193,7 @@ export async function runSounding(options: RunSoundingOptions): Promise<Sounding
         kind,
         now: checkStart,
         gateways,
+        forecast,
         engine,
         state: checkState(store, kind, dryRun),
         log: checkLog,
@@ -409,11 +438,91 @@ function checkState(store: Store, kind: string, dryRun: boolean): CheckState {
 /** The first prerequisite a rule declared that this sounding cannot provide. */
 function unmetNeeds(
   rule: Rule,
-  available: { gateways: GatewaySource | null; hostAddress: string | null },
-): 'chirpstack' | 'hostAddress' | null {
+  available: {
+    gateways: GatewaySource | null;
+    forecast: ForecastSource | null;
+    hostAddress: string | null;
+  },
+): 'chirpstack' | 'hostAddress' | 'forecast' | null {
   for (const need of rule.needs ?? []) {
     if (need === 'chirpstack' && !available.gateways) return 'chirpstack';
+    if (need === 'forecast' && !available.forecast) return 'forecast';
     if (need === 'hostAddress' && !available.hostAddress) return 'hostAddress';
+  }
+  return null;
+}
+
+/**
+ * Build the forecast source, or explain why there isn't one.
+ *
+ * Deliberately explicit, like `chirpstack`: an API key in the environment is not on its
+ * own consent to start calling a metered third-party service on a schedule. The config
+ * has to name a `forecast` block with a centroid.
+ */
+function buildForecastSource(
+  config: LeadsmanConfig,
+  log: Logger,
+): { forecast: ForecastSource | null; forecastMissing: string | null } {
+  if (!config.forecast) return { forecast: null, forecastMissing: null };
+
+  const key = resolveApiKey(config.forecast);
+  if ('missing' in key) {
+    log.warn('forecast checks unavailable', { reason: key.missing });
+    return { forecast: null, forecastMissing: key.missing };
+  }
+  if (key.source === 'config') {
+    // Said once per sounding rather than buried in a doc comment: the config file now
+    // holds a credential, and every other secret in this engine deliberately does not.
+    log.warn(
+      'the Weatherbit API key came from the config file, which is therefore no longer ' +
+        'safe to commit — prefer LEADSMAN_WEATHERBIT_API_KEY',
+    );
+  }
+  return {
+    forecast: forecastSource(config.forecast, key.apiKey, log),
+    forecastMissing: null,
+  };
+}
+
+/**
+ * Whether a check is outside its configured months or hours, and which.
+ *
+ * Evaluated in the config's timezone rather than UTC, because "overnight" and "summer"
+ * are local ideas: a southern-hemisphere install setting `activeMonths: [11,12,1,2]`
+ * for summer would get it backwards under UTC only near the date line, but `activeHours`
+ * for a frost window would be wrong by the whole UTC offset every single night.
+ */
+export function outOfSeason(
+  check: Pick<CheckConfig, 'activeMonths' | 'activeHours'>,
+  now: Date,
+  timezone = 'UTC',
+): string | null {
+  if (!check.activeMonths && !check.activeHours) return null;
+
+  let month: number;
+  let hour: number;
+  try {
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone: timezone,
+      month: 'numeric',
+      hour: 'numeric',
+      hour12: false,
+    }).formatToParts(now);
+    month = Number(parts.find((p) => p.type === 'month')?.value);
+    // Intl renders midnight as "24" in some locales under hour12:false.
+    hour = Number(parts.find((p) => p.type === 'hour')?.value) % 24;
+  } catch {
+    // An unusable timezone must not silently move every check to UTC and shift a
+    // frost window by hours — but it must not fail the sounding either.
+    month = now.getUTCMonth() + 1;
+    hour = now.getUTCHours();
+  }
+
+  if (check.activeMonths && !check.activeMonths.includes(month)) {
+    return `month ${month} is not in activeMonths [${check.activeMonths.join(', ')}]`;
+  }
+  if (check.activeHours && !check.activeHours.includes(hour)) {
+    return `hour ${hour} is not in activeHours [${check.activeHours.join(', ')}]`;
   }
   return null;
 }

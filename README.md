@@ -63,6 +63,7 @@ export LEADSMAN_MIGRATE_URL='postgres://events:...@events-postgres:5432/chirpsta
 
 leadsman migrate            # create the leadsman schema
 leadsman list               # what checks exist
+leadsman lint               # validate the config alone — no database needed
 leadsman verify             # validate config + database schema, write nothing
 leadsman run --dry-run      # evaluate everything, report, write nothing
 leadsman run                # one sounding for real
@@ -70,10 +71,20 @@ leadsman serve              # stay resident, sound on the configured schedule
 leadsman status             # what is currently open
 ```
 
-`verify` and `run --dry-run` are the two commands worth running before trusting a
-config. `verify` checks that every table and column your enabled checks declare
-actually exists in this ChirpStack version; `--dry-run` executes all the real SQL
-and prints what it would raise.
+`lint`, `verify` and `run --dry-run` are the three commands worth running before
+trusting a config, and they need progressively more of the stack:
+
+- **`lint` needs nothing but the file.** It resolves every rule name, rejects a
+  parameter the rule does not have, and — the part that matters — runs each rule's own
+  parameter validation, so a combination that *can never fire* is an error rather than
+  a check that quietly reports nothing forever. A dwell longer than the window it is
+  measured in, a threshold with neither bound, a temperature gate with no bounds: all
+  of them look configured and all of them are inert. Exit code 1 on an error, 0 on
+  warnings alone, so it works as a pre-commit hook or a CI gate.
+- **`verify` adds the database.** It checks that every table and column your enabled
+  checks declare actually exists in this ChirpStack version.
+- **`run --dry-run` adds the data.** It executes all the real SQL and prints what it
+  would raise.
 
 ## Configuration
 
@@ -137,7 +148,7 @@ exercised by CI against fixtures, so neither can drift from the code.
 
 ## Available checks
 
-Twenty-seven checks in three families, organized by *mechanism* rather than by measurement.
+Thirty-five checks in four families, organized by *mechanism* rather than by measurement.
 Which sensor a check looks at is configuration; how it decides something is wrong is
 code. That is why so few checks cover all 104 paths of the normalized vocabulary — a
 wind threshold and a soil-moisture threshold are the same mechanism pointed at
@@ -152,6 +163,13 @@ Run `leadsman list` for every parameter and default.
 | `measurement-rate` | Value changing faster than a per-hour limit | warning |
 | `measurement-stuck` | Reading has not changed across many uplinks | warning |
 | `measurement-missing` | A field vanished from the codec output | warning |
+| `measurement-dwell` | How long a value stayed inside a band — reached a target, or fell short | warning |
+| `measurement-accumulation` | A total across a window: degree days, light integral, rainfall | info |
+| `measurement-derived` | A quantity no sensor emits: VPD, delta-T, dew point, THI | warning |
+| `measurement-outlier` | One device disagreeing with its peer group | warning |
+| `measurement-implausible` | A reading physics does not permit — **needs no configuration** | warning |
+| `mold-risk` | Humidity held in a band for hours, at a temperature a fungus grows at | warning |
+| `response-missing` | An action happened and its expected effect never followed | warning |
 | `boolean-alarm` | A flag is asserted (leak, gas, smoke, motion, open contact) | critical |
 | `counter-stalled` | A monotonic total stopped advancing, or went backwards | warning |
 | `counter-spike` | A monotonic total advancing far too fast | critical |
@@ -250,11 +268,45 @@ it inherits `device-silent`'s trade-off, plus one of its own: a gateway with no 
 range never appears at all, and a gateway that appeared once during commissioning counts
 as one that was in service and stopped. `ignoreGateways` is how you retire those.
 
+### Forecast checks
+
+Every family above reads the past. This one reads the future, and it is the only place
+in the engine where an alert can arrive before the thing it warns about.
+
+| Check | Subject | Mechanism | Default severity |
+|---|---|---|---|
+| `forecast-threshold` | site | A forecast value crosses a bound inside a lead-time window | warning |
+
+The value is not in the difficulty of the check — it is a threshold, and a simple one.
+It is in *when it arrives*. A frost alert at 04:10 tells a grower their crop is already
+frosted. The same alert at 18:00 the evening before is the difference between running
+the fans and losing the block, and no amount of telemetry can produce it.
+
+Three things are worth understanding:
+
+- **The subject is the site, not a device.** A forecast is about a place. Pinning it on
+  whichever sensor happens to be nearby is how someone ends up driving out to look at a
+  sensor that is working perfectly — the same reasoning behind `fleet-silent`.
+- **One HTTP call per sounding, shared.** A forecast's resolution is kilometres and the
+  distance between blocks is hundreds of metres, so the config names one centroid and
+  every forecast check reads the same answer. Ten instances cost one request. See
+  [Forecast](#forecast).
+- **It is normalized onto the same vocabulary.** `air.temperature` is °C and
+  `wind.speed` is m/s whether the number came from a sensor in the orchard or from an
+  API, so a frost bound of 1.5 means the identical thing in both, and the candidate-path
+  mechanism works unchanged.
+
 ### The checks worth enabling first
 
-Six describe a device that looks **completely healthy to every other check** while
+Seven describe a device that looks **completely healthy to every other check** while
 producing no usable data:
 
+- `measurement-implausible` — the reading is outside what physics permits: -40 % soil
+  moisture from a detached probe, pH 71 from a scaling error, 5504 °C from a byte-order
+  bug. It needs **no configuration at all** — the bounds come from the normalized
+  vocabulary's own schema, 73 paths with a declared physical range — and it protects
+  the trustworthiness of every other check rather than measuring anything, because the
+  bad value has been flowing into every average, trend and accumulation downstream.
 - `decode-failure` — the codec is producing nothing.
 - `measurement-missing` — the codec still works but a field silently disappeared, so
   every check on it stops matching the device. Silence looks identical to health.
@@ -337,12 +389,132 @@ The distinction that matters most is **latest reading vs. window**:
 | Is it out of bounds right now? | `measurement-threshold` |
 | Did it ever cross the line? | `measurement-peak` |
 | Is it heading somewhere bad? | `measurement-rate` |
+| Has it stayed bad long enough to matter? | `measurement-dwell`, `mold-risk` |
+| How much of it was there in total? | `measurement-accumulation` |
+| Is this device wrong compared to its neighbours? | `measurement-outlier` |
+| Is the value possible at all? | `measurement-implausible` |
+| Is a quantity no sensor emits out of band? | `measurement-derived` |
+| Did the thing we did actually work? | `response-missing` |
+| Is it about to happen? | `forecast-threshold` |
 
 Wind is the clearest case. A station reporting 10-minute averages can hide a 21 m/s
 gust completely — `measurement-threshold` sees calm, `measurement-peak` sees the gust.
 Conversely a tank at 40 % passes every threshold while falling 9 %/h, which only
 `measurement-rate` catches, and only `measurement-rate` gives you the hours of warning
 that make it actionable.
+
+`mold-risk` is the fourth question and the odd one out, because its answer is a length
+of time rather than a value. Fungal infection is a *duration* phenomenon: botrytis on
+grapes and peacock spot on olives need free water or near-saturation held on the tissue
+for hours, at a temperature the spores germinate at. Neither half predicts anything
+alone — 90 % RH fires on every cold clear autumn night and infects nothing, and 18 °C
+fires every afternoon — so the check measures the longest **unbroken** run inside a
+humidity band during which the *same uplink* also reported a temperature inside a
+second band.
+
+Three properties are worth knowing before you tune it:
+
+- **Longest run, not total time.** Six scattered one-hour spells are six failed
+  infections; one six-hour spell is one successful one. Summing them would report the
+  first as the second.
+- **A reporting gap breaks the run.** While a device is silent nothing is known about
+  the canopy, so `maxGapHours` refuses to bridge across the gap rather than inventing
+  dwell out of missing data. Set it to a small multiple of the fleet's uplink interval.
+- **The duration is measured, not assumed.** It runs from the first in-band reading to
+  the last, so an hourly reporter understates a six-hour event as five, and a single
+  in-band reading is zero hours rather than one interval. Every rounding is toward not
+  raising, which is the right direction for the one check that spends tokens by default.
+
+Give each crop its own entry with its own numbers and its own scope — the gate for
+peacock spot on olives (10–20 °C, twelve hours) is not the gate for botrytis on grapes
+(15–25 °C, four), and one entry spanning both would raise an alert neither an agent nor
+a grower could attribute. See the `PLANT AND DISEASE` section of
+`config/leadsman.example.json`.
+
+`measurement-dwell` is the same mechanism without the crop, and it adds the axis
+`mold-risk` does not need. `mode` picks whether the answer is the longest unbroken run
+or the total across the window, and that is not cosmetic: chill hours do not care
+whether the cold arrived in one stretch or twelve, so reporting the longest run would
+under-count a normal winter tenfold. `comparison: "atMost"` then raises when the dwell
+**fails** to reach its target — the direction nothing else in the engine can express,
+because a thing that did not happen often enough leaves no reading for a threshold to
+catch. Insufficient chill, unmet vernalization and an under-delivered irrigation
+allocation all live there.
+
+### Totals, and the direction that has no reading
+
+`measurement-accumulation` integrates. Nothing else here does, and that single absence
+used to block most of the standard agronomic index set, because the numbers a grower
+plans against are totals rather than instants — growing degree days, daily light
+integral, rainfall or irrigation delivered, cumulative heat or cold exposure.
+
+Two parameters do most of the work and both are easy to get wrong:
+
+- **`method`.** `integral` is the area under the curve and is right for anything that
+  is a *rate* or a persisting level — temperature, PAR, mm/hour. `sum` adds readings
+  and ignores time, which is right only when each reading is already a per-report
+  quantity. A `sum` over a rate silently scales with how often the device reports, so
+  the same weather gives a different answer on a 5-minute node and an hourly one.
+- **`scale`.** The integral comes out in unit·hours, and most indices want something
+  else: `0.0416667` (1/24) turns °C·hours into degree days, `0.0036` turns
+  µmol/m²/s·hours into mol/m² for a light integral, and `1` leaves mm/hour·hours as mm.
+
+Coverage is reported rather than assumed. A gap longer than `maxGapHours` contributes
+nothing, because holding the last value across a silent day would manufacture degree
+days out of a dead radio, and `minCoverage` refuses to judge a total at all below a
+fraction of the window — "the block is 300 GDD behind" and "the sensor was offline for
+two days" must not look the same.
+
+### Comparing a device against its neighbours
+
+Every check above is longitudinal: one device against its own past. `measurement-outlier`
+is the cross-sectional one, and it catches the fault the others structurally cannot —
+the device that is *plausibly wrong*. A probe reading 8 % low passes every threshold,
+varies convincingly with the weather, and quietly biases every decision made from it.
+Its neighbours are the only ground truth available without a soil core.
+
+It also finds what no per-device check can: irrigation non-uniformity. Probes on one
+valve should move together, and one that does not is a blocked lateral or a failed
+emitter while every probe is individually within range.
+
+Two things to know before enabling it:
+
+- **Spread is median absolute deviation, not standard deviation.** The outlier being
+  looked for would inflate a standard deviation enough to hide inside it — with six
+  probes on a valve, one bad sensor can raise σ past its own error and land comfortably
+  within two of them. MAD does not move.
+- **The group is the scope, so scope each instance to ONE comparable group.** There is
+  no separate grouping syntax; `deviceNamePattern: "%valve-7-%"` and one entry per valve
+  is the intended shape. Comparing a greenhouse probe against a dryland one produces a
+  true statement about two unrelated numbers.
+
+### Quantities no sensor emits
+
+`measurement-derived` computes from two readings **on the same uplink** — a temperature
+from 04:00 combined with a humidity from 16:00 is arithmetically valid and physically
+meaningless. Five formulas, all from temperature and relative humidity:
+
+| Formula | Unit | What it is for |
+|---|---|---|
+| `vpd` | kPa | Vapour pressure deficit — the governing number under glass. It, not humidity, drives transpiration and stomatal closure |
+| `deltaT` | °C | Wet-bulb depression. The spray window: below ~2 the droplets drift, above ~8 they evaporate before they land |
+| `dewPoint` | °C | Condensation, leaf-wetness onset, and the floor a radiative frost will actually reach |
+| `thi` | — | Temperature-humidity index. Dairy cattle: comfort below 68, measurable milk-yield loss from ~72, severe stress above ~80 |
+| `absoluteHumidity` | g/m³ | Ventilation and drying, where relative humidity is actively misleading because it moves with temperature |
+
+### Verifying that an action worked
+
+`downlink-unacked` catches a command that was never acknowledged. `response-missing`
+catches the worse case: one that *was* acknowledged, by a device online and reporting
+happily, whose physical effect never arrived. The flow meter turned over 4,000 litres
+and the root-zone probe never moved.
+
+This is the expensive silent failure, because the operator believes it happened — the
+counter advanced, every individual check is green — and finds out at harvest. Only the
+*relationship* between the two measurements is wrong, and only a lagged correlation can
+see it. Triggers younger than `responseWindowHours` are ignored entirely; without that
+the check reports every irrigation the moment it starts, before the water could possibly
+have reached the probe.
 
 ## How alerts behave
 
@@ -597,8 +769,29 @@ the chain stops there rather than falling through.
 reader has to work out what the alert means. `pipe-pressure-low` is critical but its summary
 already says what to do — that is a fact. `device-silent` is ambiguous alone, because one node
 is a dead node and six at once is the gateway; only combining it with other alerts answers
-that, which is what makes it worth an agent's tokens. Twenty-four of the twenty-seven rules
-are facts; the situations are `device-silent`, `join-churn` and `geofence-breach`.
+that, which is what makes it worth an agent's tokens. Twenty-nine of the thirty-five rules
+are facts; the situations are `device-silent`, `join-churn`, `geofence-breach`,
+`mold-risk`, `measurement-outlier` and `response-missing`.
+
+`mold-risk` is the only measurement-shaped rule in that set, and it is there because its
+summary is true without being actionable. Whether nine hours at 93 % and 18 °C warrants a
+spray depends on the crop's phenological stage, what was last applied and how long ago, the
+pre-harvest interval, and what the forecast does next — four facts this engine does not
+hold. Waking someone who would only have to go and look all of them up is exactly the case
+the class exists to route elsewhere.
+
+`measurement-outlier` and `response-missing` are situations for the same reason, and it
+is worth being precise about it. "This probe reads 8 % below its neighbours" is a
+miscalibrated sensor, a genuinely drier corner, or the one probe installed at the right
+depth. "Water was delivered and the soil did not wet" is a blocked lateral, a failed
+emitter, a probe fault, or water moving somewhere the probe is not. In both cases the
+same alert text has several causes needing different crews, and choosing between them
+needs install history and block layout this engine does not hold.
+
+`forecast-threshold` is a **fact**, despite being the newest and least obvious. "Frost
+forecast at 04:00, -2 °C, ten hours out" is the whole story, and the response is a
+decision the grower already knows how to make. Sending it to a model to be told it is
+cold would be paying tokens to restate the summary.
 
 The site and gateway checks are all facts, and deliberately so: `fleet-silent` and
 `gateway-silent` exist to *answer* the question that makes `device-silent` a situation, so
@@ -625,6 +818,124 @@ LEADSMAN_DEST_ONCALL_CHAT_ID=-1001234567890
 
 A destination whose provider has no credentials is rejected at **config** time, not on the
 first alert — otherwise the failure looks like a network fault at 3am.
+
+## Forecast
+
+The only part of the engine that reads the future, and the only credential the config
+file is permitted to hold.
+
+```json
+{
+  "forecast": {
+    "provider": "weatherbit",
+    "latitude": 38.795371405,
+    "longitude": -121.9932155,
+    "hours": 48,
+    "timeoutMs": 8000
+  }
+}
+```
+
+```sh
+export LEADSMAN_WEATHERBIT_API_KEY='…'     # preferred
+```
+
+**One call per sounding.** A forecast's spatial resolution is kilometres and the
+distance between blocks is hundreds of metres, so the config names one centroid for the
+operation and every forecast check shares that answer. Ten instances of
+`forecast-threshold` — frost, heat, rain, wind, spray window — cost one HTTP request
+between them. On a 15-minute schedule that is 96 requests a day, comfortably inside
+Weatherbit's free tier. A check that sets its own `latitude`/`longitude` costs one
+additional request per distinct point, which is worth it only for genuinely distant
+blocks.
+
+**Normalized onto the codec vocabulary.** Weatherbit is requested with `units=M`, which
+makes its units already the vocabulary's, and its fields are mapped onto the same paths
+the decoders emit — so no arithmetic happens in the adapter and a threshold means one
+thing regardless of where the number came from:
+
+| Forecast path | Unit | Weatherbit field |
+|---|---|---|
+| `air.temperature` | °C | `temp` |
+| `air.relativeHumidity` | % | `rh` |
+| `wind.speed` | m/s | `wind_spd` |
+| `wind.direction` | degrees | `wind_dir` |
+| `rain.intensity` | mm/hour | `precip` |
+| `air.pressure` | hPa | `pres` |
+| `air.solarIrradiance` | W/m² | `solar_rad` |
+| `air.dewPoint` | °C | `dewpt` |
+| `air.uvIndex` | index | `uv` |
+| `forecast.precipitationProbability` | % | `pop` |
+| `forecast.windGust` | m/s | `wind_gust_spd` |
+| `forecast.apparentTemperature` | °C | `app_temp` |
+| `forecast.cloudCover` | % | `clouds` |
+| `forecast.snowIntensity` | mm/hour | `snow` |
+
+The five `forecast.*` paths have no sensor equivalent and cannot get one — probability
+of precipitation is not a quantity anything can measure, and a gust forecast is a
+different statistic from an anemometer's window maximum.
+
+A field the provider omits is **absent**, never zero: 0 °C and 0 m/s are both real
+values, and reading a missing temperature as freezing is precisely the failure a frost
+check cannot afford.
+
+### The API key, and the one exception to committable config
+
+Every other credential in this engine comes from the environment, which is what makes a
+config file safe to commit and review in a diff. `forecast.apiKey` is allowed in the
+config's general section by explicit request, and it is the one thing that breaks that
+property — a config carrying it should not be committed anywhere.
+
+`LEADSMAN_WEATHERBIT_API_KEY` overrides the file and is the recommended path. When the
+key comes from the file instead, the engine says so once per sounding:
+
+```
+WARN  the Weatherbit API key came from the config file, which is therefore no longer
+      safe to commit — prefer LEADSMAN_WEATHERBIT_API_KEY
+```
+
+The key travels as a query parameter, so it is never included in an error message or a
+log line — a failed call reports the HTTP status and nothing else.
+
+### Failure is contained
+
+A metered third-party API is the least reliable thing in the stack. A provider outage
+fails only the checks that needed it: they are recorded as `error`, the database-backed
+checks in the same sounding run normally, and no open alert is resolved on the strength
+of a forecast nobody could fetch. With no `forecast` block at all the checks are
+recorded as `skipped` rather than run, so "not configured" never looks like "no frost
+coming".
+
+## Seasonal and diurnal gating
+
+Any check can name the months or hours it runs in:
+
+```json
+{ "rule": "forecast-threshold", "as": "frost-forecast",
+  "activeMonths": [1, 2, 3, 4, 10, 11, 12],
+  "params": { "min": 1.5, "withinHours": 14 } }
+
+{ "rule": "measurement-threshold", "as": "radiative-frost",
+  "activeHours": [22, 23, 0, 1, 2, 3, 4, 5, 6] }
+```
+
+A frost check has nothing to say in July and a mildew check has nothing to say in
+January, but without this both run every fifteen minutes all year and both get tuned by
+whoever is most tired of them. It is the cheapest reduction in alert fatigue available,
+and for a `situation` it is also the cheapest reduction in token spend.
+
+Both lists **wrap**, because seasons do: `[11, 12, 1, 2]` is a southern-hemisphere
+summer and a northern dormancy, and the engine does not need to know which.
+
+Both are evaluated in the config's `timezone`, not UTC. That matters most for hours: a
+frost window expressed in local night hours would otherwise be wrong by the whole UTC
+offset every single night, which is the entire period it exists to cover.
+
+A gated check is recorded as `skipped`, exactly like one whose prerequisites are
+unconfigured — a frost check that returned nothing in July is indistinguishable from
+one that ran and found no frost, and only one of those means the check is working.
+`"activeMonths": []` is refused rather than treated as "all", because it reads like a
+placeholder and would silently disable the check forever.
 
 ## Gateway and host visibility
 
@@ -838,6 +1149,7 @@ pattern as the stack's own `010_events_roles.sh`, so it can be dropped into
 | `LEADSMAN_MIGRATE_URL` | Owner-role URL, used by `migrate`. Falls back to the above |
 | `LEADSMAN_CONFIG` | Config path. Default `config/leadsman.json` |
 | `LEADSMAN_RULES_DIR` | Extra directory of operator-supplied checks |
+| `LEADSMAN_WEATHERBIT_API_KEY` | Weatherbit key for the forecast checks. Overrides `forecast.apiKey`, and is the recommended place for it — see [Forecast](#forecast) |
 | `LEADSMAN_INSTANCE_NAME` | Names this edge device: every message leads `Alert from <name>: `, defaulting to `Leadsman`. Also the webhook payload's `instance` |
 | `LEADSMAN_WEBHOOK_TOKEN` | The shared secret. Env only — never read from the config file |
 | `LEADSMAN_WEBHOOK_TOKEN_<NAME>` | Per-destination secret, e.g. `…_AGENT` for destination `agent`. Falls back to the shared one |

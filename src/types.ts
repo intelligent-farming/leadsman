@@ -148,6 +148,20 @@ export interface SoundingContext {
    */
   gateways?: GatewaySource | null;
 
+  /**
+   * The weather that has not happened yet.
+   *
+   * Every other source in this context is a record of the past, and the most valuable
+   * decisions on a farm are made against the future: spray before the rain, run the
+   * frost fans tonight, pick ahead of the heat. No amount of telemetry contains that,
+   * so it is fetched from a forecast provider once per sounding and shared by every
+   * check in the pass — one HTTP call, not one per check.
+   *
+   * Null when unconfigured. Declare `needs: ['forecast']` rather than checking for
+   * null, and the engine will skip the check instead of running it blind.
+   */
+  forecast?: ForecastSource | null;
+
   /** Facts about this engine and its host, which no amount of telemetry can supply. */
   engine: EngineFacts;
 
@@ -194,6 +208,97 @@ export interface GatewayRecord {
  */
 export interface GatewaySource {
   listGateways(): Promise<GatewayRecord[]>;
+}
+
+/**
+ * One hour of forecast, normalized onto the codec vocabulary.
+ *
+ * The paths and units here are deliberately the SAME ones the decoded telemetry uses —
+ * `air.temperature` in °C, `wind.speed` in m/s, `rain.intensity` in mm/hour. That is
+ * what lets one mechanism read both: a threshold of 1.5 °C means the identical thing
+ * whether it came off a sensor in the block or out of a forecast API, and a check does
+ * not have to learn a second vocabulary to reason about the future.
+ *
+ * A few concepts exist only in a forecast and have no sensor equivalent, so they get
+ * paths of their own under `forecast.*` — probability of precipitation most of all,
+ * which has no meaning at all as a measurement.
+ */
+export interface ForecastHour {
+  /** Start of the hour this entry describes, RFC3339 UTC. */
+  at: string;
+  /** Hours from the sounding to `at`. 0 is the hour in progress. */
+  leadHours: number;
+  /**
+   * Normalized values, keyed by dotted vocabulary path. Sparse: a provider that does
+   * not return a field simply omits it rather than sending a zero, because zero is a
+   * legitimate temperature and a legitimate wind speed.
+   */
+  values: Record<string, number>;
+}
+
+/** A location a forecast can be fetched for. */
+export interface Coordinates {
+  latitude: number;
+  longitude: number;
+}
+
+/** A forecast for one place, as the provider returned it. */
+export interface Forecast {
+  /** Where it is for — the configured centroid unless a check asked for somewhere else. */
+  at: Coordinates;
+  /** Provider's own name for the place, when it supplies one. Display only. */
+  locationName: string | null;
+  /** When this forecast was fetched. */
+  retrievedAt: string;
+  /** Hour-by-hour, ascending. */
+  hours: ForecastHour[];
+}
+
+/**
+ * Where forecasts come from. An interface rather than the concrete client so a check
+ * can be tested with a stub and no HTTP — the same shape, and for the same reason, as
+ * `GatewaySource`.
+ */
+export interface ForecastSource {
+  /**
+   * The forecast for the configured centroid, or for an explicit point.
+   *
+   * Results are memoized per coordinate for the life of the source, which is one
+   * sounding. Calling it from ten checks with no argument costs one HTTP request;
+   * passing a distinct point costs one more, which is why the centroid is the default
+   * and per-check coordinates are the exception rather than the habit.
+   */
+  forecast(at?: Coordinates): Promise<Forecast>;
+  /** The configured centroid, so a check can report what it reasoned about. */
+  centroid: Coordinates;
+}
+
+/** Forecast provider settings. Lives in the config's general section. */
+export interface ForecastConfig {
+  /** Only Weatherbit today. Named so a second provider does not change the shape. */
+  provider: 'weatherbit';
+  /**
+   * The point every check reasons about unless it names its own — normally the
+   * centroid of the operation, since a forecast's resolution is far coarser than the
+   * distance between blocks and one call per block would buy nothing but quota use.
+   */
+  latitude: number;
+  longitude: number;
+  /**
+   * API key.
+   *
+   * NOTE: this is the one credential the config file is permitted to hold, at the
+   * operator's explicit request, and it is therefore the one reason a config file may
+   * not be safe to commit. `LEADSMAN_WEATHERBIT_API_KEY` overrides it and is the
+   * recommended way to supply it; parseConfig warns when the key came from the file.
+   */
+  apiKey?: string;
+  /** How many hours ahead to request. Weatherbit's hourly endpoint caps this by plan. */
+  hours: number;
+  /** Give up on the provider after this long. */
+  timeoutMs: number;
+  /** Override for testing against a local stub. */
+  baseUrl?: string;
 }
 
 /** Host- and engine-level facts, gathered once per sounding. */
@@ -253,13 +358,14 @@ export interface Rule {
    *
    *   chirpstack   a configured connection to the network server's gateway API
    *   hostAddress  a configured source for the host's forwarding address
+   *   forecast     a configured forecast provider
    *
    * A check naming something unconfigured is recorded as `skipped` rather than run, so
    * "this needs setting up" reads differently from "this found nothing" in
    * `leadsman.run`. Without it, an unconfigured gateway check looks exactly like a
    * healthy one — which is the failure mode this whole area exists to remove.
    */
-  needs?: ReadonlyArray<'chirpstack' | 'hostAddress'>;
+  needs?: ReadonlyArray<'chirpstack' | 'hostAddress' | 'forecast'>;
   /** Return everything currently in breach. Throw to fail the sounding. */
   run(ctx: SoundingContext): Promise<Finding[]>;
 }
@@ -283,6 +389,27 @@ export interface CheckConfig {
    * instance named `pipe-pressure-low` is a situation while `soil-ph-range` is a fact.
    */
   notifyTo?: string;
+  /**
+   * Months this check runs in, 1-12, in the config's timezone. Absent means every month.
+   *
+   * A frost check has nothing to say in July and a mildew check has nothing to say in
+   * January, but both run every fifteen minutes all year and both are tuned by whoever
+   * is most tired of them. Seasonal gating is the cheapest reduction in alert fatigue
+   * available, and for a `situation` it is also the cheapest reduction in token spend.
+   *
+   * Ranges wrap, because seasons do: `[11, 12, 1, 2]` is a southern-hemisphere summer
+   * and a northern-hemisphere dormancy, and the engine does not need to know which.
+   */
+  activeMonths?: number[];
+  /**
+   * Hours this check runs in, 0-23, in the config's timezone. Absent means every hour.
+   *
+   * For the checks whose subject only exists at one time of day: radiative frost forms
+   * overnight, heat stress happens in the afternoon, and a daily-light check has nothing
+   * to measure before dusk. Wraps across midnight, so `[22, 23, 0, 1, 2, 3, 4, 5, 6]` is
+   * one continuous night.
+   */
+  activeHours?: number[];
   params?: Record<string, unknown>;
 }
 
@@ -441,6 +568,8 @@ export interface LeadsmanConfig {
   suppress?: SuppressRule[];
   heartbeat?: HeartbeatConfig;
   chirpstack?: ChirpStackConfig;
+  /** Forecast provider and the centroid every forecast check reasons about. */
+  forecast?: ForecastConfig;
   /** Where to read the host's gateway-forwarding address. */
   hostAddress?: HostAddressConfig;
   checks: CheckConfig[];
