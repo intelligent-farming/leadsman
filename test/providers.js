@@ -1086,7 +1086,38 @@ test('forecast: an HTTP error never echoes the URL, which carries the key', asyn
   } finally { srv.close(); }
 });
 
-test('forecast: a failed fetch is not cached as the answer for the sounding', async () => {
+test('forecast: a failure is shared by every check in the sounding, not retried by each', async () => {
+  // Regression: the rejected promise used to be evicted, so every forecast check in the
+  // pass refetched in turn — ten checks against a provider returning 500 cost ten
+  // requests, and against one that hangs, ten back-to-back timeouts stalling the
+  // sounding. One sounding, one call, whether it succeeds or not.
+  let hits = 0;
+  const srv = await capture((req, res) => {
+    hits += 1;
+    res.writeHead(500).end();
+  });
+  const warned = [];
+  try {
+    const src = forecastSource(fcConfig(srv.port), 'k', {
+      debug() {}, warn: (m, meta) => warned.push([m, meta]),
+    });
+    for (let i = 0; i < 10; i += 1) {
+      // Sequential on purpose: concurrent callers already shared the in-flight promise.
+      // The bug was the NEXT caller after the rejection settled.
+      await assert.rejects(() => src.forecast(), /HTTP 500/);
+    }
+    assert.equal(hits, 1, 'ten checks against a failing provider must cost one request');
+    assert.equal(warned.length, 1, 'and the outage is logged once, not once per check');
+
+    // A distinct point is a distinct request, as it is on success.
+    await assert.rejects(() => src.forecast({ latitude: 36.7378, longitude: -119.7871 }));
+    assert.equal(hits, 2);
+  } finally { srv.close(); }
+});
+
+test('forecast: the next sounding gets a fresh attempt after a failure', async () => {
+  // The memo lives exactly as long as one source, and the runner builds one per
+  // sounding — so an outage costs this pass, never the next one.
   let hits = 0;
   const srv = await capture((req, res) => {
     hits += 1;
@@ -1094,10 +1125,8 @@ test('forecast: a failed fetch is not cached as the answer for the sounding', as
     res.writeHead(200, { 'content-type': 'application/json' }).end(wbBody([wbHour()]));
   });
   try {
-    const src = forecastSource(fcConfig(srv.port), 'k', quiet);
-    await assert.rejects(() => src.forecast());
-    // The next check in the same pass gets a real attempt rather than the rejection.
-    const fc = await src.forecast();
+    await assert.rejects(() => forecastSource(fcConfig(srv.port), 'k', quiet).forecast());
+    const fc = await forecastSource(fcConfig(srv.port), 'k', quiet).forecast();
     assert.equal(fc.hours.length, 1);
   } finally { srv.close(); }
 });
@@ -1133,4 +1162,112 @@ test('forecast: the environment key wins over the config file, and says which', 
     if (prev === undefined) delete process.env.LEADSMAN_WEATHERBIT_API_KEY;
     else process.env.LEADSMAN_WEATHERBIT_API_KEY = prev;
   }
+});
+
+// ── forecast-threshold evaluation ────────────────────────────────────────────
+// Against a fake source, never a real API: the rule's job is what it concludes from a
+// list of hours, and every case below is a list of hours.
+
+const { loadRules } = require('../dist/registry.js');
+
+/** Run forecast-threshold over hourly values starting `firstLead` hours out. */
+async function forecastRun(values, params, firstLead = 1) {
+  const rule = loadRules().get('forecast-threshold');
+  const base = Date.parse('2026-07-15T00:00:00.000Z');
+  const hours = values.map((v, i) => ({
+    at: new Date(base + (firstLead + i) * 3_600_000).toISOString(),
+    leadHours: firstLead + i,
+    values: v === null ? {} : { 'air.temperature': v },
+  }));
+  const lines = [];
+  return rule.run({
+    query: async () => [],
+    params: { ...rule.defaultParams, withinHours: 24, ...params },
+    openDevEuis: new Set(),
+    openSubjects: new Set(),
+    kind: 'test',
+    now: new Date(base),
+    log: { debug() {}, info() {}, warn: (m) => lines.push(m), error() {} },
+    forecast: {
+      centroid: { latitude: 0, longitude: 0 },
+      forecast: async () => ({
+        at: { latitude: 0, longitude: 0 }, locationName: 'Test block',
+        retrievedAt: new Date(base).toISOString(), hours,
+      }),
+    },
+  });
+}
+
+test('forecast-threshold: minHours counts CONSECUTIVE breaching hours, not scattered ones', async () => {
+  // Regression: [1,10,1,10,...]-style scatter used to add up to "sustained". Two
+  // single-hour dips separated by a recovery are two excursions, not a 2-hour event.
+  assert.deepEqual(
+    await forecastRun([1, 10, 1, 10, 10], { min: 1.5, max: null, minHours: 2 }),
+    [],
+    'two isolated sub-1.5 hours must not satisfy minHours 2',
+  );
+  // An hour that does not carry the path ends the run too — nothing is known about it.
+  assert.deepEqual(
+    await forecastRun([1, null, 1], { min: 1.5, max: null, minHours: 2 }),
+    [],
+  );
+  const found = await forecastRun([10, 1, 1, 10], { min: 1.5, max: null, minHours: 2 });
+  assert.equal(found.length, 1, 'two adjacent breaching hours are the sustained event');
+  assert.equal(found[0].detail.runHours, 2);
+  assert.equal(found[0].detail.runStartAt, '2026-07-15T02:00:00.000Z');
+  assert.equal(found[0].detail.runEndAt, '2026-07-15T03:00:00.000Z');
+});
+
+test('forecast-threshold: [1,10,10,10,1] is two single-hour dips, not a sustained frost', async () => {
+  // The fact-pass case, as stated: [1,10,10,10,1] against min 1.5 breaches in hours 1
+  // and 5 only — two separate single hours — so minHours 2 must not fire.
+  assert.deepEqual(
+    await forecastRun([1, 10, 10, 10, 1], { min: 1.5, max: null, minHours: 2 }),
+    [],
+  );
+  // Two adjacent breaching hours do satisfy it.
+  const run = await forecastRun([1, 1, 10], { min: 1.5, max: null, minHours: 2 });
+  assert.equal(run.length, 1);
+  assert.equal(run[0].detail.runHours, 2);
+  // And a single breaching hour satisfies the default minHours 1.
+  const tail = await forecastRun([10, 10, 1], { min: 1.5, max: null, minHours: 1 });
+  assert.equal(tail.length, 1);
+  assert.equal(tail[0].detail.worstValue, 1);
+});
+
+test('forecast-threshold: with min and max both set, the summary quotes the worst of the side that breached', async () => {
+  // Regression: whenever min was set the reducer picked the LOWEST crossing, so a heat
+  // breach was reported by its mildest hour — "31C (above 30C)" when 35 was forecast.
+  const heat = await forecastRun([20, 32, 35, 31], { min: 0, max: 30, minHours: 1, unit: 'C' });
+  assert.equal(heat.length, 1);
+  assert.equal(heat[0].detail.worstValue, 35);
+  assert.equal(heat[0].detail.breached, 'max');
+  assert.match(heat[0].summary, /35C \(above 30C\)/);
+  assert.doesNotMatch(heat[0].summary, /31C/);
+});
+
+test('forecast-threshold: a forecast breaching both bounds reports both', async () => {
+  // A frost at dawn and a heat spike in the afternoon are two problems; quoting one
+  // would hide the other.
+  const found = await forecastRun([-2, -3, 10, 36, 38], { min: 0, max: 35, minHours: 1, unit: 'C' });
+  assert.equal(found.length, 1, 'still one site alert');
+  const d = found[0].detail;
+  assert.equal(d.breached, 'both');
+  assert.match(found[0].summary, /-3C \(below 0C\) and 38C \(above 35C\)/);
+  assert.equal(d.worstValue, -3, 'the soonest breach leads');
+  assert.deepEqual(d.breaches.map((b) => [b.bound, b.worstValue]), [['min', -3], ['max', 38]]);
+  assert.equal(d.hoursAffected, 4);
+});
+
+test('forecast-threshold: the hour in progress is excluded at afterHours 0', async () => {
+  // Pins the afterHours doc: the in-progress hour's timestamp is in the past, so its
+  // lead is negative and it never reaches the window — afterHours is not needed for it.
+  const found = await forecastRun([-5, 10, 10], { min: 1.5, max: null, afterHours: 0 }, -0.5);
+  assert.deepEqual(found, []);
+  // afterHours skips hours that START sooner than N hours out.
+  const later = await forecastRun([10, -1, -2], { min: 1.5, max: null, afterHours: 2 }, 1);
+  assert.equal(later.length, 1);
+  assert.equal(later[0].detail.firstBreachAt, '2026-07-15T02:00:00.000Z');
+  const skipped = await forecastRun([-1, 10, 10], { min: 1.5, max: null, afterHours: 2 }, 1);
+  assert.deepEqual(skipped, []);
 });

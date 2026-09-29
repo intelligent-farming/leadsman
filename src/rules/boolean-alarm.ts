@@ -23,7 +23,9 @@
  *
  * The alert clears when the flag reads false again, so a leak detector that trips and
  * is then dried out resolves on its own — while a detector that stays wet keeps one
- * open alert rather than notifying on every uplink.
+ * open alert rather than notifying on every uplink. Only a frame that carries the flag
+ * can clear it: a heartbeat or battery frame that omits the field is skipped, and the
+ * latest frame that did report it still decides.
  */
 
 import { int, optNum, round } from '../params';
@@ -94,6 +96,12 @@ const rule: Rule = {
     const maxGapHours = optNum(ctx.params, 'maxGapHours') ?? 1;
     if (minDurationMinutes < 0) throw new Error('minDurationMinutes must not be negative');
     if (maxGapHours <= 0) throw new Error('maxGapHours must be positive');
+    if (lookbackHours <= 0) {
+      throw new Error(
+        'lookbackHours must be positive — an empty window holds no readings, so this ' +
+          'check could never fire',
+      );
+    }
     if (minDurationMinutes >= lookbackHours * 60) {
       throw new Error(
         `minDurationMinutes (${minDurationMinutes}) must be less than lookbackHours ` +

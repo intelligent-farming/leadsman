@@ -86,6 +86,12 @@ const rule: Rule = {
     if (direction !== 'max' && direction !== 'min') {
       throw new Error(`direction must be "max" or "min" (got "${direction}")`);
     }
+    if (lookbackHours <= 0) {
+      throw new Error(
+        'lookbackHours must be positive — an empty window holds no readings, so this ' +
+          'check could never fire',
+      );
+    }
 
     const rawComparison = ctx.params.comparison;
     if (rawComparison !== null && rawComparison !== undefined && rawComparison !== 'above' && rawComparison !== 'below') {

@@ -33,8 +33,9 @@
  *
  * ## Why this is a `situation`
  *
- * Unlike almost every other rule here, this one defaults to the expensive routing
- * class, and it is the only measurement-shaped rule that does. The summary line is
+ * Unlike most rules here, this one defaults to the expensive routing class — one of
+ * the few measurement-shaped rules that do, alongside `soil-deficit-band` and
+ * `measurement-outlier`, and for the same kind of reason. The summary line is
  * *true* but it is not *actionable*: whether nine hours at 93 °% and 18 °C warrants a
  * spray depends on the crop's phenological stage, what was last applied and how long
  * ago, the pre-harvest interval, whether the canopy was just opened up, and what the
@@ -81,9 +82,9 @@ const rule: Rule = {
     'Enable once per crop with a distinct "as" name and its own scope.',
   defaultSeverity: 'warning',
   /**
-   * A situation, and deliberately the only measurement rule that is one: acting on it
-   * needs the crop stage, the spray history and the forecast, none of which are in the
-   * event store. See the header.
+   * A situation, deliberately — as are soil-deficit-band and measurement-outlier:
+   * acting on it needs the crop stage, the spray history and the forecast, none of
+   * which are in the event store. See the header.
    */
   defaultRouting: 'situation',
   defaultParams: {

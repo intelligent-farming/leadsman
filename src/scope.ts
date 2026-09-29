@@ -149,7 +149,12 @@ export const GATEWAY_SCOPE_PARAMS = {
   ignoreGateways: [] as string[],
 };
 
-/** Gateway EUIs are compared lowercase, matching how rx_info and the API report them. */
+/**
+ * Gateway EUIs are compared lowercase, matching how ChirpStack v4's rx_info and API report
+ * them. Lowercased here for the in-memory comparison, and again on both sides of the SQL
+ * predicate in gatewayScopeClause, so an uppercase id in rx_info (a v3-era row, a
+ * hand-written fixture, another writer) is still matched by `gateways`/`ignoreGateways`.
+ */
 function euiList(params: Record<string, unknown>, key: string): string[] {
   const raw = params[key];
   if (raw === null || raw === undefined) return [];
@@ -172,6 +177,12 @@ export function resolveGatewayScope(params: Record<string, unknown>): GatewaySco
  * Same constant-shape approach as scopeClause: both parameters are always referenced so
  * the statement text does not change with configuration. Consumes two positional
  * parameters starting at `startIndex`.
+ *
+ * Case-insensitive on both sides: the column is wrapped in lower() and the bound lists
+ * are lowercased here rather than trusted to arrive that way, because a GatewayScope can
+ * be built directly (ANY_GATEWAY, a test) without going through resolveGatewayScope.
+ * Comparing the raw rx_info id against a lowercased list would let an uppercase id slip
+ * past `ignoreGateways` — the documented "compared lowercase" would then be untrue.
  */
 export function gatewayScopeClause(
   scope: GatewayScope,
@@ -181,9 +192,12 @@ export function gatewayScopeClause(
   const i = startIndex;
   return {
     sql:
-      `AND (cardinality($${i}::text[]) = 0 OR ${column} = ANY($${i}::text[])) ` +
-      `AND NOT (${column} = ANY($${i + 1}::text[]))`,
-    values: [scope.only, scope.ignore],
+      `AND (cardinality($${i}::text[]) = 0 OR lower(${column}) = ANY($${i}::text[])) ` +
+      `AND NOT (lower(${column}) = ANY($${i + 1}::text[]))`,
+    values: [
+      scope.only.map((id) => id.toLowerCase()),
+      scope.ignore.map((id) => id.toLowerCase()),
+    ],
   };
 }
 

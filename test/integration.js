@@ -314,7 +314,9 @@ async function main() {
   // never seen is only intelligible through it.
   const logErr = alerts.find((a) => a.kind === 'chirpstack-errors');
   assert.match(logErr.detail.latestDescription, /codec error/i);
-  assert.equal(logErr.severity, 'critical', 'ChirpStack level 2 is an ERROR');
+  // Level 2 is ChirpStack's highest level and the default minLevel, so it does not
+  // escalate on its own — the check's configured severity applies.
+  assert.equal(logErr.severity, 'warning', 'findings carry the configured severity');
 
   // Join churn is judged on joins relative to uplinks, not joins alone.
   const churn = alerts.find((a) => a.kind === 'rejoining');

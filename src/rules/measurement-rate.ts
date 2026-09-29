@@ -124,6 +124,21 @@ const rule: Rule = {
       throw new Error(`direction must be "falling", "rising", or "either" (got "${direction}")`);
     }
     if (maxRate <= 0) throw new Error('maxRatePerHour must be positive');
+    if (lookbackHours <= 0) {
+      throw new Error(
+        'lookbackHours must be positive — an empty window holds no readings, so this ' +
+          'check could never fire',
+      );
+    }
+    // The span is last reading minus first, both inside the window, so it is always
+    // strictly shorter than lookbackHours. A minimum span at or past the window can
+    // never be met.
+    if (minSpanHours >= lookbackHours) {
+      throw new Error(
+        `minSpanHours (${minSpanHours}) must be less than lookbackHours (${lookbackHours}) — ` +
+          'the readings in a window cannot span more than the window, so this check could never fire',
+      );
+    }
     if (method !== 'endpoints' && method !== 'leastSquares') {
       throw new Error(`method must be "endpoints" or "leastSquares" (got "${method}")`);
     }

@@ -44,15 +44,37 @@ const walk = (node, prefix) => {
     return;
   }
   if (node.type === 'number' || node.type === 'integer') {
-    const { minimum = null, maximum = null } = node;
-    if (minimum !== null || maximum !== null) ranges.set(prefix, [minimum, maximum]);
+    // JSON Schema 2020-12 carries exclusive bounds as numbers of their own
+    // (`exclusiveMaximum: 360` on wind direction). Dropping them vendored
+    // `wind.direction` as [0, null] and let 540 degrees through, so each side keeps
+    // whichever of the inclusive and exclusive bounds is tighter, and remembers
+    // which kind it was.
+    const side = (inclusive, exclusive, tighter) => {
+      const inc = typeof inclusive === 'number' ? inclusive : null;
+      const exc = typeof exclusive === 'number' ? exclusive : null;
+      if (exc === null) return [inc, false];
+      if (inc === null) return [exc, true];
+      return tighter(exc, inc) ? [exc, true] : [inc, false];
+    };
+    const [lo, loExclusive] = side(node.minimum, node.exclusiveMinimum, (e, i) => e >= i);
+    const [hi, hiExclusive] = side(node.maximum, node.exclusiveMaximum, (e, i) => e <= i);
+    if (lo !== null || hi !== null) {
+      ranges.set(prefix, { lo, hi, loExclusive, hiExclusive });
+    }
   }
 };
 walk(schema, '');
 
 const rows = [...ranges.entries()]
   .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
-  .map(([p, [lo, hi]]) => `  ['${p}', [${lo ?? 'null'}, ${hi ?? 'null'}]],`)
+  .map(([p, { lo, hi, loExclusive, hiExclusive }]) => {
+    // The exclusivity element is emitted only where a bound is exclusive, so the
+    // common inclusive row stays a plain pair and a diff shows the exceptions.
+    const flags = [loExclusive ? 'min: true' : null, hiExclusive ? 'max: true' : null]
+      .filter(Boolean);
+    const exclusive = flags.length > 0 ? `, { ${flags.join(', ')} }` : '';
+    return `  ['${p}', [${lo ?? 'null'}, ${hi ?? 'null'}${exclusive}]],`;
+  })
   .join('\n');
 
 const out = `/**
@@ -63,8 +85,9 @@ const out = `/**
  *
  * GENERATED — do not hand-edit. The source of truth is
  * \`definitions/vocabulary.schema.json\` in @intelligent-farming/lorawan-codec-normalization
- * (snapshot of v${version}), which carries an explicit \`minimum\`/\`maximum\` on
- * ${ranges.size} numeric leaves. Regenerate with \`npm run vocabulary:sync\`.
+ * (snapshot of v${version}), which carries an explicit \`minimum\`/\`maximum\` (or
+ * \`exclusiveMinimum\`/\`exclusiveMaximum\`) on ${ranges.size} numeric leaves. Regenerate
+ * with \`npm run vocabulary:sync\`.
  *
  * ## Why this is vendored rather than imported
  *
@@ -86,8 +109,23 @@ const out = `/**
  * negative humidity or a battery below zero volts, and each is a real failure signature.
  */
 
-/** Inclusive \`[minimum, maximum]\`; \`null\` on either side means unbounded there. */
-export type VocabularyRange = readonly [min: number | null, max: number | null];
+/** Which side of a range is exclusive. Absent or false means inclusive. */
+export interface RangeExclusivity {
+  readonly min?: boolean;
+  readonly max?: boolean;
+}
+
+/**
+ * \`[minimum, maximum, exclusive?]\`; \`null\` on either side means unbounded there.
+ * Bounds are inclusive unless the third element marks a side exclusive — the schema's
+ * \`exclusiveMaximum: 360\` on \`wind.direction\` is \`[0, 360, { max: true }]\`, since
+ * 360 degrees is 0 and a codec emitting it has not wrapped.
+ */
+export type VocabularyRange = readonly [
+  min: number | null,
+  max: number | null,
+  exclusive?: RangeExclusivity,
+];
 
 /** Dotted vocabulary path to its physically valid range. */
 export const VOCABULARY_RANGES: ReadonlyMap<string, VocabularyRange> = new Map<

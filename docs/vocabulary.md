@@ -33,8 +33,8 @@ LoRaWAN MAC layer, so it works on a device whose payload codec emits nothing at 
 
 One concept often spans several paths, because which one a device emits depends on
 what kind of sensor it is. Every check therefore takes a **priority-ordered list**,
-resolves the first path present *per device*, and ignores devices carrying none of
-them. So a single entry covers a mixed fleet:
+resolves the first path present *per device* — in the newest uplink that carries any
+candidate — and ignores devices carrying none of them. So a single entry covers a mixed fleet:
 
 ```json
 { "rule": "measurement-threshold", "as": "frost-risk",
@@ -96,7 +96,7 @@ Groupings worth knowing, since these are the ones that bite if you only list one
 | Path | Type | Unit | Range | Checks |
 |---|---|---|---|---|
 | `soil.depth` | number | cm | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
-| `soil.moisture` | number | % | ≥ 0, ≤ 100 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
+| `soil.moisture` | number | % | ≥ 0, ≤ 100 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible`, `soil-deficit-band` |
 | `soil.temperature` | number | °C | ≥ -273.15 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
 | `soil.ec` | number | dS/m | ≥ 0, ≤ 621 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
 | `soil.pH` | number | — | ≥ 0, ≤ 14 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
@@ -167,13 +167,13 @@ Groupings worth knowing, since these are the ones that bite if you only list one
 | Path | Type | Unit | Range | Checks |
 |---|---|---|---|---|
 | `action.motion.detected` | boolean | — | — | `boolean-alarm` |
-| `action.motion.count` | number | count | ≥ 0 | `counter-stalled`, `counter-spike` |
+| `action.motion.count` | number | count | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
 | `action.contactState` | string | — | `open`, `closed` | `boolean-alarm` |
 | `action.occupancy.occupied` | boolean | true | — | `boolean-alarm` |
-| `action.occupancy.duration` | number | s | ≥ 0 | `counter-stalled`, `counter-spike` |
+| `action.occupancy.duration` | number | s | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
 | `action.button.pressed` | boolean | true | — | `boolean-alarm` |
 | `action.button.event` | string | — | `single`, `double`, `triple`, `long`, `hold`, `release` | — |
-| `action.button.count` | number | count | ≥ 0 | `counter-stalled`, `counter-spike` |
+| `action.button.count` | number | count | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
 | `action.smoke.detected` | boolean | true | — | `boolean-alarm` |
 | `action.switch.state` | boolean | true | — | `boolean-alarm` |
 
@@ -253,15 +253,15 @@ Groupings worth knowing, since these are the ones that bite if you only list one
 
 | Path | Type | Unit | Range | Checks |
 |---|---|---|---|---|
-| `pulse.count` | number | count | ≥ 0 | `counter-stalled`, `counter-spike` |
+| `pulse.count` | number | count | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
 | `pulse.total` | number | count | ≥ 0 | `counter-stalled`, `counter-spike` |
 
 ### `people`
 
 | Path | Type | Unit | Range | Checks |
 |---|---|---|---|---|
-| `people.in` | number | count | ≥ 0 | `counter-stalled`, `counter-spike` |
-| `people.out` | number | count | ≥ 0 | `counter-stalled`, `counter-spike` |
+| `people.in` | number | count | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
+| `people.out` | number | count | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
 | `people.total` | number | in - out | — | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
 | `people.present` | number | count | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
 

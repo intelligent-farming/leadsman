@@ -347,7 +347,7 @@
         "centerLat": null,
         "centerLon": null,
         "radiusMetres": null,
-        "clearMargin": 0.0005,
+        "clearMargin": 25,
         "lookbackHours": 24
       }
     },

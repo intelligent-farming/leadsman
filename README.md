@@ -75,7 +75,8 @@ leadsman status             # what is currently open
 trusting a config, and they need progressively more of the stack:
 
 - **`lint` needs nothing but the file.** It resolves every rule name, rejects a
-  parameter the rule does not have, and — the part that matters — runs each rule's own
+  parameter the rule does not have (a typo would otherwise fall back to the default
+  silently), and — the part that matters — runs each rule's own
   parameter validation, so a combination that *can never fire* is an error rather than
   a check that quietly reports nothing forever. A dwell longer than the window it is
   measured in, a threshold with neither bound, a temperature gate with no bounds: all
@@ -118,7 +119,7 @@ the environment — so it is safe to commit and review in a diff.
 | `as` | Instance name, and the alert `kind`. Defaults to `rule`. Required when enabling the same rule twice |
 | `enabled` | Defaults to `true`. Set `false` to keep an entry documented but inactive |
 | `severity` | Overrides the check's default. A check may still escalate an individual finding |
-| `params` | Merged over the check's `defaultParams`. Unknown keys are reported by `verify` |
+| `params` | Merged over the check's `defaultParams`. Unknown keys are an error in `lint` and `verify` |
 | `statementTimeoutMs` | Per-query ceiling, applied as Postgres `statement_timeout` |
 
 Generic checks like `measurement-threshold` are meant to be listed more than once
@@ -148,7 +149,7 @@ exercised by CI against fixtures, so neither can drift from the code.
 
 ## Available checks
 
-Thirty-five checks in four families, organized by *mechanism* rather than by measurement.
+Thirty-six checks in four families, organized by *mechanism* rather than by measurement.
 Which sensor a check looks at is configuration; how it decides something is wrong is
 code. That is why so few checks cover all 104 paths of the normalized vocabulary — a
 wind threshold and a soil-moisture threshold are the same mechanism pointed at
@@ -165,18 +166,19 @@ Run `leadsman list` for every parameter and default.
 | `measurement-missing` | A field vanished from the codec output | warning |
 | `measurement-dwell` | How long a value stayed inside a band — reached a target, or fell short | warning |
 | `measurement-accumulation` | A total across a window: degree days, light integral, rainfall | info |
-| `measurement-derived` | A quantity no sensor emits: VPD, delta-T, dew point, THI | warning |
+| `measurement-derived` | A quantity no sensor emits: VPD, delta-T, dew point, THI, absolute humidity | warning |
 | `measurement-outlier` | One device disagreeing with its peer group | warning |
+| `soil-deficit-band` | A managed deficit drifting out of its band, and which way | warning |
 | `measurement-implausible` | A reading physics does not permit — **needs no configuration** | warning |
 | `mold-risk` | Humidity held in a band for hours, at a temperature a fungus grows at | warning |
 | `response-missing` | An action happened and its expected effect never followed | warning |
 | `boolean-alarm` | A flag is asserted (leak, gas, smoke, motion, open contact) | critical |
-| `counter-stalled` | A monotonic total stopped advancing, or went backwards | warning |
+| `counter-stalled` | A monotonic total stopped advancing, or stepped backwards anywhere in the window | warning |
 | `counter-spike` | A monotonic total advancing far too fast | critical |
 | `geofence-breach` | Position outside a bounding box or radius | critical |
 | `battery-low` | Supply voltage below threshold, with hysteresis | warning |
 | `device-silent` | A device that was reporting has stopped | critical |
-| `decode-failure` | Uplinks arriving but the codec decodes nothing | warning |
+| `decode-failure` | Uplinks arriving but most of them decode to nothing | warning |
 | `signal-degraded` | Average best-gateway RSSI/SNR toward the edge of coverage | info |
 
 ### Network-layer checks
@@ -191,7 +193,7 @@ healthy in `event_up`.
 | `status-battery-low` | `event_status` | Battery % from the MAC layer, **codec-independent** | warning |
 | `status-margin-low` | `event_status` | Device's demodulation margin — can it hear the gateway | warning |
 | `join-churn` | `event_join` | Repeated rejoins; session keeps dropping | warning |
-| `downlink-unacked` | `event_ack` | Confirmed downlinks never acknowledged | critical |
+| `downlink-unacked` | `event_ack` | Confirmed downlinks ChirpStack marked unacknowledged | critical |
 
 Three of these are worth understanding rather than just enabling:
 
@@ -199,7 +201,9 @@ Three of these are worth understanding rather than just enabling:
   the payload codec decoded; if the codec is missing or broken it silently stops
   matching the device, so a flat battery goes unnoticed exactly when every other check
   has already gone quiet. `event_status` comes from a MAC-layer `DevStatusReq`, so no
-  codec is involved. Enable both.
+  codec is involved. Enable both. It judges each device on its *latest* status report, so
+  a replaced battery, a switch to external power, or a battery-unavailable report
+  resolves the alert on the next sounding.
 - **`status-margin-low` measures the opposite direction from `signal-degraded`.**
   RSSI is how well the *gateway* hears the device; margin is how well the *device*
   hears the gateway. Asymmetry is common, and a low margin breaks ADR, confirmed
@@ -248,7 +252,10 @@ Four of these are worth understanding rather than just enabling:
   forever. Come back from a power cut on a new DHCP lease and every gateway on the site
   is orphaned, while each one reports itself healthy and online. This is the check that
   says "the address moved from X to Y" instead of leaving it to be worked out from
-  silence. It needs the address injected — see [Gateway and host visibility](#gateway-and-host-visibility).
+  silence. X is the address the gateways were given — the first one recorded — so a
+  second move still names X, and a move back to X resolves the alert. After
+  `openForHours` the new address is assumed to have been re-pointed and becomes the
+  baseline. It needs the address injected — see [Gateway and host visibility](#gateway-and-host-visibility).
 - **`gateway-deaf` needs the network server's registry, and cannot be done in SQL.** A
   gateway has two halves: the backhaul that reports it present, and the radio that
   receives. When the radio fails — dead concentrator, antenna off its mount, water in the
@@ -259,7 +266,7 @@ Four of these are worth understanding rather than just enabling:
 - **`host-restarted` is retrospective by construction, and that is its limit.** While the
   host is down this engine is down, so nothing inside the stack can report an outage while
   it is happening — a six-hour power cut produces no alerts at all. This check notices the
-  gap on the way back up. For an alarm *during* the outage the signal has to leave the box:
+  gap on the way back up, and keeps the alert open for `withinMinutes` after the restart. For an alarm *during* the outage the signal has to leave the box:
   see [Heartbeat](#heartbeat).
 
 The gateway checks derive their inventory from `event_up.rx_info`, the per-uplink array
@@ -289,7 +296,8 @@ Three things are worth understanding:
   sensor that is working perfectly — the same reasoning behind `fleet-silent`.
 - **One HTTP call per sounding, shared.** A forecast's resolution is kilometres and the
   distance between blocks is hundreds of metres, so the config names one centroid and
-  every forecast check reads the same answer. Ten instances cost one request. See
+  every forecast check reads the same answer — or the same failure. Ten instances cost
+  one request. See
   [Forecast](#forecast).
 - **It is normalized onto the same vocabulary.** `air.temperature` is °C and
   `wind.speed` is m/s whether the number came from a sensor in the orchard or from an
@@ -307,15 +315,21 @@ producing no usable data:
   vocabulary's own schema, 73 paths with a declared physical range — and it protects
   the trustworthiness of every other check rather than measuring anything, because the
   bad value has been flowing into every average, trend and accumulation downstream.
-- `decode-failure` — the codec is producing nothing.
+- `decode-failure` — the codec is producing nothing for at least half of the uplinks
+  (critical when it is essentially all of them).
 - `measurement-missing` — the codec still works but a field silently disappeared, so
-  every check on it stops matching the device. Silence looks identical to health.
+  every check on it stops matching the device. Silence looks identical to health. Every
+  listed path is tracked separately, so a four-element probe losing only its EC channel
+  is caught, and only uplinks that decode count as still reporting.
 - `measurement-stuck` — a detached probe or seized anemometer reporting a plausible
   constant forever.
 - `counter-stalled` — a water meter reading the same total because the pump failed.
-- `join-churn` — a device rejoining more often than it reports data. `device-silent`
+- `join-churn` — a device rejoining more often than it reports data (critical, even with
+  no uplinks at all), or more than once per ten uplinks once it has reported a few times. `device-silent`
   stays quiet because uplinks *are* arriving.
-- `downlink-unacked` — a command that never landed. Nothing in the telemetry says a
+- `downlink-unacked` — a command ChirpStack resolved as unacknowledged. ChirpStack only
+  writes that verdict on the device's next uplink (Class A) or after the Class B/C
+  timeout, so a device that never uplinks again produces no row. Nothing in the telemetry says a
   valve failed to open.
 
 ## Measurements and multi-path resolution
@@ -333,9 +347,10 @@ What the vocabulary does *not* give you is one path per concept. Temperature arr
 `tank.volume`, `water.level`, or `linear.position`. A check that knew only one of those
 would silently ignore most of a mixed fleet.
 
-So `paths` is a **priority-ordered candidate list**. Per device, the first path present
-in that device's telemetry is used; devices carrying none of them are ignored rather
-than treated as zero. One entry covers the fleet:
+So `paths` is a **priority-ordered candidate list**. Per device, the newest uplink that carries any of the
+candidates is used, and within it the first path present wins — a status or heartbeat
+frame carrying none of them is skipped rather than read as the value disappearing.
+Devices carrying none of them are ignored rather than treated as zero. One entry covers the fleet:
 
 ```json
 { "rule": "measurement-threshold", "as": "frost-risk", "severity": "critical",
@@ -395,6 +410,7 @@ The distinction that matters most is **latest reading vs. window**:
 | Is the value possible at all? | `measurement-implausible` |
 | Is a quantity no sensor emits out of band? | `measurement-derived` |
 | Did the thing we did actually work? | `response-missing` |
+| Is a managed deficit holding its band? | `soil-deficit-band` |
 | Is it about to happen? | `forecast-threshold` |
 
 Wind is the clearest case. A station reporting 10-minute averages can hide a 21 m/s
@@ -427,7 +443,7 @@ Three properties are worth knowing before you tune it:
 
 Give each crop its own entry with its own numbers and its own scope — the gate for
 peacock spot on olives (10–20 °C, twelve hours) is not the gate for botrytis on grapes
-(15–25 °C, four), and one entry spanning both would raise an alert neither an agent nor
+(15–28 °C, four hours), and one entry spanning both would raise an alert neither an agent nor
 a grower could attribute. See the `PLANT AND DISEASE` section of
 `config/leadsman.example.json`.
 
@@ -435,7 +451,10 @@ a grower could attribute. See the `PLANT AND DISEASE` section of
 `mold-risk` does not need. `mode` picks whether the answer is the longest unbroken run
 or the total across the window, and that is not cosmetic: chill hours do not care
 whether the cold arrived in one stretch or twelve, so reporting the longest run would
-under-count a normal winter tenfold. `comparison: "atMost"` then raises when the dwell
+under-count a normal winter tenfold. In `total` mode time is credited by last observation
+carried forward — each in-band reading banks the interval to the next reading (or to
+now), capped at `maxGapHours` — so fragmented cold is not under-counted; `longest` still
+runs first-to-last, which for `atMost` rounds toward raising. `comparison: "atMost"` then raises when the dwell
 **fails** to reach its target — the direction nothing else in the engine can express,
 because a thing that did not happen often enough leaves no reading for a threshold to
 catch. Insufficient chill, unmet vernalization and an under-delivered irrigation
@@ -462,8 +481,11 @@ Two parameters do most of the work and both are easy to get wrong:
 Coverage is reported rather than assumed. A gap longer than `maxGapHours` contributes
 nothing, because holding the last value across a silent day would manufacture degree
 days out of a dead radio, and `minCoverage` refuses to judge a total at all below a
-fraction of the window — "the block is 300 GDD behind" and "the sensor was offline for
-two days" must not look the same.
+fraction of the window, for `sum` as well as `integral` — "the block is 300 GDD behind"
+and "the sensor was offline for two days" must not look the same. Coverage includes the
+interval from the latest reading to now. Above `minCoverage`, the total compared with
+`min`/`max` is the observed total scaled to full coverage (`observed / coverage`), and
+the alert reports observed, projected and coverage.
 
 ### Comparing a device against its neighbours
 
@@ -499,8 +521,47 @@ meaningless. Five formulas, all from temperature and relative humidity:
 | `vpd` | kPa | Vapour pressure deficit — the governing number under glass. It, not humidity, drives transpiration and stomatal closure |
 | `deltaT` | °C | Wet-bulb depression. The spray window: below ~2 the droplets drift, above ~8 they evaporate before they land |
 | `dewPoint` | °C | Condensation, leaf-wetness onset, and the floor a radiative frost will actually reach |
-| `thi` | — | Temperature-humidity index. Dairy cattle: comfort below 68, measurable milk-yield loss from ~72, severe stress above ~80 |
+| `thi` | — | Temperature-humidity index. Dairy cattle: comfort below 68; milk-yield loss in high-producing cows from ~68 (Zimbelman et al. 2009; ~72 in the older Armstrong 1994 threshold); severe stress above ~80 |
 | `absoluteHumidity` | g/m³ | Ventilation and drying, where relative humidity is actively misleading because it moves with temperature |
+
+### A band the block is meant to live in
+
+`measurement-threshold` with both `min` and `max` already catches a two-sided target,
+and for most deployments it is the right tool — it is cheaper and its summary names the
+bound that broke. Reach for `soil-deficit-band` instead when **persistence and asymmetry
+are the signal**, which is what a managed deficit is judged on.
+
+Post-veraison regulated deficit irrigation is the motivating case. After veraison a
+grower deliberately holds soil moisture below field capacity: enough stress to
+concentrate colour and flavour, check berry size and stop vegetative growth, not so much
+that the vine shuts down. Both ways out of that band are expensive and they are opposite
+mistakes — too dry and sugar accumulation stalls and berries shrivel; too wet and they
+swell, dilute and can split, while laterals restart into a canopy that then invites rot.
+
+A threshold reports an instant. These three break the same two bounds and mean different
+things:
+
+| What the window shows | What it is | The correction |
+|---|---|---|
+| 62 % of three days below the floor | under-watered | more water |
+| 30 % below **and** 30 % above | pulsed too hard | smaller, more frequent sets — **more water makes it worse** |
+| one reading below at 04:00, back by 06:00 | nothing | none |
+
+Only a residency measurement separates them, and the middle row is the one most often
+corrected backwards. Time is attributed by last-observation-carried-forward, and a
+reporting gap longer than `maxGapHours` is attributed to neither side — a block that
+went quiet at 30 % and came back at 12 % was not observed at either value in between.
+
+Two limits are worth stating plainly, because both are easy to assume away:
+
+- **It does not know it is post-veraison.** Leadsman has no crop, no phenology and no
+  growth stage, so `activeMonths` is a *calendar proxy* for the ripening window and a
+  warm year will move veraison by weeks. The agent, or the grower, supplies the stage.
+- **It does not know the soil.** A floor of 18 % VWC is dry in clay and wet in sand, so
+  the band is always in the sensor's own units and must come from the block's own
+  calibration. `fieldCapacity` and `wiltingPoint` are optional and change nothing about
+  what fires — they add the depletion fraction to the alert, which is the number that
+  transfers between blocks where a raw VWC does not.
 
 ### Verifying that an action worked
 
@@ -508,6 +569,11 @@ meaningless. Five formulas, all from temperature and relative humidity:
 catches the worse case: one that *was* acknowledged, by a device online and reporting
 happily, whose physical effect never arrived. The flow meter turned over 4,000 litres
 and the root-zone probe never moved.
+
+The meter and the probe are usually different devices, so map them with
+`responseDevices`: `{ "<meter DevEUI>": ["<probe DevEUI>", …] }`. A mapped trigger
+passes if any mapped probe moved by `minChange`; a trigger not in the map is judged on
+its own device's response path.
 
 This is the expensive silent failure, because the operator believes it happened — the
 counter advanced, every individual check is green — and finds out at harvest. Only the
@@ -534,7 +600,8 @@ keeps reporting it, and *resolved* when it stops.
   `leadsman.run`.
 
 Hysteresis is available where thresholds are involved — `battery-low` takes separate
-raise and clear voltages, `measurement-threshold` takes a `clearMargin` — so a value
+raise and clear voltages, `measurement-threshold` takes a `clearMargin`, `geofence-breach`
+takes a `clearMargin` in metres for both shapes — so a value
 sitting on a boundary does not flap.
 
 ### Subjects
@@ -546,8 +613,8 @@ any device, so an alert names one of four subject kinds:
 | `subject_kind` | `subject_id` | Raised by |
 |---|---|---|
 | `device` | DevEUI | every measurement and network-layer check |
-| `gateway` | gateway EUI | the gateway checks |
-| `site` | `site` | `fleet-silent` |
+| `gateway` | gateway EUI | the gateway checks, except `gateway-redundancy-lost`, which is about the device that lost its redundancy |
+| `site` | `site` | `fleet-silent`, `forecast-threshold` |
 | `engine` | `engine` | `host-restarted`, `host-address-changed` |
 
 A gateway EUI is also sixteen hex characters, so it would have fitted into `dev_eui`
@@ -579,7 +646,7 @@ is the exception — absence of data is what it fires on.
 ```json
 {
   "suppress": [
-    { "while": ["fleet-silent"],   "mute": ["device-silent", "signal-degraded"] },
+    { "while": ["fleet-silent"],   "mute": ["device-silent"] },
     { "while": ["gateway-silent"], "mute": ["device-silent"] }
   ]
 }
@@ -769,12 +836,12 @@ the chain stops there rather than falling through.
 reader has to work out what the alert means. `pipe-pressure-low` is critical but its summary
 already says what to do — that is a fact. `device-silent` is ambiguous alone, because one node
 is a dead node and six at once is the gateway; only combining it with other alerts answers
-that, which is what makes it worth an agent's tokens. Twenty-nine of the thirty-five rules
+that, which is what makes it worth an agent's tokens. Twenty-nine of the thirty-six rules
 are facts; the situations are `device-silent`, `join-churn`, `geofence-breach`,
-`mold-risk`, `measurement-outlier` and `response-missing`.
+`mold-risk`, `measurement-outlier`, `response-missing` and `soil-deficit-band`.
 
-`mold-risk` is the only measurement-shaped rule in that set, and it is there because its
-summary is true without being actionable. Whether nine hours at 93 % and 18 °C warrants a
+`mold-risk` is there because its summary is true without being actionable — as are
+`soil-deficit-band` and `measurement-outlier`, the other two measurement-shaped rules in the set. Whether nine hours at 93 % and 18 °C warrants a
 spray depends on the crop's phenological stage, what was last applied and how long ago, the
 pre-harvest interval, and what the forecast does next — four facts this engine does not
 hold. Waking someone who would only have to go and look all of them up is exactly the case
@@ -844,8 +911,11 @@ export LEADSMAN_WEATHERBIT_API_KEY='…'     # preferred
 distance between blocks is hundreds of metres, so the config names one centroid for the
 operation and every forecast check shares that answer. Ten instances of
 `forecast-threshold` — frost, heat, rain, wind, spray window — cost one HTTP request
-between them. On a 15-minute schedule that is 96 requests a day, comfortably inside
-Weatherbit's free tier. A check that sets its own `latitude`/`longitude` costs one
+between them, and a failed request is shared the same way: every forecast check in that
+sounding reports the one error, and the next sounding retries. On a 15-minute schedule
+that is 96 requests a day — more than Weatherbit's free plan allows (50 a day), and the
+free plan does not include the hourly forecast endpoint at all, so plan on a paid tier.
+A check that sets its own `latitude`/`longitude` costs one
 additional request per distinct point, which is worth it only for genuinely distant
 blocks.
 
@@ -952,7 +1022,8 @@ and mock-sensors already read, so this needs no new credential. Mount the `share
 read-only and point at it; see [`docs/stack-fragment.yml`](docs/stack-fragment.yml).
 
 - **The gateway API** (`chirpStackUrl` + `apiKey` + `tenantId`) enables `gateway-deaf` and
-  `gateway-never-seen`. `rx_info` shows which gateways *are* forwarding, which covers a
+  `gateway-never-seen`, and lets `gateway-silent` leave a gateway ChirpStack reports online
+  to `gateway-deaf`, so a deaf gateway raises one alert rather than two. `rx_info` shows which gateways *are* forwarding, which covers a
   gateway that stopped; it cannot show one that is connected and hearing nothing, or one
   registered and never heard from, because both are *absent* from the telemetry rather
   than visible in it. The API key is read only from this file, never from
@@ -1190,18 +1261,23 @@ what the config sets and never fails validation.
 ## Tests
 
 ```sh
-npm test        # smoke suite — no database needed
-npm run test:db # resolver + engine — requires a scratch Postgres
+npm test        # smoke + providers — no database needed
+npm run test:db # resolver, engine and per-family rule suites — requires a scratch Postgres
 npm run test:all
 ```
 
-Three layers, because they catch different things:
+Three layers — config and contract logic without a database, the SQL against a real
+server, and whole fixtures end to end — because they catch different things:
 
 | Suite | Needs a DB | Covers |
 |---|---|---|
 | `test/smoke.js` | no | Config validation, check discovery, the `Rule` contract, param and scope coercion, CLI exit codes, and that every rule runs on its own defaults |
-| `test/resolver.js` | yes | The five multi-path resolvers and the device-scope filter, each against the smallest event store that can distinguish the behaviour |
+| `test/providers.js` | no | Delivery providers and the forecast provider against fake HTTP, including the once-per-sounding request |
+| `test/resolver.js` | yes | The shared measurement resolvers in `src/measurement.ts` and the device-scope filter, each against the smallest event store that can distinguish the behaviour |
 | `test/engine.js` | yes | The alert lifecycle, the runner's failure handling, the notifier, migration idempotency, and `statement_timeout` |
+| `test/gateway.js` | yes | The gateway and site checks and the `rx_info` helpers, including malformed rows and both key spellings |
+| `test/network.js` | yes | The checks that read `event_status`, `event_join`, `event_log` and `event_ack`, and the host checks |
+| `test/checks.js` | yes | Counters, geofences and decode-failure against real SQL |
 | `test/integration.js` | yes | 32 device faults and 2 gateway faults, plus 11 healthy devices and 2 healthy gateways, end to end |
 | `test/makerfabs.js` | yes | The shipped per-device config, against payload shapes from each codec's `vectors.json` |
 
@@ -1210,7 +1286,7 @@ path priority, the numeric guard, `first`/`last` ordering, the partial unique in
 deduplicates. A mock cannot exercise `WITH ORDINALITY`, lateral joins, or JSONB path
 operators, so the database-backed suites use a real server and skip cleanly without one.
 
-Two properties are worth calling out because getting them wrong is quiet rather than
+Four properties are worth calling out because getting them wrong is quiet rather than
 loud, and both now have dedicated tests:
 
 - **A failing check resolves nothing.** If a query errors there is no evidence the

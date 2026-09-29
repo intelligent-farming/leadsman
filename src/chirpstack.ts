@@ -21,6 +21,10 @@
  * a different database from the event store this engine connects to. Rather than open a
  * second DSN into a schema ChirpStack owns, this reads the documented API.
  *
+ * gateway-silent reads the same record when it is available, without requiring it: a
+ * gateway silent in rx_info that the registry calls online is deaf rather than offline,
+ * and is left to gateway-deaf so one fault raises one alert.
+ *
  * No new dependency: `fetch` and `AbortController` are already how notify.ts talks to
  * Twilio, Slack and webhooks, so `pg` + `croner` remains the whole tree.
  *

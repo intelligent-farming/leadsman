@@ -11,7 +11,7 @@
  * On a farm the downlinks that matter are the ones that move something: open a valve,
  * start a pump, change a setpoint, retune a reporting interval. Those are normally sent
  * confirmed, and ChirpStack records the outcome in `event_ack` — `acknowledged = true`
- * when the device confirmed it, `false` when the confirmation never came.
+ * when the device confirmed it, `false` when ChirpStack gave up waiting.
  *
  * An unacknowledged downlink is genuinely dangerous, because the failure is silent in
  * both directions. Nothing in the telemetry says "the valve did not open"; the sensor
@@ -28,6 +28,28 @@
  * Note `event_ack` only receives rows for *confirmed* downlinks. A deployment that never
  * sends confirmed downlinks will have an empty table and this check will correctly stay
  * silent forever, which is why it ships disabled in the example config.
+ *
+ * ── what reaches event_ack, and what does not ───────────────────────────────────
+ * ChirpStack v4 writes the `acknowledged = false` row lazily. A confirmed downlink stays
+ * pending in the device queue; the row is written only when ChirpStack next looks for a
+ * downlink to send that device and finds the pending item still unconfirmed (and, for
+ * Class B/C, past the profile's timeout) — it then discards the item and emits the ack
+ * event with acknowledged = false. For a Class A device that moment is its next uplink
+ * that did not carry the ACK bit. (chirpstack/src/downlink/data.rs,
+ * get_next_device_queue_item; the `true` row comes from uplink/data.rs on an uplink with
+ * ACK set.)
+ *
+ * So this check counts downlinks ChirpStack has *resolved* as failed. It cannot see:
+ *
+ *   - a confirmed downlink to a Class A device that never uplinks again — it stays
+ *     pending forever and writes no row. device-silent reports that device instead
+ *   - a queue flushed by a rejoin (device profile "flush queue on activate") or cleared
+ *     through the API — deleted without an ack event. join-churn covers the first
+ *   - a downlink still pending: the failure appears one uplink (or one timeout) late
+ *
+ * These are not recoverable from the event store: `event_tx_ack` records that a gateway
+ * transmitted a frame but not whether it was confirmed, so "sent, never resolved" cannot
+ * be told apart from an unconfirmed downlink that needed no ack.
  */
 
 import { int, num, round } from '../params';
@@ -46,9 +68,11 @@ interface Row {
 const rule: Rule = {
   id: 'downlink-unacked',
   description:
-    'Flags devices whose confirmed downlinks are not being acknowledged — a command you ' +
-    'sent never landed. Silent in the telemetry, because a valve that failed to open ' +
-    'produces no anomalous reading. Only meaningful if you send confirmed downlinks.',
+    'Flags devices whose confirmed downlinks ChirpStack has marked unacknowledged — a ' +
+    'command you sent never landed. Silent in the telemetry, because a valve that failed ' +
+    'to open produces no anomalous reading. Only meaningful if you send confirmed ' +
+    'downlinks; a downlink ChirpStack never resolves (the device stops uplinking) writes ' +
+    'no ack row and is not counted.',
   defaultSeverity: 'critical',
   /** Downlinks not being acknowledged. A count against a threshold.
    */
@@ -85,9 +109,10 @@ const rule: Rule = {
 
     const sc = scopeClause(resolveScope(ctx.params), 4);
 
-    // `acknowledged IS NOT TRUE` rather than `= false`, so a NULL — which some
-    // ChirpStack versions write when the ack never resolved either way — counts as a
-    // failure rather than vanishing from both sides of the ratio.
+    // ChirpStack v4 declares `acknowledged boolean NOT NULL`, so a NULL does not occur
+    // there. `IS NOT TRUE` rather than `= false` costs nothing and means a NULL in a
+    // hand-built or differently-migrated table counts as a failure instead of vanishing
+    // from the numerator while still sitting in the denominator.
     const rows = await ctx.query<Row>(
       `SELECT dev_eui,
               max(device_name)                                        AS device_name,
@@ -97,7 +122,7 @@ const rule: Rule = {
               (array_agg(f_cnt_down ORDER BY time DESC)
                  FILTER (WHERE acknowledged IS NOT TRUE))[1]          AS latest_f_cnt_down
          FROM event_ack
-        WHERE time > now() - make_interval(hours => $1::int)
+        WHERE time > now() - make_interval(secs => $1::float8 * 3600)
           ${sc.sql}
         GROUP BY dev_eui
        HAVING count(*) FILTER (WHERE acknowledged IS NOT TRUE) >= $2::int

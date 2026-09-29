@@ -63,10 +63,17 @@ TRUNCATE event_up, event_join, event_status, event_log, event_ack;
 -- would report nothing while appearing to pass. `gw` defaults to GW_MAIN so all the
 -- existing fixtures below keep working unchanged.
 --
--- snake_case `gateway_id` is what ChirpStack's PostgreSQL integration writes (its Rust
--- structs serialize snake_case); the MQTT path emits camelCase `gatewayId` for the same
--- field. The queries read either, and this fixture uses the form the event store
--- actually stores.
+-- The shape is what ChirpStack v4's PostgreSQL integration writes: the gateway
+-- UplinkRxInfo protobuf serialized through pbjson, i.e. the protobuf JSON mapping, which
+-- is camelCase — `gatewayId`, `rssi`, `snr`, `context`, `crcStatus`, `metadata` (and
+-- `gwTime`/`nsTime`/`timeSinceGpsEpoch` where the gateway supplies them). rx() uses that
+-- shape, so CI exercises what a real store holds.
+--
+-- rx2() deliberately keeps the snake_case form (`gateway_id`) that a ChirpStack v3-era
+-- store or other tooling holds. The queries COALESCE both spellings on purpose — a key
+-- they failed to read would mean an empty gateway inventory, which reports no faults —
+-- and the only way to keep that fallback honest is for CI to feed it. rx2() shares
+-- GW_MAIN with rx(), so the two spellings must also merge into one gateway.
 -- Drop the two-argument form this replaced. CREATE OR REPLACE only replaces a matching
 -- signature, so without this an older database (or the other fixture applied first)
 -- keeps both overloads and a bare rx() call fails as ambiguous.
@@ -79,7 +86,10 @@ CREATE OR REPLACE FUNCTION rx(
 )
 RETURNS jsonb LANGUAGE sql IMMUTABLE AS
 $$ SELECT jsonb_build_array(
-     jsonb_build_object('gateway_id', gw, 'rssi', rssi, 'snr', snr)) $$;
+     jsonb_build_object('gatewayId', gw, 'uplinkId', 1, 'rssi', rssi, 'snr', snr,
+                        'channel', 0, 'context', 'AAAAAA==', 'crcStatus', 'CRC_OK',
+                        'metadata', jsonb_build_object('region_config_id', 'us915_0',
+                                                       'region_common_name', 'US915'))) $$;
 
 -- Two gateways hearing the same uplink, for the redundancy check.
 CREATE OR REPLACE FUNCTION rx2(

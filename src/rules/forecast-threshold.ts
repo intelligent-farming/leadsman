@@ -49,6 +49,68 @@ interface Crossing {
   value: number;
 }
 
+type Direction = 'below' | 'above';
+
+/** A breach of one bound, summarised over its qualifying runs. */
+interface Breach {
+  direction: Direction;
+  bound: number;
+  /** Most extreme hour: coldest for `below`, hottest for `above`. */
+  worst: Crossing;
+  /** The first qualifying run — the one a grower has to act on first. */
+  runStart: Crossing;
+  runEnd: Crossing;
+  runHours: number;
+  /** Hours across every qualifying run; a lone excursion shorter than minHours is not counted. */
+  hoursAffected: number;
+  longestRunHours: number;
+}
+
+/**
+ * Consecutive runs of hours breaching one side, keeping those at least `minHours` long.
+ * `series` is the window in lead-time order, with null for an hour that carries none of
+ * the candidate paths — which breaks a run, since nothing is known about that hour.
+ */
+function breachFor(
+  series: Array<Crossing | null>,
+  direction: Direction,
+  bound: number,
+  minHours: number,
+): Breach | null {
+  const breaches = (c: Crossing | null): c is Crossing =>
+    c !== null && (direction === 'below' ? c.value < bound : c.value > bound);
+
+  const runs: Crossing[][] = [];
+  let current: Crossing[] = [];
+  for (const c of series) {
+    if (breaches(c)) {
+      current.push(c);
+      continue;
+    }
+    if (current.length > 0) runs.push(current);
+    current = [];
+  }
+  if (current.length > 0) runs.push(current);
+
+  const qualifying = runs.filter((r) => r.length >= minHours);
+  if (qualifying.length === 0) return null;
+
+  const hours = qualifying.flat();
+  const worst = hours.reduce((a, b) =>
+    (direction === 'below' ? b.value < a.value : b.value > a.value) ? b : a);
+  const first = qualifying[0];
+  return {
+    direction,
+    bound,
+    worst,
+    runStart: first[0],
+    runEnd: first[first.length - 1],
+    runHours: first.length,
+    hoursAffected: hours.length,
+    longestRunHours: Math.max(...qualifying.map((r) => r.length)),
+  };
+}
+
 /** First matching path present in this hour, resolved by the usual candidate priority. */
 function valueAt(hour: ForecastHour, paths: string[][]): { path: string; value: number } | null {
   for (const parts of paths) {
@@ -94,14 +156,21 @@ const rule: Rule = {
      */
     withinHours: 12,
     /**
-     * Ignore the first this-many hours. Occasionally useful to suppress the hour in
-     * progress, which every provider reports as a partly-observed estimate.
+     * Ignore forecast hours that start sooner than this many hours from now. The hour
+     * already in progress needs no help — its timestamp is in the past, so its lead is
+     * negative and it is excluded even at 0. Use this when a breach closer than N
+     * hours is too late to act on (fans need lead time, the spray rig is already out),
+     * or to tier two instances of the check — 0–6 h as critical, 6–24 h as a warning —
+     * so the same event is not raised by both.
      */
     afterHours: 0,
     /**
-     * Require this many forecast hours to breach before raising. 1 alerts on a single
-     * hour dipping over the line; 2 or 3 asks for a sustained event and filters the
-     * model's noisiest single-hour excursions.
+     * Require this many CONSECUTIVE forecast hours to breach before raising. 1 alerts
+     * on a single hour dipping over the line; 2 or 3 asks for a sustained event and
+     * filters the model's noisiest single-hour excursions. Consecutive means adjacent
+     * hours in the forecast, breaching on the same side: an hour back inside the bound,
+     * or an hour that does not carry the path, ends the run — scattered single-hour
+     * dips never add up to an event.
      */
     minHours: 1,
     /** Shown in the alert summary. */
@@ -173,16 +242,13 @@ const rule: Rule = {
       return [];
     }
 
-    const crossings: Crossing[] = [];
-    let carried = 0;
-    for (const hour of inWindow) {
+    // One entry per in-window hour, in lead order (the source sorts), so adjacency in
+    // this array is adjacency in the forecast.
+    const series: Array<Crossing | null> = inWindow.map((hour) => {
       const hit = valueAt(hour, paths);
-      if (!hit) continue;
-      carried += 1;
-      const belowMin = min !== null && hit.value < min;
-      const aboveMax = max !== null && hit.value > max;
-      if (belowMin || aboveMax) crossings.push({ hour, path: hit.path, value: hit.value });
-    }
+      return hit ? { hour, path: hit.path, value: hit.value } : null;
+    });
+    const carried = series.filter((c) => c !== null).length;
 
     if (carried === 0) {
       // The provider does not supply this field. Worth a warning rather than a silent
@@ -194,17 +260,28 @@ const rule: Rule = {
       return [];
     }
 
-    if (crossings.length < minHours) return [];
+    // Each bound is judged on its own. With both set, a day forecast to swing from a
+    // frost to a heat spike breaches both, and the summary has to say so — picking one
+    // direction would report the lesser problem, or the wrong one.
+    const breaches: Breach[] = [];
+    if (min !== null) {
+      const b = breachFor(series, 'below', min, minHours);
+      if (b) breaches.push(b);
+    }
+    if (max !== null) {
+      const b = breachFor(series, 'above', max, minHours);
+      if (b) breaches.push(b);
+    }
+    if (breaches.length === 0) return [];
 
-    // The worst hour is what the summary leads with — a grower deciding whether to run
-    // fans wants the coldest number, not the first one over the line.
-    const worst = crossings.reduce((a, b) => {
-      if (min !== null) return b.value < a.value ? b : a;
-      return b.value > a.value ? b : a;
-    });
-    const soonest = crossings.reduce((a, b) => (b.hour.leadHours < a.hour.leadHours ? b : a));
-    const direction = min !== null && worst.value < min ? 'below' : 'above';
-    const bound = direction === 'below' ? `${min}${unit}` : `${max}${unit}`;
+    // The soonest breach leads — it is the decision due first — and within each
+    // direction the worst hour is what the summary quotes: a grower deciding whether to
+    // run fans wants the coldest number, not the first one over the line.
+    breaches.sort((a, b) => a.runStart.hour.leadHours - b.runStart.hour.leadHours);
+    const lead = breaches[0];
+    const hoursAffected = breaches.reduce((n, b) => n + b.hoursAffected, 0);
+    const describe = (b: Breach) =>
+      `${round(b.worst.value, 1)}${unit} (${b.direction} ${b.bound}${unit})`;
 
     const label =
       (typeof ctx.params.locationLabel === 'string' && ctx.params.locationLabel) ||
@@ -215,20 +292,38 @@ const rule: Rule = {
       {
         subject: { kind: 'site', id: 'site', name: label },
         summary:
-          `${label}: ${worst.path} forecast ${round(worst.value, 1)}${unit} ` +
-          `(${direction} ${bound}) in ${round(soonest.hour.leadHours, 0)}h — ` +
-          `${crossings.length} hour${crossings.length > 1 ? 's' : ''} affected, ` +
-          `worst at ${worst.hour.at.slice(11, 16)}Z`,
+          `${label}: ${lead.worst.path} forecast ${breaches.map(describe).join(' and ')} ` +
+          `in ${round(lead.runStart.hour.leadHours, 0)}h — ` +
+          `${hoursAffected} hour${hoursAffected > 1 ? 's' : ''} affected, ` +
+          `worst at ${lead.worst.hour.at.slice(11, 16)}Z`,
         detail: {
-          measurement: worst.path,
-          worstValue: round(worst.value, 2),
-          worstAt: worst.hour.at,
-          firstBreachAt: soonest.hour.at,
-          leadHours: round(soonest.hour.leadHours, 1),
-          hoursAffected: crossings.length,
+          measurement: lead.worst.path,
+          worstValue: round(lead.worst.value, 2),
+          worstAt: lead.worst.hour.at,
+          firstBreachAt: lead.runStart.hour.at,
+          leadHours: round(lead.runStart.hour.leadHours, 1),
+          // The first qualifying run: the sustained event minHours asked for.
+          runStartAt: lead.runStart.hour.at,
+          runEndAt: lead.runEnd.hour.at,
+          runHours: lead.runHours,
+          hoursAffected,
+          minHours,
           min,
           max,
-          breached: direction === 'below' ? 'min' : 'max',
+          breached:
+            breaches.length === 2 ? 'both' : lead.direction === 'below' ? 'min' : 'max',
+          // Per direction, so a both-ways breach keeps each side's numbers.
+          breaches: breaches.map((b) => ({
+            bound: b.direction === 'below' ? 'min' : 'max',
+            limit: b.bound,
+            worstValue: round(b.worst.value, 2),
+            worstAt: b.worst.hour.at,
+            runStartAt: b.runStart.hour.at,
+            runEndAt: b.runEnd.hour.at,
+            runHours: b.runHours,
+            longestRunHours: b.longestRunHours,
+            hoursAffected: b.hoursAffected,
+          })),
           unit: unit || null,
           withinHours,
           location: { ...forecast.at, name: forecast.locationName },

@@ -14,14 +14,20 @@
  * different: uplinks arrive, they decode, the values are fine, RSSI on the surviving link
  * may be excellent. `signal-degraded` cannot see it, because the best link is still good;
  * it measures the quality of the connection that carried the uplink, not how many
- * connections there were. It already computes the gateway count per uplink and reports it
- * as `avgGatewaysPerUplink` — informational only, thresholded by nothing. This is that
- * number given a threshold.
+ * connections there were. It already reports an average gateway count per uplink as
+ * `avgGatewaysPerUplink` — informational only, thresholded by nothing, and counted as
+ * rx_info entries. This check counts distinct gateway ids per uplink instead, so a
+ * gateway reporting one uplink through two boards or antennas is one gateway.
  *
- * Maximum rather than average, deliberately. An average falls whenever a distant gateway
- * starts hearing a device intermittently, which is a gain in coverage showing up as a
- * loss in the metric. The maximum only falls when a gateway that used to hear the device
- * reliably has stopped — which is the actual event.
+ * The two windows use different statistics on purpose (see gatewayRedundancy):
+ *
+ *   history  a *typical* level — the device "used to reach N" only if at least
+ *            `minHistoricalShare` of its historical uplinks reached N or more gateways.
+ *            Not the maximum: one stray double reception in fourteen days would set a
+ *            maximum of 2 on a device that has only ever really had one gateway.
+ *   recent   the maximum. It only has to say whether any recent uplink still reached
+ *            N, and a gateway that still hears the device now and then has not been
+ *            lost — which errs toward not raising.
  *
  * Disabled by default because the right threshold is a property of the site plan. Two
  * gateways is comfortable redundancy on a compact block and nowhere near enough across a
@@ -30,7 +36,7 @@
  */
 
 import { gatewayRedundancy } from '../gateway';
-import { int } from '../params';
+import { int, num } from '../params';
 import { resolveScope, SCOPE_PARAMS } from '../scope';
 import type { Finding, Rule } from '../types';
 
@@ -67,6 +73,15 @@ const rule: Rule = {
      * This check is about a decline, so there has to have been something to decline from.
      */
     minHistoricalGateways: 2,
+    /**
+     * Share of historical uplinks (0–1) that must have reached a gateway count for it to
+     * count as the device's historical level.
+     *
+     * 0.5 means "at least half its uplinks reached N gateways" — a typical level rather
+     * than a best-ever one. Lower it for a device whose second gateway was always
+     * marginal but still counted on; 1.0 demands every historical uplink reached N.
+     */
+    minHistoricalShare: 0.5,
     /** Skip devices with fewer recent uplinks than this — too few to conclude anything. */
     minRecentUplinks: 10,
     /** Skip devices with fewer historical uplinks than this. */
@@ -83,6 +98,11 @@ const rule: Rule = {
     const minHistoricalGateways = int(ctx.params, 'minHistoricalGateways');
     const minRecentUplinks = int(ctx.params, 'minRecentUplinks');
     const minHistoricalUplinks = int(ctx.params, 'minHistoricalUplinks');
+    const minHistoricalShare = num(ctx.params, 'minHistoricalShare');
+
+    if (!(minHistoricalShare > 0) || minHistoricalShare > 1) {
+      throw new Error(`minHistoricalShare must be in (0, 1] (got ${minHistoricalShare})`);
+    }
 
     if (recentHours >= historyHours) {
       throw new Error(
@@ -98,13 +118,13 @@ const rule: Rule = {
     }
 
     const scope = resolveScope(ctx.params);
-    const rows = await gatewayRedundancy(ctx, historyHours, recentHours, scope);
+    const rows = await gatewayRedundancy(ctx, historyHours, recentHours, minHistoricalShare, scope);
 
     const findings: Finding[] = [];
     for (const d of rows) {
       if (d.recentUplinks < minRecentUplinks) continue;
       if (d.historicalUplinks < minHistoricalUplinks) continue;
-      if (d.historicalMax < minHistoricalGateways) continue;
+      if (d.historicalLevel < minHistoricalGateways) continue;
       if (d.recentMax >= minGateways) continue;
 
       const label = d.deviceName ?? d.devEui;
@@ -113,10 +133,14 @@ const rule: Rule = {
         deviceName: d.deviceName,
         summary:
           `${label} is now reaching ${d.recentMax} gateway${d.recentMax === 1 ? '' : 's'} ` +
-          `(was ${d.historicalMax} over ${Math.round(historyHours / 24)}d) — ` +
+          `(was ${d.historicalLevel} over ${Math.round(historyHours / 24)}d) — ` +
           `${d.recentMax === 1 ? 'one gateway failure will cut it off' : 'redundancy reduced'}`,
         detail: {
           recentMaxGateways: d.recentMax,
+          // The level the decline is measured from, and the share that defines it.
+          historicalGateways: d.historicalLevel,
+          minHistoricalShare,
+          // Best-ever, for context only — not what the comparison uses.
           historicalMaxGateways: d.historicalMax,
           minGateways,
           recentUplinks: d.recentUplinks,

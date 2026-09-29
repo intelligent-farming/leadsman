@@ -70,7 +70,7 @@ const rule: Rule = {
               round(EXTRACT(EPOCH FROM (now() - max(time))) / 60)     AS silent_minutes,
               count(*)                                                AS uplinks
          FROM event_up
-        WHERE time > now() - make_interval(hours => $1::int)
+        WHERE time > now() - make_interval(secs => $1::float8 * 3600)
           ${sc.sql}
         GROUP BY dev_eui
        HAVING count(*) >= $2::int

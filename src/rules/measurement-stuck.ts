@@ -14,8 +14,13 @@
  * Zero variation across many samples means the sensor, not the environment.
  *
  * Two tuning levers, because coarse sensors legitimately repeat values:
- *   - `decimals` compares at the sensor's real resolution rather than full float
- *     precision (a 0.5 %-resolution moisture probe looks stuck at 3 decimals).
+ *   - `decimals` compares at the sensor's real resolution. Rounding can only merge
+ *     values, never split them, so every decimal removed makes a device look MORE
+ *     stuck. Too many decimals and float noise from the codec's scaling (21.300000001
+ *     vs 21.3) counts as variation, so a dead sensor looks alive; too few and a
+ *     coarse-but-live sensor whose real steps are finer than the rounding (a
+ *     0.1 °C probe compared at 0 decimals) collapses to one value and looks stuck.
+ *     Set it to the number of decimals the sensor actually resolves.
  *   - `minSamples` raises the evidence bar.
  *
  * Do not point this at a monotonic counter — a counter that stops is
@@ -45,8 +50,11 @@ const rule: Rule = {
     /** Need at least this many readings before concluding anything. */
     minSamples: 12,
     /**
-     * Round to this many decimals before comparing, to match the sensor's real
-     * resolution. Comparing raw floats makes coarse sensors look stuck.
+     * Round to this many decimals before comparing — the sensor's real resolution.
+     * Fewer decimals merge more readings and make a device look MORE stuck (a
+     * 0.1-step sensor compared at 0 decimals can flag while live); more decimals let
+     * float noise below the sensor's resolution pass for variation, hiding a dead
+     * sensor.
      */
     decimals: 3,
     /**
@@ -70,6 +78,12 @@ const rule: Rule = {
     const maxDistinct = int(ctx.params, 'maxDistinctValues');
 
     if (minSamples < 2) throw new Error('minSamples must be at least 2');
+    if (lookbackHours <= 0) {
+      throw new Error(
+        'lookbackHours must be positive — an empty window holds no readings, so this ' +
+          'check could never fire',
+      );
+    }
     if (decimals < 0 || decimals > 10) throw new Error('decimals must be between 0 and 10');
     if (maxDistinct < 1) throw new Error('maxDistinctValues must be at least 1');
 

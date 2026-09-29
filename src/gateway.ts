@@ -24,14 +24,18 @@
  * than the inventory window drops out of the inventory and stops being reported. By then
  * it has been reported for the length of the window, or it was never really in service.
  *
- * ── The gateway-id key ──
- * ChirpStack's PostgreSQL integration writes the protobuf struct as JSON, which
- * serializes snake_case, so `gateway_id` is expected. Its MQTT path emits camelCase
- * `gatewayId` for the same field, and the two are easy to confuse. Every query here reads
- * `COALESCE(g->>'gateway_id', g->>'gatewayId')` so both shapes work — a missing key would
- * otherwise mean an empty gateway inventory, and an empty inventory reports no faults,
- * which is the one failure mode worth engineering against here. To see what your
- * deployment actually stores:
+ * ── The rx_info key names ──
+ * ChirpStack v4's PostgreSQL integration stores rx_info as the gateway UplinkRxInfo
+ * messages serialized through pbjson, which emits the protobuf JSON mapping — camelCase:
+ * `gatewayId`, `rssi`, `snr`, `gwTime`, `nsTime`, `timeSinceGpsEpoch`, `context`,
+ * `metadata`, `crcStatus`. The MQTT integration emits the same camelCase shape. Every
+ * query here still reads `COALESCE(g->>'gatewayId', g->>'gateway_id')` (and the snake_case
+ * form of each time field): snake_case is what a store written by ChirpStack v3's
+ * integration — Go's encoding/json over the protobuf structs — or by other tooling holds,
+ * and a missing key would otherwise mean an empty gateway inventory, and an empty
+ * inventory reports no faults, which is the one failure mode worth engineering against
+ * here. Ids are lowercased as they are read, so the inventory, the scope filter and the
+ * alert subject all agree on one spelling. To see what your deployment actually stores:
  *
  *   SELECT DISTINCT jsonb_object_keys(g)
  *     FROM event_up, jsonb_array_elements(rx_info) g
@@ -53,32 +57,39 @@ export const RX_INFO_REQUIREMENT: SchemaRequirement = {
 };
 
 /**
- * Rows surviving the shape guards, materialized.
+ * Every rx_info entry in the window, one row per (uplink, gateway entry).
  *
- * MATERIALIZED is load-bearing rather than a hint. `jsonb_array_elements` raises an error
- * on a value that is not an array, and a lateral join is logically evaluated before the
- * WHERE clause that would have excluded such a row — so with an inlinable CTE, one
- * malformed rx_info anywhere in the window can abort the whole sounding. Materializing
- * forces the filter to run first. signal-degraded gets away without it only because its
- * jsonb_array_elements sits in a scalar subquery in the target list, which is evaluated
- * after WHERE.
+ * The shape guard is a CASE inside the lateral call, and that placement is load-bearing.
+ * `jsonb_array_elements` (and `jsonb_array_length`) raise on a value that is not an
+ * array, and Postgres guarantees no evaluation order among WHERE conditions — so
+ * `jsonb_typeof(rx_info) = 'array' AND jsonb_array_length(rx_info) > 0` can run the
+ * second test on the row the first was meant to exclude, and a lateral join can be
+ * evaluated before the WHERE clause entirely. Either way one malformed rx_info anywhere
+ * in the window aborts the sounding. CASE is the one construct whose branches are
+ * evaluated in order at run time, so a non-array rx_info becomes an empty array and
+ * simply contributes no rows. The WHERE-clause typeof test stays as a cheap pre-filter,
+ * not as the guard. An empty array needs no special case: it yields no elements.
+ *
+ * The gateway id is lowercased here, once, so grouping, the scope predicate and the
+ * returned id cannot disagree about case.
  */
 const RX_ROWS = `
-  WITH rx AS MATERIALIZED (
+  WITH rx AS (
     SELECT dev_eui, time, rx_info
       FROM event_up
-     WHERE time > now() - make_interval(hours => $1::int)
+     WHERE time > now() - make_interval(secs => $1::float8 * 3600)
        AND rx_info IS NOT NULL
        AND jsonb_typeof(rx_info) = 'array'
-       AND jsonb_array_length(rx_info) > 0
   ),
   seen AS (
-    SELECT COALESCE(g->>'gateway_id', g->>'gatewayId') AS gateway_id,
+    SELECT lower(COALESCE(g->>'gatewayId', g->>'gateway_id')) AS gateway_id,
            rx.dev_eui,
            rx.time,
            g AS gw
       FROM rx
-      CROSS JOIN LATERAL jsonb_array_elements(rx.rx_info) AS g
+      CROSS JOIN LATERAL jsonb_array_elements(
+        CASE WHEN jsonb_typeof(rx.rx_info) = 'array' THEN rx.rx_info ELSE '[]'::jsonb END
+      ) AS g
   )`;
 
 /** One gateway's traffic over the window. */
@@ -232,7 +243,13 @@ export async function gatewayContinuity(
 export interface GatewayRedundancy {
   devEui: string;
   deviceName: string | null;
-  /** Best simultaneous gateway count seen in the historical window. */
+  /**
+   * The device's typical gateway count over the historical window: the largest N such
+   * that at least `minHistoricalShare` of its historical uplinks reached N or more
+   * distinct gateways. 0 when it has no uplink with a gateway id.
+   */
+  historicalLevel: number;
+  /** Best simultaneous gateway count seen in the historical window — context only. */
   historicalMax: number;
   /** Best simultaneous gateway count seen in the recent window. */
   recentMax: number;
@@ -241,57 +258,98 @@ export interface GatewayRedundancy {
 }
 
 /**
- * Per device, the most gateways that ever heard one of its uplinks, historically and
- * recently.
+ * Per device, how many distinct gateways its uplinks typically reached historically, and
+ * the most any recent uplink reached.
  *
- * Maximum rather than average, deliberately. An average falls when a distant gateway
- * hears the device intermittently, which is not a loss of anything; the maximum only
- * falls when a gateway that used to hear it reliably has stopped. That is the difference
- * between a device with no redundancy left and a device whose third gateway is marginal.
+ * The two sides are deliberately different statistics.
+ *
+ * The historical side is a *typical* level, not a maximum. A maximum is set by the single
+ * best uplink in the window, so one stray double reception in fourteen days — a
+ * neighbour's gateway on a clear night, a survey handheld — would make a one-gateway
+ * device look like it "used to reach 2" and report a loss that never happened. Requiring
+ * a share of historical uplinks (`minHistoricalShare`, e.g. half) to have reached N is
+ * what makes "used to reach N" mean "reliably reached N".
+ *
+ * The recent side stays a maximum. It only has to answer "has *any* recent uplink still
+ * reached N", which errs toward not raising: a device whose second gateway still hears it
+ * now and then has not lost that gateway.
+ *
+ * Gateways are counted as distinct gateway ids per uplink, not rx_info entries: a gateway
+ * with two concentrator boards or antennas can report one uplink twice, and that is one
+ * point of failure, not two. Entries without an id are not counted at all.
+ *
+ * Non-array rx_info is guarded with CASE rather than a WHERE conjunct — see RX_ROWS for
+ * why the conjunct is not a guard.
  */
 export async function gatewayRedundancy(
   ctx: SoundingContext,
   historyHours: number,
   recentHours: number,
+  minHistoricalShare: number,
   scope: DeviceScope,
 ): Promise<GatewayRedundancy[]> {
-  // $1 historyHours, $2 recentHours, then the two the device scope always consumes.
-  const sc = scopeClause(scope, 3);
+  // $1 historyHours, $2 recentHours, $3 minHistoricalShare, then the two the device
+  // scope always consumes.
+  const sc = scopeClause(scope, 4);
 
   const rows = await ctx.query<{
     dev_eui: string;
     device_name: string | null;
+    historical_level: string | null;
     historical_max: string;
     recent_max: string | null;
     recent_uplinks: string;
     historical_uplinks: string;
   }>(
-    `WITH rx AS MATERIALIZED (
-       SELECT dev_eui, device_name, time, jsonb_array_length(rx_info) AS gateways
+    `WITH rx AS (
+       SELECT dev_eui, device_name, time,
+              CASE WHEN jsonb_typeof(rx_info) = 'array' THEN (
+                SELECT count(DISTINCT lower(COALESCE(g->>'gatewayId', g->>'gateway_id')))
+                  FROM jsonb_array_elements(rx_info) AS g
+              ) END AS gateways
          FROM event_up
-        WHERE time > now() - make_interval(hours => $1::int)
+        WHERE time > now() - make_interval(secs => $1::float8 * 3600)
           AND rx_info IS NOT NULL
           AND jsonb_typeof(rx_info) = 'array'
-          AND jsonb_array_length(rx_info) > 0
           ${sc.sql}
+     ),
+     counted AS (
+       SELECT * FROM rx WHERE gateways > 0
+     ),
+     -- For each gateway count a device's uplinks reached, how many uplinks reached at
+     -- least that many: a running sum from the top down.
+     levels AS (
+       SELECT dev_eui, gateways,
+              sum(n) OVER (PARTITION BY dev_eui ORDER BY gateways DESC) AS at_least,
+              sum(n) OVER (PARTITION BY dev_eui)                        AS total
+         FROM (SELECT dev_eui, gateways, count(*) AS n
+                 FROM counted GROUP BY dev_eui, gateways) h
+     ),
+     typical AS (
+       SELECT dev_eui, max(gateways) FILTER (WHERE at_least >= $3::numeric * total) AS level
+         FROM levels
+        GROUP BY dev_eui
      )
-     SELECT dev_eui,
-            max(device_name)                                                  AS device_name,
-            max(gateways)                                                     AS historical_max,
-            max(gateways) FILTER (
-              WHERE time > now() - make_interval(hours => $2::int))            AS recent_max,
+     SELECT c.dev_eui,
+            max(c.device_name)                                                AS device_name,
+            max(t.level)                                                      AS historical_level,
+            max(c.gateways)                                                   AS historical_max,
+            max(c.gateways) FILTER (
+              WHERE c.time > now() - make_interval(secs => $2::float8 * 3600))          AS recent_max,
             count(*) FILTER (
-              WHERE time > now() - make_interval(hours => $2::int))            AS recent_uplinks,
+              WHERE c.time > now() - make_interval(secs => $2::float8 * 3600))          AS recent_uplinks,
             count(*)                                                          AS historical_uplinks
-       FROM rx
-      GROUP BY dev_eui
-      ORDER BY dev_eui`,
-    [historyHours, recentHours, ...sc.values],
+       FROM counted c
+       JOIN typical t ON t.dev_eui = c.dev_eui
+      GROUP BY c.dev_eui
+      ORDER BY c.dev_eui`,
+    [historyHours, recentHours, minHistoricalShare, ...sc.values],
   );
 
   return rows.map((r) => ({
     devEui: r.dev_eui,
     deviceName: r.device_name,
+    historicalLevel: r.historical_level === null ? 0 : Number(r.historical_level),
     historicalMax: Number(r.historical_max),
     recentMax: r.recent_max === null ? 0 : Number(r.recent_max),
     recentUplinks: Number(r.recent_uplinks),
@@ -302,13 +360,24 @@ export async function gatewayRedundancy(
 /** A gateway's timekeeping, as reported alongside each reception. */
 export interface GatewayTimekeeping {
   gatewayId: string;
+  /** Receptions inside the evaluation window. */
   receptions: number;
-  /** Receptions carrying a gateway-supplied timestamp at all. */
+  /** Window receptions carrying a gateway-supplied timestamp of any kind (GPS or clock). */
   timestamped: number;
-  /** Worst absolute divergence between the gateway's clock and the event time, seconds. */
+  /** Window receptions carrying GPS time (`timeSinceGpsEpoch`) — present only with a lock. */
+  gpsTimed: number;
+  /** Receptions over the whole history window carrying any gateway timestamp. */
+  historyTimestamped: number;
+  /** Receptions over the whole history window carrying GPS time. */
+  historyGpsTimed: number;
+  /** Worst absolute divergence between the gateway's clock and the reference, seconds. */
   maxSkewSeconds: number | null;
-  /** Median-ish figure: the mean absolute divergence, seconds. */
+  /** The mean absolute divergence, seconds. */
   avgSkewSeconds: number | null;
+  /** Window receptions whose skew was measured at all (well-formed gwTime). */
+  skewCompared: number;
+  /** Of those, how many were measured against the network server's `nsTime`. */
+  skewAgainstNsTime: number;
   lastSeen: string;
 }
 
@@ -321,58 +390,113 @@ export interface GatewayTimekeeping {
  * else in this engine notices — but Class-B beaconing, downlink scheduling windows and
  * any TDOA geolocation are all quietly broken.
  *
- * `gw_time` is ChirpStack's field for the gateway's own timestamp; `time_since_gps_epoch`
- * is present only with a lock, which makes its disappearance the cleaner signal of the
- * two. Both are read for whichever the deployment provides.
+ * Three rx_info fields, counted separately because they fail separately:
+ *
+ *   gwTime / gw_time                    the gateway's own timestamp. Present with a GPS
+ *                                       lock and, on most packet forwarders, without one
+ *                                       too — stamped from the system clock. Its presence
+ *                                       therefore says nothing about GPS.
+ *   timeSinceGpsEpoch / time_since_…    present only with a lock. Its disappearance while
+ *                                       gwTime continues is the GPS-loss signature, and
+ *                                       is counted on its own so the fallback clock
+ *                                       cannot mask it.
+ *   nsTime / ns_time                    the network server's receive clock — the reference
+ *                                       skew is measured against.
+ *
+ * Skew is gwTime minus nsTime. It is deliberately not gwTime minus `event_up.time`:
+ * ChirpStack v4 derives the event time from the gateway itself — time_since_gps_epoch
+ * when present, else gwTime when it is within `rx_timestamp_max_drift` (default 30 s) of
+ * the server, and only otherwise the server's own now() — so against the event time any
+ * drift under that bound reads as zero. Only a reception without a well-formed nsTime
+ * falls back to the event time, and the counts returned say how many did.
+ *
+ * `time` (bare) is read as a last resort for the gateway timestamp: it is the field name
+ * a ChirpStack v3 store used for it.
+ *
+ * Two windows: the history window ($1, which RX_ROWS scans) answers "did this gateway
+ * ever supply this field", the evaluation window ($2) answers "does it now". Judging
+ * "previously supplied" inside the evaluation window alone means a gateway that stops
+ * stamping entirely looks, one window later, exactly like a model that never stamped —
+ * and its open alert resolves while the fault persists.
+ *
+ * Timestamps are cast only behind a regex CASE, so a garbage string is counted as
+ * unusable for skew rather than aborting the sounding.
  */
 export async function gatewayTimekeeping(
   ctx: SoundingContext,
   lookbackHours: number,
+  historyHours: number,
   scope: GatewayScope,
 ): Promise<GatewayTimekeeping[]> {
-  const gs = gatewayScopeClause(scope, 2);
+  // $1 historyHours (RX_ROWS), $2 lookbackHours, then the gateway scope's two.
+  const gs = gatewayScopeClause(scope, 3);
+  const TS = `'^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ]'`;
 
   const rows = await ctx.query<{
     gateway_id: string;
     receptions: string;
     timestamped: string;
+    gps_timed: string;
+    history_timestamped: string;
+    history_gps_timed: string;
     max_skew: string | null;
     avg_skew: string | null;
+    skew_compared: string;
+    skew_vs_ns: string;
     last_seen: string;
   }>(
     `${RX_ROWS},
      timed AS (
        SELECT gateway_id,
               time,
-              COALESCE(gw->>'gw_time', gw->>'gwTime', gw->>'time') AS gw_time,
-              (gw ? 'time_since_gps_epoch') OR (gw ? 'timeSinceGpsEpoch') AS has_gps
+              time > now() - make_interval(secs => $2::float8 * 3600)           AS in_window,
+              COALESCE(gw->>'gwTime', gw->>'gw_time', gw->>'time')    AS gw_time,
+              COALESCE(gw->>'nsTime', gw->>'ns_time')                  AS ns_time,
+              (gw ? 'timeSinceGpsEpoch') OR (gw ? 'time_since_gps_epoch') AS has_gps
          FROM seen
         WHERE gateway_id IS NOT NULL
           AND gateway_id <> ''
           ${gs.sql}
+     ),
+     skewed AS (
+       SELECT timed.*,
+              COALESCE(gw_time ~ ${TS} AND ns_time ~ ${TS}, false)   AS vs_ns,
+              CASE
+                WHEN gw_time ~ ${TS} AND ns_time ~ ${TS}
+                  THEN abs(EXTRACT(EPOCH FROM (gw_time::timestamptz - ns_time::timestamptz)))
+                WHEN gw_time ~ ${TS}
+                  THEN abs(EXTRACT(EPOCH FROM (gw_time::timestamptz - time)))
+              END                                                     AS skew
+         FROM timed
      )
      SELECT gateway_id,
-            count(*)                                    AS receptions,
-            count(*) FILTER (WHERE gw_time IS NOT NULL OR has_gps) AS timestamped,
-            -- Only well-formed timestamps are compared; a garbage string is counted as
-            -- untimestamped rather than cast, which would abort the sounding.
-            max(abs(EXTRACT(EPOCH FROM (gw_time::timestamptz - time)))) FILTER (
-              WHERE gw_time ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ]')     AS max_skew,
-            round(avg(abs(EXTRACT(EPOCH FROM (gw_time::timestamptz - time)))) FILTER (
-              WHERE gw_time ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ]'), 1) AS avg_skew,
-            max(time)                                   AS last_seen
-       FROM timed
+            count(*) FILTER (WHERE in_window)                                    AS receptions,
+            count(*) FILTER (WHERE in_window AND (gw_time IS NOT NULL OR has_gps)) AS timestamped,
+            count(*) FILTER (WHERE in_window AND has_gps)                        AS gps_timed,
+            count(*) FILTER (WHERE gw_time IS NOT NULL OR has_gps)               AS history_timestamped,
+            count(*) FILTER (WHERE has_gps)                                      AS history_gps_timed,
+            max(skew) FILTER (WHERE in_window)                                   AS max_skew,
+            round(avg(skew) FILTER (WHERE in_window), 1)                         AS avg_skew,
+            count(skew) FILTER (WHERE in_window)                                 AS skew_compared,
+            count(skew) FILTER (WHERE in_window AND vs_ns)                       AS skew_vs_ns,
+            max(time)                                                            AS last_seen
+       FROM skewed
       GROUP BY gateway_id
       ORDER BY gateway_id`,
-    [lookbackHours, ...gs.values],
+    [historyHours, lookbackHours, ...gs.values],
   );
 
   return rows.map((r) => ({
     gatewayId: r.gateway_id.toLowerCase(),
     receptions: Number(r.receptions),
     timestamped: Number(r.timestamped),
+    gpsTimed: Number(r.gps_timed),
+    historyTimestamped: Number(r.history_timestamped),
+    historyGpsTimed: Number(r.history_gps_timed),
     maxSkewSeconds: r.max_skew === null ? null : Number(r.max_skew),
     avgSkewSeconds: r.avg_skew === null ? null : Number(r.avg_skew),
+    skewCompared: Number(r.skew_compared),
+    skewAgainstNsTime: Number(r.skew_vs_ns),
     lastSeen: r.last_seen,
   }));
 }

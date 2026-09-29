@@ -42,7 +42,24 @@
  * silent day would manufacture degree days out of a dead radio, and an index that
  * quietly counts its own outages is worse than no index. `minCoverage` refuses to
  * report a total at all below a fraction of the window, because "the block is 300 GDD
- * behind" and "the sensor was offline for two days" must not look the same.
+ * behind" and "the sensor was offline for two days" must not look the same. That
+ * applies to `sum` as much as to `integral`: a rain gauge that reported for three
+ * hours of twenty-four has not measured a day's rain, and coverage is computed on the
+ * same basis for both — time spanned by intervals no longer than `maxGapHours`,
+ * including the trailing interval from the latest reading to now.
+ *
+ * ## The total is judged at full coverage
+ *
+ * Coverage the rule accepts still biases the total: at 0.8 coverage an honest sensor
+ * reports 80 % of the true figure, and an unscaled "short of target" at that coverage
+ * is the missing fifth, not the crop. So the observed total is projected to the whole
+ * window — `observed / coverage`, the mean rate over the observed time held across the
+ * unobserved time — and the PROJECTED total is what is compared with `min` and `max`,
+ * in both directions. That is unbiased when the gaps look like the rest of the window
+ * and wrong when they do not (a gauge that died during the storm), which is exactly
+ * why `minCoverage` still bounds how much of the answer may be projection. The alert
+ * carries observed, projected and coverage side by side, so a reader can see how much
+ * of the number was measured.
  */
 
 import { int, num, optNum, round, str } from '../params';
@@ -91,8 +108,9 @@ const rule: Rule = {
     maxGapHours: 3,
     /**
      * Refuse to judge a total built from less than this fraction of the window
-     * (0-1). An under-target alert from a sensor that was offline half the period is
-     * an alert about the radio wearing an agronomic costume.
+     * (above 0, at most 1). An under-target alert from a sensor that was offline half
+     * the period is an alert about the radio wearing an agronomic costume. Applies to
+     * both methods. The total judged is the observed total scaled up to full coverage.
      */
     minCoverage: 0.8,
     /** A total needs at least this many readings behind it. */
@@ -134,8 +152,12 @@ const rule: Rule = {
     }
     if (scale === 0) throw new Error('scale must not be zero — the total would always be 0');
     if (maxGapHours <= 0) throw new Error('maxGapHours must be positive');
-    if (minCoverage < 0 || minCoverage > 1) {
-      throw new Error(`minCoverage must be between 0 and 1 (got ${minCoverage})`);
+    if (!(minCoverage > 0) || minCoverage > 1) {
+      throw new Error(
+        `minCoverage must be between 0 and 1, and above 0 (got ${minCoverage}) — the ` +
+          'judged total is scaled by coverage, and a total with no covered time behind ' +
+          'it is not a measurement',
+      );
     }
     if (clearMargin < 0) throw new Error('clearMargin must not be negative');
 
@@ -158,10 +180,14 @@ const rule: Rule = {
     for (const r of rows) {
       if (r.samples < minSamples) continue;
 
-      // Coverage is only meaningful for an integral: a sum has no notion of the time
-      // between readings, which is exactly why it is the wrong method for a rate.
-      const coverage = method === 'integral' ? r.coveredHours / lookbackHours : 1;
-      if (coverage < minCoverage) {
+      // Same basis for both methods. A sum ignores time in its VALUE, which is why it
+      // is the wrong method for a rate, but whether the window was observed at all is
+      // a question about time either way. Capped at 1: a reading stamped at the window
+      // edge can round covered time a hair past the window.
+      const coverage = Math.min(1, r.coveredHours / lookbackHours);
+      // The epsilon keeps coverage exactly AT the line on the accepted side: 19.2/24 is
+      // 0.7999999999999999 in floating point, not 0.8.
+      if (!(coverage > 0) || coverage + 1e-9 < minCoverage) {
         uncovered.push(`${r.devEui} ${Math.round(coverage * 100)}%`);
         ctx.log.debug('accumulation not judged — too little of the window is covered', {
           device: r.devEui,
@@ -173,7 +199,10 @@ const rule: Rule = {
       }
       judged += 1;
 
-      const total = r.total * scale;
+      const observed = r.total * scale;
+      // Judged at full coverage — see the header. Without it an accepted 0.8 coverage
+      // reads 20 % short, and constant 20 °C against a 10 GDD target "fails" at 8.5.
+      const total = observed / coverage;
       const open = ctx.openDevEuis.has(r.devEui);
       const lower = min === null ? null : open ? min + clearMargin : min;
       const upper = max === null ? null : open ? max - clearMargin : max;
@@ -184,16 +213,23 @@ const rule: Rule = {
 
       const name = r.deviceName ?? r.devEui;
       const bound = belowMin ? `target ${min}${unit}` : `limit ${max}${unit}`;
+      const projection = coverage < 1
+        ? ` (${round(observed, 1)}${unit} observed over ${Math.round(coverage * 100)}% ` +
+          'of the window, projected to full coverage)'
+        : '';
 
       findings.push({
         devEui: r.devEui,
         deviceName: r.deviceName,
         summary:
           `${name} accumulated ${round(total, 1)}${unit} from ${r.matchedPath} over ` +
-          `${lookbackHours}h — ${belowMin ? 'short of' : 'over'} ${bound}`,
+          `${lookbackHours}h${projection} — ${belowMin ? 'short of' : 'over'} ${bound}`,
         detail: {
           measurement: r.matchedPath,
+          /** The projected total — the number compared with min and max. */
           total: round(total, 3),
+          observedTotal: round(observed, 3),
+          projectedTotal: round(total, 3),
           unit: unit.trim() || null,
           method,
           base,

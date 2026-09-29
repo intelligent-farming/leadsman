@@ -25,10 +25,19 @@
  * new failure modes. Filtering by severity and putting `description` in the alert means
  * a code this engine has never heard of still reaches a human with its own explanation.
  *
- * `excludeCodes` defaults to '7' (frame-counter retransmission). On a real store both
- * healthy devices produced nothing *but* code 7 — normal LoRaWAN behaviour when an ack
- * is lost and the device repeats a frame. Alerting on it would fire constantly, which is
- * how operators learn to ignore alerts.
+ * `excludeCodes` defaults to '7' (UPLINK_F_CNT_RETRANSMISSION, "Uplink was flagged as
+ * re-transmission / frame-counter did not increment"). On a real store healthy devices
+ * produced nothing *but* code 7 — normal LoRaWAN behaviour when an ack is lost and the
+ * device repeats a frame. ChirpStack logs it at level 1 (WARNING), so at the default
+ * minLevel of 2 the level filter already drops it and the exclusion changes nothing.
+ * It is there for the day minLevel is lowered to 1: without it, every retransmission on
+ * every device would fire, which is how operators learn to ignore alerts.
+ *
+ * ── severity ────────────────────────────────────────────────────────────────────
+ * Findings carry the check's configured severity (default warning) and never escalate
+ * on their own. ChirpStack's highest level is 2 (ERROR), which is also the default
+ * minLevel, so escalating on "an error was logged" would make every finding critical
+ * and the configured severity meaningless. Set `severity` on the check to change it.
  */
 
 import { int, round } from '../params';
@@ -40,7 +49,7 @@ interface Row {
   device_name: string | null;
   events: string;
   worst_level: string;
-  codes: string;
+  codes: string | null;
   latest_description: string | null;
   latest_at: string;
 }
@@ -69,7 +78,8 @@ const rule: Rule = {
     /**
      * Codes to ignore, as text. '7' is frame-counter retransmission — normal LoRaWAN
      * behaviour when an ack is lost, and on a real store the only thing healthy devices
-     * ever logged.
+     * ever logged. ChirpStack logs it at level 1, so this only has an effect once
+     * minLevel is lowered to 1.
      */
     excludeCodes: ['7'],
     /** Narrow this check to part of the fleet — see src/scope.ts. */
@@ -98,31 +108,43 @@ const rule: Rule = {
     const sc = scopeClause(resolveScope(ctx.params), 5);
 
     // `level` and `code` are text holding numeric enum values, so the comparison needs
-    // a cast — guarded by a regex, because a ChirpStack version writing a symbolic name
-    // instead of a number must not abort the sounding.
+    // a cast — guarded, because a ChirpStack version writing a symbolic name instead of a
+    // number must not abort the sounding. The guard is a CASE, not `level ~ … AND
+    // level::int >= …`: Postgres does not promise to evaluate AND left to right, so the
+    // cast could run on a non-numeric level first. CASE does guarantee its order. A
+    // non-numeric level becomes NULL and fails the comparison.
+    //
+    // The exclusion is NULL-safe: `NOT (code = ANY(…))` is NULL for a NULL code, which
+    // would drop the row silently rather than keep it.
     const rows = await ctx.query<Row>(
-      `SELECT dev_eui,
+      `WITH l AS (
+         SELECT dev_eui, device_name, time, code, description,
+                CASE WHEN level ~ '^[0-9]+$' THEN level::int END AS lvl
+           FROM event_log
+          WHERE time > now() - make_interval(secs => $1::float8 * 3600)
+            ${sc.sql}
+       )
+       SELECT dev_eui,
               max(device_name)                                      AS device_name,
               count(*)                                              AS events,
-              max(level::int)                                       AS worst_level,
+              max(lvl)                                              AS worst_level,
               string_agg(DISTINCT code, ',' ORDER BY code)           AS codes,
               (array_agg(description ORDER BY time DESC))[1]         AS latest_description,
               max(time)                                             AS latest_at
-         FROM event_log
-        WHERE time > now() - make_interval(hours => $1::int)
-          AND level ~ '^[0-9]+$'
-          AND level::int >= $2::int
-          AND NOT (code = ANY($4::text[]))
-          ${sc.sql}
+         FROM l
+        WHERE lvl >= $2::int
+          AND (code IS NULL OR NOT (code = ANY($4::text[])))
         GROUP BY dev_eui
        HAVING count(*) >= $3::int
-        ORDER BY max(level::int) DESC, count(*) DESC`,
+        ORDER BY max(lvl) DESC, count(*) DESC`,
       [lookbackHours, minLevel, minEvents, excludeCodes, ...sc.values],
     );
 
     return rows.map((row) => {
       const events = Number(row.events);
       const worst = Number(row.worst_level);
+      // string_agg ignores NULL codes, and yields NULL if every code was NULL.
+      const codes = row.codes ? row.codes.split(',') : [];
       const name = row.device_name ?? row.dev_eui;
       // The description is the payload here — it is ChirpStack's own words for what
       // went wrong, and the only part that survives a code this engine has not seen.
@@ -138,13 +160,14 @@ const rule: Rule = {
         deviceName: row.device_name,
         summary:
           `${name}: ${events} ChirpStack ${noun}${events === 1 ? '' : 's'} in ` +
-          `${lookbackHours}h (code${row.codes.includes(',') ? 's' : ''} ${row.codes})${reason}`,
-        // Level 2 is ChirpStack's ERROR; anything above is more serious still.
-        severity: worst >= 2 ? 'critical' : undefined,
+          `${lookbackHours}h (code${codes.length === 1 ? '' : 's'} ${codes.join(',')})${reason}`,
+        // The check's configured severity — see "severity" above for why this does not
+        // escalate on level.
+        severity: undefined,
         detail: {
           events,
           worstLevel: worst,
-          codes: row.codes.split(','),
+          codes,
           latestDescription: row.latest_description,
           latestAt: row.latest_at,
           lookbackHours,

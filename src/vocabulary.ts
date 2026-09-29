@@ -6,8 +6,9 @@
  *
  * GENERATED — do not hand-edit. The source of truth is
  * `definitions/vocabulary.schema.json` in @intelligent-farming/lorawan-codec-normalization
- * (snapshot of v0.2.2), which carries an explicit `minimum`/`maximum` on
- * 73 numeric leaves. Regenerate with `npm run vocabulary:sync`.
+ * (snapshot of v0.2.2), which carries an explicit `minimum`/`maximum` (or
+ * `exclusiveMinimum`/`exclusiveMaximum`) on 73 numeric leaves. Regenerate
+ * with `npm run vocabulary:sync`.
  *
  * ## Why this is vendored rather than imported
  *
@@ -29,8 +30,23 @@
  * negative humidity or a battery below zero volts, and each is a real failure signature.
  */
 
-/** Inclusive `[minimum, maximum]`; `null` on either side means unbounded there. */
-export type VocabularyRange = readonly [min: number | null, max: number | null];
+/** Which side of a range is exclusive. Absent or false means inclusive. */
+export interface RangeExclusivity {
+  readonly min?: boolean;
+  readonly max?: boolean;
+}
+
+/**
+ * `[minimum, maximum, exclusive?]`; `null` on either side means unbounded there.
+ * Bounds are inclusive unless the third element marks a side exclusive — the schema's
+ * `exclusiveMaximum: 360` on `wind.direction` is `[0, 360, { max: true }]`, since
+ * 360 degrees is 0 and a codec emitting it has not wrapped.
+ */
+export type VocabularyRange = readonly [
+  min: number | null,
+  max: number | null,
+  exclusive?: RangeExclusivity,
+];
 
 /** Dotted vocabulary path to its physically valid range. */
 export const VOCABULARY_RANGES: ReadonlyMap<string, VocabularyRange> = new Map<
@@ -108,7 +124,7 @@ export const VOCABULARY_RANGES: ReadonlyMap<string, VocabularyRange> = new Map<
   ['water.temperature.max', [-273.15, null]],
   ['water.temperature.min', [-273.15, null]],
   ['water.turbidity', [0, null]],
-  ['wind.direction', [0, null]],
+  ['wind.direction', [0, 360, { max: true }]],
   ['wind.speed', [0, null]],
 ]);
 

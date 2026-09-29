@@ -88,13 +88,28 @@ const rule: Rule = {
     }
     const ignore = new Set((Array.isArray(rawIgnore) ? rawIgnore : []).map(String));
     if (minBreaches < 1) throw new Error('minBreaches must be at least 1');
+    if (lookbackHours <= 0) {
+      throw new Error(
+        'lookbackHours must be positive — an empty window holds no readings, so this ' +
+          'check could never fire',
+      );
+    }
 
     // The bounds table becomes a JSONB parameter and the comparison happens in SQL, so
     // the engine never pulls a window of raw telemetry across the wire to filter it in
     // TypeScript. 73 paths is a small enough literal to send every sounding.
     const bounds = [...VOCABULARY_RANGES.entries()]
       .filter(([path]) => !ignore.has(path))
-      .map(([path, [min, max]]) => ({ path: path.split('.'), label: path, min, max }));
+      .map(([path, [min, max, exclusive]]) => ({
+        path: path.split('.'),
+        label: path,
+        min,
+        max,
+        // Exclusive sides from the schema: wind.direction is [0, 360) — 360 degrees is
+        // 0, and a codec emitting it has failed to wrap.
+        minExclusive: exclusive?.min === true,
+        maxExclusive: exclusive?.max === true,
+      }));
 
     if (bounds.length === 0) {
       throw new Error('every known path is in ignorePaths — this check cannot fire');
@@ -112,13 +127,17 @@ const rule: Rule = {
       worst: string;
       lo: string | null;
       hi: string | null;
+      lo_excl: boolean;
+      hi_excl: boolean;
       last_at: string;
     }>(
       `WITH bounds AS (
          SELECT ARRAY(SELECT jsonb_array_elements_text(b->'path')) AS path,
                 b->>'label'                                        AS label,
                 (b->>'min')::numeric                               AS lo,
-                (b->>'max')::numeric                               AS hi
+                (b->>'max')::numeric                               AS hi,
+                (b->>'minExclusive')::boolean                      AS lo_excl,
+                (b->>'maxExclusive')::boolean                      AS hi_excl
            FROM jsonb_array_elements($1::jsonb) AS t(b)
        ),
        breached AS (
@@ -127,35 +146,40 @@ const rule: Rule = {
                 b.label,
                 b.lo,
                 b.hi,
+                b.lo_excl,
+                b.hi_excl,
                 (e.object #>> b.path)::numeric AS value,
                 e.time
            FROM event_up e
            CROSS JOIN bounds b
-          WHERE e.time > now() - make_interval(hours => $2::int)
+          WHERE e.time > now() - make_interval(secs => $2::float8 * 3600)
             AND e.object IS NOT NULL
             AND e.object #>> b.path IS NOT NULL
             -- The same numeric guard the resolvers use: a codec emitting "3.7V" where
             -- a number belongs is decode-failure's problem, not this check's.
             AND e.object #>> b.path ~ '^-?[0-9]+(\\.[0-9]+)?$'
-            AND (   (b.lo IS NOT NULL AND (e.object #>> b.path)::numeric < b.lo)
-                 OR (b.hi IS NOT NULL AND (e.object #>> b.path)::numeric > b.hi))
+            -- An exclusive side also rejects the bound itself.
+            AND (   (b.lo IS NOT NULL AND ((e.object #>> b.path)::numeric < b.lo
+                       OR (b.lo_excl AND (e.object #>> b.path)::numeric = b.lo)))
+                 OR (b.hi IS NOT NULL AND ((e.object #>> b.path)::numeric > b.hi
+                       OR (b.hi_excl AND (e.object #>> b.path)::numeric = b.hi))))
             ${sc.sql}
        )
        SELECT dev_eui,
               max(device_name) AS device_name,
               label,
               count(*)         AS breaches,
-              lo, hi,
+              lo, hi, lo_excl, hi_excl,
               -- The reading furthest outside the bound, which is the one worth showing:
               -- it is the most diagnostic of what kind of fault this is.
               (array_agg(value ORDER BY
                  greatest(COALESCE(lo - value, 0), COALESCE(value - hi, 0)) DESC))[1] AS worst,
               max(time) AS last_at
          FROM breached
-        GROUP BY dev_eui, label, lo, hi
+        GROUP BY dev_eui, label, lo, hi, lo_excl, hi_excl
        HAVING count(*) >= $3::int
         ORDER BY dev_eui, label`,
-      [JSON.stringify(bounds), Math.round(lookbackHours), minBreaches, ...sc.values],
+      [JSON.stringify(bounds), lookbackHours, minBreaches, ...sc.values],
     );
 
     // One finding per device, not per path: a probe whose codec scaling is wrong
@@ -175,10 +199,14 @@ const rule: Rule = {
       const worst = breaches[0];
       const others = breaches.length - 1;
 
-      const bound =
-        Number(worst.worst) < Number(worst.lo ?? -Infinity)
-          ? `min ${worst.lo}`
-          : `max ${worst.hi}`;
+      // Below (or, for an exclusive minimum, at) the lower bound means the min broke;
+      // anything else in this list broke the max.
+      const lo = worst.lo === null ? null : Number(worst.lo);
+      const brokeMin =
+        lo !== null && (Number(worst.worst) < lo || (worst.lo_excl && Number(worst.worst) === lo));
+      const bound = brokeMin
+        ? `min ${worst.lo}${worst.lo_excl ? ', exclusive' : ''}`
+        : `max ${worst.hi}${worst.hi_excl ? ', exclusive' : ''}`;
 
       findings.push({
         devEui,
@@ -193,6 +221,8 @@ const rule: Rule = {
             worstValue: round(Number(b.worst), 3),
             min: b.lo === null ? null : Number(b.lo),
             max: b.hi === null ? null : Number(b.hi),
+            minExclusive: b.lo_excl,
+            maxExclusive: b.hi_excl,
             breaches: Number(b.breaches),
           })),
           lookbackHours,

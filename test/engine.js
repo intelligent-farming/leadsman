@@ -811,6 +811,65 @@ if (!h.available) {
 
   // ── every rule's SQL actually executes ──────────────────────────────────────
 
+  test('soil-deficit-band: real telemetry separates two blocks with the same miss', async () => {
+    // End to end, and the point of the rule in one test: two blocks spend the SAME
+    // share of the window out of the same band and need opposite corrections. A
+    // min/max threshold would report them identically.
+    const { loadRules } = require('../dist/registry.js');
+    const rule = loadRules().get('soil-deficit-band');
+
+    // 24 hourly readings each. block-dry sits under the floor; block-swing alternates
+    // between well under and well over it.
+    const dry =   [...Array(14).fill(11), ...Array(10).fill(22)];
+    const swing = [...Array(7).fill(11), ...Array(7).fill(34), ...Array(10).fill(22)];
+    for (const [devEui, name, series] of [
+      ['aa', 'block-dry', dry], ['bb', 'block-swing', swing],
+    ]) {
+      for (let i = 0; i < series.length; i += 1) {
+        await h.uplink(env.db, {
+          devEui, deviceName: name, minutesAgo: (series.length - 1 - i) * 60,
+          object: { soil: { moisture: series[i] } },
+        });
+      }
+    }
+
+    const summary = await runSounding({
+      config: {
+        schedule: '* * * * *', statementTimeoutMs: 15_000,
+        checks: [{
+          rule: 'soil-deficit-band', as: 'post-veraison-deficit', enabled: true,
+          params: {
+            ...rule.defaultParams,
+            floor: 18, ceiling: 28, lookbackHours: 24,
+            maxOutOfBandFraction: 0.25, minCoverage: 0.6, minSamples: 12,
+            fieldCapacity: 32, wiltingPoint: 12,
+          },
+        }],
+      },
+      rules: new Map([['soil-deficit-band', rule]]),
+      store: env.store, log: h.quietLogger(),
+    });
+
+    assert.equal(summary.raised, 2, 'both blocks are out of band');
+    const open = await openAlerts();
+    const byName = Object.fromEntries(open.map((a) => [a.dev_eui, a.summary]));
+
+    assert.match(byName.aa, /below the 18% floor/);
+    assert.doesNotMatch(byName.aa, /swinging/);
+    // The block that must NOT be given more water.
+    assert.match(byName.bb, /swinging across the band/);
+    assert.match(byName.bb, /sets too large and too far apart/);
+
+    const detail = await env.store.query(
+      `SELECT dev_eui, detail->>'pattern' AS pattern,
+              (detail->>'depletionFraction')::numeric AS depletion
+         FROM leadsman.alert ORDER BY dev_eui`,
+    );
+    assert.deepEqual(detail.map((r) => r.pattern), ['below', 'oscillating']);
+    // Both ended at 22 % VWC: (32 - 22) / (32 - 12) = 0.5 depleted.
+    assert.equal(Number(detail[0].depletion), 0.5);
+  });
+
   // ── seasonal gating and the forecast source, through the runner ─────────────
   // Both are engine-level rather than rule-level, so they are only exercised here.
 

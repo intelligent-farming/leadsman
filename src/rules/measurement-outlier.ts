@@ -96,7 +96,12 @@ const rule: Rule = {
     minGroupSize: 4,
     /** Averaging window per device. Long enough to smooth diurnal phase differences. */
     lookbackHours: 24,
-    /** A device needs this many readings in the window to be compared. */
+    /**
+     * A device needs this many readings in the window to be compared — and to count
+     * toward the group at all. Sparser devices are left out BEFORE the median and MAD
+     * are computed, so they can neither hide an outlier nor manufacture one, and they
+     * do not count toward minGroupSize or the "N devices" in the summary.
+     */
     minSamples: 6,
     /** Shown in the alert summary. */
     unit: '%',
@@ -129,12 +134,17 @@ const rule: Rule = {
       );
     }
 
-    const scope = resolveScope(ctx.params);
-    const rows = await groupDeviation(ctx, paths, lookbackHours, scope);
+    if (minSamples < 1) throw new Error('minSamples must be at least 1');
 
-    const comparable = rows.filter((r) => r.samples >= minSamples);
+    const scope = resolveScope(ctx.params);
+    // Membership is decided in the query, before the group statistics: a device below
+    // minSamples filtered out afterwards would still have moved the median and MAD
+    // every other device is judged against.
+    const comparable = await groupDeviation(ctx, paths, lookbackHours, scope, minSamples);
     if (comparable.length === 0) {
-      ctx.log.debug('no device reports any candidate path', { paths: pathsLabel(paths) });
+      ctx.log.debug('no device has enough readings at any candidate path to compare', {
+        paths: pathsLabel(paths), minSamples,
+      });
       return [];
     }
     if (comparable.length < minGroupSize) {

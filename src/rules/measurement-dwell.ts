@@ -21,7 +21,7 @@
  *
  *   mode: longest   the longest UNBROKEN run. Infection, exposure, anything where the
  *                   damage needs continuity.
- *   mode: total     every run added together. Accumulation — chill does not care
+ *   mode: total     all time in band added together. Accumulation — chill does not care
  *                   whether the cold came in one stretch or twelve, and reporting the
  *                   longest run would under-count a normal winter tenfold.
  *
@@ -38,6 +38,24 @@
  * until the device has covered `minSamples` readings and refuses to judge a device
  * that has barely reported — otherwise every newly-installed sensor is instantly short
  * of its chill target.
+ *
+ * ## Which way each mode rounds
+ *
+ * The two modes credit time differently, so they err in different directions, and
+ * the direction matters most for `atMost`, where under-counting RAISES:
+ *
+ *   longest   first in-band reading to last. Understates a run by up to one reporting
+ *             interval at each end. Toward not raising for `atLeast` (the infection
+ *             question, which is why mold-risk keeps it); toward raising for `atMost`,
+ *             so leave some slack in a "longest run must reach N hours" target.
+ *   total     last observation carried forward: every in-band reading is credited with
+ *             the time to the next reading, and the latest with the time up to now,
+ *             each capped at `maxGapHours`. No interval is lost per run, so seven
+ *             fragmented nights of six hourly readings bank 42 h rather than 35 h —
+ *             first-to-last per run would call that a chill shortfall. The cap credits a
+ *             device that went quiet mid-band with up to `maxGapHours` it was not
+ *             observed for, which errs toward more dwell: toward not raising for
+ *             `atMost` (chill), toward raising for `atLeast`.
  */
 
 import { int, num, optNum, round, str } from '../params';
@@ -87,7 +105,11 @@ const rule: Rule = {
     gateMax: null,
     /** The window the dwell is measured over. */
     lookbackHours: 168,
-    /** A reporting gap longer than this breaks a run and contributes nothing. */
+    /**
+     * The longest a reading is trusted to speak for. A reporting gap longer than this
+     * breaks a run; in "total" mode each reading is credited with the time to the next
+     * one (or to now) but never more than this.
+     */
     maxGapHours: 3,
     /**
      * A device needs this many in-band readings (atLeast) or window readings (atMost)

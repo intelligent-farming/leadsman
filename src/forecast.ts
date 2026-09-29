@@ -17,7 +17,9 @@
  * return the same numbers, so the config names ONE centroid for the operation and every
  * check shares that answer. The source memoizes per coordinate for the life of the
  * sounding, so ten checks calling `forecast()` cost one HTTP request. A check that
- * passes explicit coordinates costs one more — deliberately the exception.
+ * passes explicit coordinates costs one more — deliberately the exception. A failure
+ * is memoized the same way: ten checks against a provider that is down cost one
+ * failed request, not ten, and the next sounding tries again.
  *
  * ## Normalized onto the codec vocabulary
  *
@@ -236,10 +238,22 @@ export function forecastSource(
       if (!pending) {
         pending = load(point);
         cache.set(key, pending);
-        // A rejected forecast must not be cached as the answer for the rest of the
-        // sounding's lifetime — but the source only lives for one sounding, so the
-        // retry this enables is the next check in the same pass, not a hot loop.
-        pending.catch(() => cache.delete(key));
+        // A FAILED forecast is memoized too, for the life of the sounding. Evicting it
+        // would make every forecast check in the pass retry in turn — ten checks against
+        // a provider that is down cost ten requests, and against one that is hanging
+        // ten back-to-back timeouts that stall the whole sounding. The source is built
+        // per sounding, so the next sounding tries again from scratch; within this one,
+        // every check sees the same error and the runner contains it per check, so
+        // nothing is resolved on the strength of an outage.
+        //
+        // The handler only marks the rejection as observed (each caller still awaits
+        // and sees it); it logs once here rather than once per check.
+        pending.catch((err: Error) =>
+          log.warn('forecast unavailable for this sounding; not retrying until the next', {
+            at: key,
+            error: err.message,
+          }),
+        );
       }
       return pending;
     },

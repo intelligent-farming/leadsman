@@ -156,14 +156,15 @@ function paramNameProblems(rule: Rule, check: CheckConfig, kind: string): Verify
   const out: VerifyProblem[] = [];
   // Unknown params are almost always typos, and a typo'd threshold silently
   // falls back to the default, which is the kind of bug that looks like the
-  // check "not working" for weeks.
+  // check "not working" for weeks. That is a config that looks configured and is
+  // not — the class lint exists to refuse — so it is an error, not a warning.
   for (const key of Object.keys(check.params ?? {})) {
     if (!(key in rule.defaultParams)) {
       out.push({
-        severity: 'warning',
+        severity: 'error',
         where: `checks.${kind}.params`,
         message:
-          `"${key}" is not a parameter of rule "${rule.id}" and will be ignored ` +
+          `"${key}" is not a parameter of rule "${rule.id}" and would be ignored ` +
           `(known: ${Object.keys(rule.defaultParams).join(', ') || 'none'})`,
       });
     }

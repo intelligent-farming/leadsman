@@ -71,10 +71,13 @@ const leaves = [];
 // Which checks make sense for a given path. Booleans and enums route to
 // boolean-alarm; cumulative totals to the counter checks; everything numeric and
 // instantaneous to the measurement checks.
+// Only paths the schema describes as cumulative. Per-interval counts (pulse.count,
+// action.button.count, people.in/out), time-in-current-state (action.occupancy.duration)
+// and action.motion.count, whose schema text does not promise a running total, reset
+// or fall as a matter of course — counter-stalled would call that "went backwards".
 const COUNTERS = new Set([
-  'metering.water.total', 'metering.energy.total', 'pulse.total', 'pulse.count',
-  'device.runtime', 'rain.cumulative', 'action.motion.count', 'action.button.count',
-  'action.occupancy.duration', 'people.in', 'people.out',
+  'metering.water.total', 'metering.energy.total', 'pulse.total',
+  'device.runtime', 'rain.cumulative',
 ]);
 const POSITIONS = new Set(['position.latitude', 'position.longitude']);
 const NON_TELEMETRY = new Set(['time', 'air.location', 'hvac.mode', 'action.button.event']);

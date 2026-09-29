@@ -144,7 +144,9 @@ export interface SoundingContext {
    * telemetry. That needs the network server's own record.
    *
    * Null when unconfigured. Declare `needs: ['chirpstack']` rather than checking for
-   * null, and the engine will skip the check instead of running it blind.
+   * null, and the engine will skip the check instead of running it blind — unless the
+   * check uses it only optionally (gateway-silent), in which case check for null and
+   * treat a failing call as absent.
    */
   gateways?: GatewaySource | null;
 
@@ -386,7 +388,7 @@ export interface CheckConfig {
    * Destination name from `notify.destinations`, or a `Routing` value resolved through
    * `notify.routing`. Overrides the rule's `defaultRouting`. This is where a deployment
    * expresses meaning the generic rules cannot know — that its `measurement-threshold`
-   * instance named `pipe-pressure-low` is a situation while `soil-ph-range` is a fact.
+   * instance named `frost-risk` is a situation while `pipe-pressure-low` is a fact.
    */
   notifyTo?: string;
   /**

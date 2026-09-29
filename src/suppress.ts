@@ -8,7 +8,7 @@
  * makes every device behind it look silent, so `fleet-silent` and forty `device-silent`
  * alerts are all simultaneously true — but only the first is a fault. The other forty each
  * name a sensor that is working perfectly, and delivering them buries the one alert that
- * identifies the actual problem under thirty-nine that misdiagnose it.
+ * identifies the actual problem under forty that misdiagnose it.
  *
  * Three properties make this safe enough to be on by default:
  *

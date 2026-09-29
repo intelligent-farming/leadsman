@@ -19,8 +19,10 @@
  *                  radiative frost will actually fall to.
  *   thi            Temperature-humidity index. Livestock heat stress — the standard
  *                  classification for dairy cattle is comfort below 68, mild stress
- *                  68-72, moderate 72-80, severe above 80, with measured milk-yield
- *                  loss beginning around 72.
+ *                  68-72, moderate 72-80, severe above 80. Milk-yield loss in
+ *                  high-producing cows begins around 68 (Zimbelman et al. 2009); 72 is
+ *                  the older onset from Armstrong (1994), still common in extension
+ *                  material and appropriate for lower-yielding herds.
  *   absoluteHumidity  g/m³. Ventilation and drying calculations, where relative
  *                  humidity is actively misleading because it moves with temperature.
  *
@@ -40,10 +42,14 @@ import { int, optNum, round, str } from '../params';
 import { latestPairs, pathsLabel, resolvePaths } from '../measurement';
 import { resolveScope, SCOPE_PARAMS } from '../scope';
 import type { Finding, Rule } from '../types';
+import { VOCABULARY_RANGES, type VocabularyRange } from '../vocabulary';
 
 /**
- * Saturation vapour pressure over water, kPa. Tetens, which is within ±0.1 % of the
- * psychrometric tables from 0-50 °C.
+ * Saturation vapour pressure over water, kPa. Tetens (the FAO-56 coefficients), which
+ * reads low against the IAPWS reference by under 0.1 % from 0 to 30 °C and by about
+ * 0.13 % at 40-50 °C. It degrades below freezing — about 0.3 % low at -10 °C and 0.8 %
+ * at -20 °C, still over supercooled water rather than ice — which is inside the error
+ * of any humidity sensor but worth knowing for a frost-night dew point.
  *
  * Note this is also what `absoluteHumidity` is built on, whereas that quantity is
  * more often published using the Magnus coefficients (17.67 / 243.5) rather than
@@ -58,13 +64,15 @@ function saturationVapourPressure(tempC: number): number {
 /**
  * Wet-bulb temperature, °C, from dry bulb and RH.
  *
- * Stull's 2011 empirical fit. Accurate to about ±0.3 °C for RH 5-99 % and temperatures
- * -20 to 50 °C at sea level, which comfortably covers every spray decision. The exact
- * form requires iterating a psychrometric equation, and a third of a degree is far
- * inside the error of the humidity sensor feeding it.
+ * Stull's 2011 empirical fit, published as valid for RH 5-99 % and -20 to 50 °C at
+ * standard sea-level pressure, except where low humidity and cold temperature occur
+ * together. Over that range its error runs from -1 to +0.65 °C with a mean absolute
+ * error under 0.3 °C; the largest errors are at low RH and low temperature. The exact
+ * form requires iterating a psychrometric equation. Near the 2 °C and 8-10 °C delta-T
+ * spray bounds the fit can move a borderline reading across a line, so treat a
+ * delta-T within about half a degree of a bound as marginal rather than decided.
  */
-function wetBulb(tempC: number, rh: number): number {
-  const r = Math.min(Math.max(rh, 0), 100);
+function wetBulb(tempC: number, r: number): number {
   // Capped at the dry bulb: the wet bulb cannot physically exceed it, but Stull's
   // fit overshoots by about 0.01 °C at saturation, which would report a delta-T of
   // -0.01 — a physically impossible number in an alert a sprayer operator reads.
@@ -88,14 +96,15 @@ const FORMULAS: Record<string, Formula> = {
   vpd: {
     unit: ' kPa',
     about: 'vapour pressure deficit from temperature and relative humidity',
-    compute: (t, rh) => saturationVapourPressure(t) * (1 - Math.min(Math.max(rh, 0), 100) / 100),
+    compute: (t, rh) => saturationVapourPressure(t) * (1 - rh / 100),
   },
   dewPoint: {
     unit: 'C',
     about: 'dew point from temperature and relative humidity (Magnus)',
     compute: (t, rh) => {
-      // Guard the log: a codec reporting 0 % RH would otherwise give -Infinity.
-      const r = Math.min(Math.max(rh, 0.1), 100);
+      // Guard the log: a codec reporting exactly 0 % RH would otherwise give
+      // -Infinity. Inputs outside 0-100 never reach here (see inputProblem).
+      const r = Math.max(rh, 0.1);
       const gamma = (17.27 * t) / (237.3 + t) + Math.log(r / 100);
       return (237.3 * gamma) / (17.27 - gamma);
     },
@@ -110,17 +119,49 @@ const FORMULAS: Record<string, Formula> = {
     about: 'temperature-humidity index — livestock heat stress',
     compute: (t, rh) => {
       const f = 1.8 * t + 32;
-      return f - (0.55 - 0.0055 * Math.min(Math.max(rh, 0), 100)) * (f - 58);
+      return f - (0.55 - 0.0055 * rh) * (f - 58);
     },
   },
   absoluteHumidity: {
     unit: ' g/m³',
     about: 'absolute humidity from temperature and relative humidity',
     compute: (t, rh) =>
-      (2.1674 * (saturationVapourPressure(t) * 10) * Math.min(Math.max(rh, 0), 100)) /
+      (2.1674 * (saturationVapourPressure(t) * 10) * rh) /
       (273.15 + t),
   },
 };
+
+/**
+ * Why a pair is outside the domain every formula here is defined on, or null.
+ *
+ * The formulas used to clamp RH into 0-100, so a codec emitting 250 % humidity
+ * computed as saturated air — vpd 0, delta-T 0, dew point equal to the dry bulb — and
+ * fired a vpd-low or spray-unsuitable alert on a sensor fault. Skipping is right
+ * instead: measurement-implausible is the check that reports an impossible input, and
+ * a derived quantity computed from one is not a field condition.
+ *
+ * Temperature is held to the vocabulary's declared range for the path that matched
+ * (absolute zero for every temperature path), and to the Tetens pole at -237.3 °C
+ * whatever the path, since below it the saturation curve is not a curve.
+ */
+function inputProblem(
+  tempPath: string, tempC: number, humidityPath: string, rh: number,
+): string | null {
+  if (!Number.isFinite(tempC) || !Number.isFinite(rh)) return 'input is not a number';
+  if (rh < 0 || rh > 100) return 'relative humidity outside 0-100 %';
+  const hr = VOCABULARY_RANGES.get(humidityPath);
+  if (hr && !withinRange(rh, hr)) return `${humidityPath} outside its vocabulary range`;
+  const tr = VOCABULARY_RANGES.get(tempPath);
+  if (tr && !withinRange(tempC, tr)) return `${tempPath} outside its vocabulary range`;
+  if (tempC <= -237.3) return 'temperature below the saturation formula\'s domain';
+  return null;
+}
+
+function withinRange(v: number, [min, max, exclusive]: VocabularyRange): boolean {
+  if (min !== null && (v < min || (exclusive?.min === true && v === min))) return false;
+  if (max !== null && (v > max || (exclusive?.max === true && v === max))) return false;
+  return true;
+}
 
 const rule: Rule = {
   id: 'measurement-derived',
@@ -179,6 +220,12 @@ const rule: Rule = {
       throw new Error(`min (${min}) must not exceed max (${max})`);
     }
     if (clearMargin < 0) throw new Error('clearMargin must not be negative');
+    if (lookbackHours <= 0) {
+      throw new Error(
+        'lookbackHours must be positive — an empty window holds no readings, so this ' +
+          'check could never fire',
+      );
+    }
 
     const scope = resolveScope(ctx.params);
     const pairs = await latestPairs(ctx, tempPaths, humidityPaths, lookbackHours, scope);
@@ -194,11 +241,20 @@ const rule: Rule = {
     const findings: Finding[] = [];
 
     for (const p of pairs) {
+      // An input outside the physical range — a codec emitting 250 % humidity, say —
+      // is a data fault, and measurement-implausible is the check that reports it.
+      // Saying nothing here is correct; computing on it would alert on the fault as
+      // if it were weather.
+      const problem = inputProblem(p.primaryPath, p.primary, p.secondaryPath, p.secondary);
+      if (problem !== null) {
+        ctx.log.debug('input outside the formula\'s domain — skipping', {
+          device: p.devEui, formula: name, problem,
+          temperature: p.primary, humidity: p.secondary,
+        });
+        continue;
+      }
       const value = formula.compute(p.primary, p.secondary);
       if (!Number.isFinite(value)) {
-        // A formula that produced NaN means an input outside its domain — a codec
-        // emitting 250 % humidity, say. That is a data fault, and measurement-
-        // implausible is the check that reports it; saying nothing here is correct.
         ctx.log.debug('derived value is not finite — skipping', {
           device: p.devEui, formula: name, temperature: p.primary, humidity: p.secondary,
         });

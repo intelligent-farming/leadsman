@@ -23,9 +23,25 @@
  *
  * ## The mechanism
  *
- * A lagged correlation between two paths on one device. `mold-risk` correlates two
- * measurements inside a single uplink; this correlates a trigger with a response
- * separated by however long the physics takes.
+ * A lagged correlation between a trigger path and a response path. `mold-risk`
+ * correlates two measurements inside a single uplink; this correlates a trigger with a
+ * response separated by however long the physics takes.
+ *
+ * By default both are read from the SAME device, which suits a controller that meters
+ * and senses on one board. The headline case above does not look like that: the flow
+ * meter is on the header, the probe is in the block, and no vocabulary category emits
+ * both a water total and a soil moisture. `responseDevices` says which devices answer
+ * for which trigger:
+ *
+ *   "responseDevices": { "a84041000181c061": ["a84041000181c0a2", "a84041000181c0a3"] }
+ *
+ * A mapped trigger is judged only on its mapped devices, each against its own baseline
+ * (its last reading at or before the trigger), and the action counts as having worked
+ * if ANY of them moved by `minChange` in `direction` — one wetted probe proves the
+ * water arrived somewhere, and it is the probe that stayed dry on its own that
+ * `measurement-outlier` exists for. Triggers not in the map keep the same-device
+ * pairing. Mapped response devices are read even when the scope would exclude them:
+ * the scope selects triggers.
  *
  *   trigger   a numeric path that INCREASED by at least `triggerDelta`. A monotonic
  *             counter advancing is the natural case — litres delivered, pump runtime,
@@ -47,16 +63,59 @@
  */
 
 import { int, num, round, str } from '../params';
-import { pathsLabel, resolvePaths, triggerResponse } from '../measurement';
+import {
+  pathsLabel, resolvePaths, triggerResponse, type ResponseDeviceMap,
+} from '../measurement';
 import { resolveScope, SCOPE_PARAMS } from '../scope';
 import type { Finding, Rule } from '../types';
+
+const EUI = /^[0-9a-f]{16}$/;
+
+/**
+ * Validate and normalize `responseDevices`. Thrown errors surface as lint errors, and
+ * that matters: a typo'd EUI would otherwise pair a meter with a probe that never
+ * reports, every trigger would be unjudgeable, and the check would sit silent looking
+ * healthy.
+ */
+function parseResponseDevices(raw: unknown): ResponseDeviceMap {
+  if (raw === null || raw === undefined) return {};
+  if (typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new Error(
+      'responseDevices must be an object mapping a trigger DevEUI to an array of ' +
+        `response DevEUIs, or null (got ${JSON.stringify(raw)})`,
+    );
+  }
+  const out: ResponseDeviceMap = {};
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    const trig = key.toLowerCase();
+    if (!EUI.test(trig)) {
+      throw new Error(`responseDevices key "${key}" is not a 16-digit hex DevEUI`);
+    }
+    if (!Array.isArray(value) || value.length === 0) {
+      throw new Error(
+        `responseDevices["${key}"] must be a non-empty array of response DevEUIs`,
+      );
+    }
+    out[trig] = value.map((v, i) => {
+      if (typeof v !== 'string' || !EUI.test(v.toLowerCase())) {
+        throw new Error(
+          `responseDevices["${key}"][${i}] is not a 16-digit hex DevEUI ` +
+            `(got ${JSON.stringify(v)})`,
+        );
+      }
+      return v.toLowerCase();
+    });
+  }
+  return out;
+}
 
 const rule: Rule = {
   id: 'response-missing',
   description:
     'Flags a device where a trigger measurement advanced — litres delivered, pump ' +
     'runtime, a valve flag — but the measurement that should have responded did not ' +
-    'move within the expected lag. Catches irrigation that ran and did nothing.',
+    'move within the expected lag, on the same device or on the response devices ' +
+    'mapped to it. Catches irrigation that ran and did nothing.',
   defaultSeverity: 'warning',
   /**
    * A situation: the same symptom has several causes needing different people, and
@@ -90,6 +149,14 @@ const rule: Rule = {
     responseWindowHours: 6,
     /** How far back to look for a trigger. */
     lookbackHours: 48,
+    /**
+     * Optional cross-device pairing: an object mapping a trigger DevEUI to the array
+     * of DevEUIs whose response it is judged on — `{ "<meter>": ["<probe>", …] }`,
+     * 16-digit hex. A mapped trigger is judged only on those devices and passes if
+     * any of them moved; unmapped triggers are judged on their own response path.
+     * null or {} pairs every trigger with itself.
+     */
+    responseDevices: null,
     /** Narrow this check to part of the fleet — see src/scope.ts. */
     ...SCOPE_PARAMS,
   },
@@ -105,6 +172,7 @@ const rule: Rule = {
     const minChange = num(ctx.params, 'minChange');
     const responseWindowHours = num(ctx.params, 'responseWindowHours');
     const lookbackHours = int(ctx.params, 'lookbackHours');
+    const responseDevices = parseResponseDevices(ctx.params.responseDevices);
 
     if (direction !== 'rising' && direction !== 'falling') {
       throw new Error(`direction must be "rising" or "falling" (got "${direction}")`);
@@ -122,7 +190,7 @@ const rule: Rule = {
     const scope = resolveScope(ctx.params);
     const rows = await triggerResponse(
       ctx, paths, responsePaths, lookbackHours, triggerDelta,
-      responseWindowHours, direction, scope,
+      responseWindowHours, direction, scope, responseDevices,
     );
 
     if (rows.length === 0) {
@@ -147,19 +215,39 @@ const rule: Rule = {
         (ctx.now.getTime() - new Date(r.triggeredAt).getTime()) / 3_600_000,
         1,
       );
+      // Name where the response was read when it is not the trigger device, since
+      // "soil.moisture only moved 0.3" on a flow meter is otherwise unreadable.
+      const where = r.paired
+        ? r.responses.length === 1
+          ? ` on ${r.responseDeviceName ?? r.responseDevEui}`
+          : ` on any of ${r.responses.length} response devices (best: ` +
+            `${r.responseDeviceName ?? r.responseDevEui})`
+        : '';
 
       findings.push({
         devEui: r.devEui,
         deviceName: r.deviceName,
         summary:
           `${name} ${r.triggerPath} advanced ${round(r.triggerDelta, 1)} ${hoursAgo}h ago ` +
-          `but ${r.responsePath} only moved ${round(moved, 2)} in ${responseWindowHours}h ` +
-          `(expected ${minChange})`,
+          `but ${r.responsePath}${where} only moved ${round(moved, 2)} in ` +
+          `${responseWindowHours}h (expected ${minChange})`,
         detail: {
           trigger: r.triggerPath,
           triggerDelta: round(r.triggerDelta, 3),
           triggeredAt: r.triggeredAt,
           response: r.responsePath,
+          responseDevice: r.responseDevEui,
+          responseDeviceName: r.responseDeviceName,
+          paired: r.paired,
+          responseDevices: r.responses.map((o) => ({
+            devEui: o.devEui,
+            deviceName: o.deviceName,
+            response: o.responsePath,
+            baseline: round(o.baseline, 3),
+            reached: round(o.extreme, 3),
+            moved: round(direction === 'rising' ? o.change : -o.change, 3),
+            responseSamples: o.responseSamples,
+          })),
           direction,
           baseline: round(r.baseline, 3),
           reached: round(r.extreme, 3),

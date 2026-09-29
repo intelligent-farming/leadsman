@@ -312,6 +312,26 @@ test('geofence-breach requires a complete fence definition', async () => {
   );
 });
 
+test('geofence-breach skips a (0, 0) "no fix" position itself, whatever the resolver returns', async () => {
+  // Regression M21. The resolver may also drop (0, 0), but the rule must not depend on
+  // it: a tracker waking indoors reports 0, 0, and that used to raise a critical breach
+  // ~10 000 km out. Stubbed rows, so this is the rule's guard alone.
+  const rule = loadRules().get('geofence-breach');
+  const debug = [];
+  const ctx = {
+    ...ctxFor(rule, { shape: 'box', north: 41.9, south: 41.8, east: -93.5, west: -93.7 }, [
+      { dev_eui: 'nofix', device_name: 'collar', lat: '0', lon: '0', at: '2026-08-05T00:00:00Z' },
+      { dev_eui: 'away', device_name: 'trailer', lat: '42.5', lon: '-93.6', at: '2026-08-05T00:00:00Z' },
+    ]),
+    log: { debug: (m, meta) => debug.push([m, meta]), info() {}, warn() {}, error() {} },
+  };
+  const found = await rule.run(ctx);
+  assert.deepEqual(found.map((f) => f.devEui), ['away'], 'a real breach still raises');
+  assert.equal(debug.length, 1);
+  assert.match(debug[0][0], /\(0, 0\) position/);
+  assert.equal(debug[0][1].devEui, 'nofix');
+});
+
 test('boolean-alarm requires at least one truthy value', async () => {
   const rule = loadRules().get('boolean-alarm');
   await assert.rejects(() => rule.run(ctxFor(rule, { trueValues: [] })), /non-empty array/);
@@ -454,10 +474,12 @@ test('counter-stalled flags a backwards counter as critical', async () => {
   const findings = await rule.run(
     ctxFor(rule, {}, [
       {
+        // counterWindows' row shape (src/counter.ts): step-aware, not just endpoints.
         dev_eui: 'aa', device_name: 'meter', matched_path: 'metering.water.total',
-        vmin: '120', vmax: '80000', vavg: '40060', vfirst: '80000', vlast: '120',
-        samples: '12', distinct_values: '2',
+        vfirst: '80000', vlast: '120', samples: '12',
         first_at: '2026-08-05T00:00:00.000Z', last_at: '2026-08-05T12:00:00.000Z',
+        rise: '0', drops: '1', max_drop: '79880', drop_from: '80000', drop_to: '120',
+        drop_at: '2026-08-05T08:00:00.000Z',
       },
     ]),
   );
@@ -581,6 +603,228 @@ test('rules either run on their own defaults or explain what configuration they 
   });
 });
 
+// ── soil-deficit-band ────────────────────────────────────────────────────────
+// A managed deficit is a band the block lives in, and both ways out are faults with
+// opposite remedies. These pin the classification, because getting it backwards
+// tells a grower to add water to a block that is already being over-irrigated.
+
+/** One residency row in the shape bandResidency's SQL returns. */
+function residencyRow(over = {}) {
+  return {
+    dev_eui: 'aa11bb22cc33dd44',
+    device_name: 'block-7',
+    matched_path: 'soil.moisture',
+    hours_below: '0', hours_in: '0', hours_above: '0', gap_hours: '0',
+    vmin: '10', vmax: '30', vavg: '20.0000',
+    last_value: '15', last_state: 'below',
+    last_at: '2026-09-24T06:00:00.000Z',
+    samples: '72',
+    ...over,
+  };
+}
+
+test('soil-deficit-band names under-watering when the time is all on one side', async () => {
+  const rule = loadRules().get('soil-deficit-band');
+  const findings = await rule.run(ctxFor(rule, { lookbackHours: 72 }, [
+    residencyRow({ hours_below: '45', hours_in: '25', hours_above: '0' }),
+  ]));
+
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].detail.pattern, 'below');
+  assert.match(findings[0].summary, /64% of the time below the 18% floor/);
+  assert.match(findings[0].summary, /block-7/);
+  assert.equal(findings[0].detail.hoursBelow, 45);
+});
+
+test('soil-deficit-band names over-watering as its own fault, not just "out of band"', async () => {
+  const rule = loadRules().get('soil-deficit-band');
+  const findings = await rule.run(ctxFor(rule, { lookbackHours: 72 }, [
+    residencyRow({ hours_below: '0', hours_in: '20', hours_above: '50',
+                   last_value: '31', last_state: 'above' }),
+  ]));
+  assert.equal(findings[0].detail.pattern, 'above');
+  assert.match(findings[0].summary, /above the 28% ceiling/);
+});
+
+test('soil-deficit-band calls out oscillation, where more water makes it worse', async () => {
+  // The case an operator most often corrects backwards. Same total time out of band
+  // as the under-watered block above, opposite remedy.
+  const rule = loadRules().get('soil-deficit-band');
+  const findings = await rule.run(ctxFor(rule, { lookbackHours: 72 }, [
+    residencyRow({ hours_below: '24', hours_in: '22', hours_above: '24' }),
+  ]));
+
+  assert.equal(findings[0].detail.pattern, 'oscillating');
+  assert.match(findings[0].summary, /swinging across the band/);
+  assert.match(findings[0].summary, /sets too large and too far apart/);
+});
+
+test('soil-deficit-band stays quiet for a block inside its band', async () => {
+  const rule = loadRules().get('soil-deficit-band');
+  assert.deepEqual(
+    await rule.run(ctxFor(rule, { lookbackHours: 72 }, [
+      residencyRow({ hours_below: '4', hours_in: '66', hours_above: '0',
+                     last_value: '22', last_state: 'in' }),
+    ])),
+    [], '6% out of band is inside the 25% tolerance',
+  );
+});
+
+test('soil-deficit-band refuses to judge a block that barely reported', async () => {
+  // A block that reported for six hours of three days has demonstrated nothing about
+  // its deficit, and saying nothing beats guessing from it.
+  const rule = loadRules().get('soil-deficit-band');
+  const lines = [];
+  const ctx = {
+    ...ctxFor(rule, { lookbackHours: 72, minCoverage: 0.6 }, [
+      residencyRow({ hours_below: '6', hours_in: '0', hours_above: '0', gap_hours: '60' }),
+    ]),
+    log: { debug() {}, info() {}, warn: (m) => lines.push(m), error() {} },
+  };
+
+  assert.deepEqual(await ctx && await rule.run(ctx), []);
+  assert.equal(lines.length, 1);
+  assert.match(lines[0], /currently measuring nothing/);
+});
+
+test('soil-deficit-band holds an open alert below the raise line', async () => {
+  const rule = loadRules().get('soil-deficit-band');
+  // 22% out of band: under the 25% raise line, over the 25-5=20% clear line.
+  const rows = [residencyRow({ hours_below: '16', hours_in: '56', hours_above: '0' })];
+  const params = { lookbackHours: 72, maxOutOfBandFraction: 0.25, clearMarginFraction: 0.05 };
+
+  assert.deepEqual(await rule.run(ctxFor(rule, params, rows)), [], 'must not raise at 22%');
+  assert.equal(
+    (await rule.run({ ...ctxFor(rule, params, rows), openDevEuis: new Set(['aa11bb22cc33dd44']) })).length,
+    1, 'an open alert stays open at 22%',
+  );
+});
+
+test('soil-deficit-band adds depletion only when both soil constants are given', async () => {
+  const rule = loadRules().get('soil-deficit-band');
+  const rows = [residencyRow({ hours_below: '45', hours_in: '25', last_value: '15' })];
+
+  const plain = await rule.run(ctxFor(rule, { lookbackHours: 72 }, rows));
+  assert.equal('depletionFraction' in plain[0].detail, false);
+
+  // FC 32, PWP 12 → TAW 20. At 15 % VWC that is (32-15)/20 = 0.85 depleted.
+  const enriched = await rule.run(ctxFor(rule, {
+    lookbackHours: 72, fieldCapacity: 32, wiltingPoint: 12,
+  }, rows));
+  assert.equal(enriched[0].detail.depletionFraction, 0.85);
+  assert.equal(enriched[0].detail.floorDepletion, 0.7, 'the 18% floor is 70% depleted');
+  assert.match(enriched[0].summary, /85% depletion/);
+});
+
+test('soil-deficit-band refuses configurations that can never mean anything', async () => {
+  const rule = loadRules().get('soil-deficit-band');
+  await assert.rejects(
+    () => rule.run(ctxFor(rule, { floor: 28, ceiling: 18 })), /must be below ceiling/);
+  await assert.rejects(
+    () => rule.run(ctxFor(rule, { floor: 20, ceiling: 20 })), /must be below ceiling/);
+  await assert.rejects(
+    () => rule.run(ctxFor(rule, { maxOutOfBandFraction: 1 })), /could ever raise/);
+  // One soil constant alone cannot produce a depletion fraction, and silently
+  // ignoring the half-configured pair would hide the mistake.
+  await assert.rejects(
+    () => rule.run(ctxFor(rule, { fieldCapacity: 32 })), /must be set together/);
+  await assert.rejects(
+    () => rule.run(ctxFor(rule, { fieldCapacity: 12, wiltingPoint: 32 })),
+    /must be above wiltingPoint/);
+});
+
+// ── fact-pass regressions: validation and judgement on stub rows ─────────────
+
+test('M19 soil-deficit-band refuses minCoverage 0, which judged 0/0 as NaN%', async () => {
+  const rule = loadRules().get('soil-deficit-band');
+  await assert.rejects(() => rule.run(ctxFor(rule, { minCoverage: 0 })), /above 0/);
+  // Covered time of zero is never judged, whatever the coverage setting.
+  const findings = await rule.run(ctxFor(rule, { lookbackHours: 72, minCoverage: 0.01 }, [
+    residencyRow({ hours_below: '0', hours_in: '0', hours_above: '0' }),
+  ]));
+  assert.deepEqual(findings, []);
+});
+
+test('L7 soil-deficit-band: clearMarginFraction must be strictly less than the raise line', async () => {
+  const rule = loadRules().get('soil-deficit-band');
+  await assert.rejects(
+    () => rule.run(ctxFor(rule, { maxOutOfBandFraction: 0.25, clearMarginFraction: 0.25 })),
+    /less than maxOutOfBandFraction/,
+  );
+  await assert.doesNotReject(
+    () => rule.run(ctxFor(rule, { maxOutOfBandFraction: 0.25, clearMarginFraction: 0.24 })),
+  );
+});
+
+test('L8 soil-deficit-band: the summary says the fraction is of OBSERVED time', async () => {
+  const rule = loadRules().get('soil-deficit-band');
+  const [f] = await rule.run(ctxFor(rule, { lookbackHours: 72 }, [
+    residencyRow({ hours_below: '45', hours_in: '25', hours_above: '0' }),
+  ]));
+  assert.match(f.summary, /for 64% of the observed 70h of the 72h window/);
+  assert.equal(f.detail.observedHours, 70);
+});
+
+/** One accumulation row in the shape windowAccumulation's SQL returns. */
+function accumulationRow(over = {}) {
+  return {
+    dev_eui: 'aa11bb22cc33dd44', device_name: 'gauge-1', matched_path: 'rain.total',
+    total: '0', samples: '12', covered_hours: '24', gap_hours: '0',
+    vmin: '0', vmax: '1', first_at: '2026-09-24T00:00:00.000Z',
+    last_at: '2026-09-25T00:00:00.000Z',
+    ...over,
+  };
+}
+
+test('M17 measurement-accumulation applies minCoverage to method "sum" too', async () => {
+  // A gauge that reported for 3h of 24 has not measured a day's rain.
+  const rule = loadRules().get('measurement-accumulation');
+  const params = { method: 'sum', scale: 1, base: null, min: 5, unit: ' mm', minCoverage: 0.8 };
+  const thin = await rule.run(ctxFor(rule, params, [
+    accumulationRow({ total: '1', covered_hours: '3', gap_hours: '21' }),
+  ]));
+  assert.deepEqual(thin, []);
+  const covered = await rule.run(ctxFor(rule, params, [accumulationRow({ total: '1' })]));
+  assert.equal(covered.length, 1, 'a fully covered short total still fires');
+});
+
+test('M18 measurement-accumulation judges the coverage-projected total, both ways', async () => {
+  const rule = loadRules().get('measurement-accumulation');
+  // 8 GDD observed over 0.8 of the window is 10 at full coverage — on target.
+  const row = accumulationRow({ total: '192', covered_hours: '19.2', gap_hours: '4.8' });
+  assert.deepEqual(await rule.run(ctxFor(rule, { min: 10 }, [row])), []);
+
+  // And over a limit by projection, even though the observed total is under it.
+  const [f] = await rule.run(ctxFor(rule, { max: 9 }, [row]));
+  assert.ok(Math.abs(f.detail.projectedTotal - 10) < 0.001);
+  assert.ok(Math.abs(f.detail.observedTotal - 8) < 0.001);
+  assert.equal(f.detail.coverage, 0.8);
+  assert.match(f.summary, /8 GDD observed over 80% of the window, projected to full coverage/);
+
+  await assert.rejects(() => rule.run(ctxFor(rule, { min: 1, minCoverage: 0 })), /above 0/);
+});
+
+test('M2 measurement-threshold validates maxGapMinutes', async () => {
+  const rule = loadRules().get('measurement-threshold');
+  await assert.rejects(
+    () => rule.run(ctxFor(rule, { min: 1, sustainMinutes: 30, maxGapMinutes: 0 })),
+    /maxGapMinutes must be positive/,
+  );
+  assert.equal(rule.defaultParams.maxGapMinutes, 90);
+});
+
+test('H10 response-missing validates the responseDevices map', async () => {
+  const rule = loadRules().get('response-missing');
+  const run = (responseDevices) => rule.run(ctxFor(rule, { responseDevices }));
+  await assert.rejects(() => run(['a840410001810001']), /must be an object/);
+  await assert.rejects(() => run({ meter: ['a840410001810002'] }), /key "meter" is not a 16-digit hex/);
+  await assert.rejects(() => run({ a840410001810001: 'a840410001810002' }), /non-empty array/);
+  await assert.rejects(() => run({ a840410001810001: [] }), /non-empty array/);
+  await assert.rejects(() => run({ a840410001810001: ['zz40410001810002'] }), /\[0\] is not a 16-digit hex/);
+  await assert.doesNotReject(() => run({ A840410001810001: ['a840410001810002'] }));
+  await assert.doesNotReject(() => run(null));
+});
+
 // ── lintConfig / leadsman lint ───────────────────────────────────────────────
 // The database-free half of verify. It exists because a config file is the part of
 // a deployment most likely to be hand-edited and least likely to be tested, and
@@ -629,8 +873,8 @@ test('lint catches an unknown rule and a typo\'d parameter', async () => {
   });
   assert.match(messages(problems).join('\n'), /error checks\.ghost: unknown rule/);
   // A typo'd parameter silently falls back to the default, which looks like the
-  // check "not working" for weeks.
-  assert.match(messages(problems).join('\n'), /warning checks\.typo\.params: "lookbackHrs"/);
+  // check "not working" for weeks — so it fails lint rather than warning.
+  assert.match(messages(problems).join('\n'), /error checks\.typo\.params: "lookbackHrs"/);
 });
 
 test('lint reports a rule whose prerequisites this config cannot supply', async () => {
@@ -935,7 +1179,7 @@ test('every rule declares a routing class, and situations stay a small set', () 
   // which are in the event store. See the rule header.
   assert.deepEqual(situations.sort(), [
     'device-silent', 'geofence-breach', 'join-churn', 'measurement-outlier',
-    'mold-risk', 'response-missing',
+    'mold-risk', 'response-missing', 'soil-deficit-band',
   ]);
 });
 
@@ -1472,7 +1716,8 @@ test('gateway-time-unsynced ignores a gateway that never reported a timestamp', 
   const never = stubCtx({
     params: { ...rule.defaultParams },
     query: async () => [{
-      gateway_id: 'aaaa000000000001', receptions: '900', timestamped: '0',
+      gateway_id: 'aaaa000000000001', receptions: '900', timestamped: '0', gps_timed: '0',
+      history_timestamped: '0', history_gps_timed: '0', skew_compared: '0', skew_vs_ns: '0',
       max_skew: null, avg_skew: null, last_seen: '2026-09-09T07:00:00.000Z',
     }],
   });
@@ -1482,7 +1727,8 @@ test('gateway-time-unsynced ignores a gateway that never reported a timestamp', 
   const lost = stubCtx({
     params: { ...rule.defaultParams },
     query: async () => [{
-      gateway_id: 'aaaa000000000001', receptions: '900', timestamped: '90',
+      gateway_id: 'aaaa000000000001', receptions: '900', timestamped: '90', gps_timed: '0',
+      history_timestamped: '2000', history_gps_timed: '0', skew_compared: '0', skew_vs_ns: '0',
       max_skew: null, avg_skew: null, last_seen: '2026-09-09T07:00:00.000Z',
     }],
   });
@@ -1497,6 +1743,7 @@ test('gateway-redundancy-lost only reports a decline, never a site that never ha
   const row = (over) => ({
     dev_eui: 'a84041000181d9e2',
     device_name: 'soil-north-01',
+    historical_level: '3',
     historical_max: '3',
     recent_max: '1',
     recent_uplinks: '200',
@@ -1513,7 +1760,7 @@ test('gateway-redundancy-lost only reports a decline, never a site that never ha
   // A single-gateway deployment: never had redundancy, so has not lost any.
   const alwaysOne = stubCtx({
     params: { ...rule.defaultParams },
-    query: async () => [row({ historical_max: '1' })],
+    query: async () => [row({ historical_level: '1' })],
   });
   assert.deepEqual(await rule.run(alwaysOne), []);
 });
@@ -1903,6 +2150,76 @@ test('measurement-derived skips a pair whose formula cannot produce a number', a
     secondary_value: '50', at: '2026-09-22T12:00:00.000Z',
   }]));
   assert.deepEqual(findings, []);
+});
+
+test('M16 measurement-derived skips out-of-range humidity instead of clamping it', async () => {
+  // 250 % RH used to clamp to 100 and compute as saturated air: vpd 0, delta-T 0 and
+  // dew point = T, so each of these low-bound checks fired on a sensor fault.
+  const rule = loadRules().get('measurement-derived');
+  const row = (t, rh, tp = 'air.temperature') => [{
+    dev_eui: 'aa', device_name: null, primary_path: tp,
+    secondary_path: 'air.relativeHumidity', primary_value: String(t),
+    secondary_value: String(rh), at: '2026-09-22T12:00:00.000Z',
+  }];
+  for (const [formula, bounds] of [
+    ['vpd', { min: 0.2, max: null }],
+    ['deltaT', { min: 2, max: null }],
+    ['dewPoint', { min: null, max: 15 }],
+    ['thi', { min: null, max: 60 }],
+    ['absoluteHumidity', { min: null, max: 5 }],
+  ]) {
+    for (const rh of [250, -5]) {
+      assert.deepEqual(
+        await rule.run(ctxFor(rule, { formula, ...bounds }, row(20, rh))), [],
+        `${formula} at ${rh} % RH must be skipped`,
+      );
+    }
+    // In range, the same bounds do fire — the skip is about the input, not the bound.
+    assert.equal(
+      (await rule.run(ctxFor(rule, { formula, ...bounds }, row(20, formula === 'vpd' || formula === 'deltaT' ? 100 : 80)))).length,
+      1, `${formula} must still fire on a valid pair`,
+    );
+  }
+  // Below absolute zero is outside the vocabulary's temperature range.
+  assert.deepEqual(await rule.run(ctxFor(rule, { formula: 'vpd', max: 0 }, row(-300, 50))), []);
+  // Exactly 0 % RH stays a valid input: the dew point log guard keeps it finite.
+  const dry = await rule.run(ctxFor(rule, { formula: 'dewPoint', max: 100 }, row(20, 0)));
+  assert.deepEqual(dry, []);
+  const dryLow = await rule.run(ctxFor(rule, { formula: 'dewPoint', min: -30, max: null }, row(20, 0)));
+  assert.equal(dryLow.length, 1);
+  assert.ok(Number.isFinite(dryLow[0].detail.value));
+});
+
+test('M6 lint: measurement rules refuse windows that can never fire', async () => {
+  const rules = loadRules();
+  const refuses = async (id, over, re) => {
+    const rule = rules.get(id);
+    await assert.rejects(() => rule.run(ctxFor(rule, over)), re, `${id} ${JSON.stringify(over)}`);
+  };
+  await refuses('measurement-rate', { minSpanHours: 10, lookbackHours: 6 }, /minSpanHours .* must be less than lookbackHours/);
+  await refuses('measurement-rate', { minSpanHours: 6, lookbackHours: 6 }, /minSpanHours/);
+  await refuses('measurement-rate', { lookbackHours: 0, minSpanHours: 0 }, /lookbackHours must be positive/);
+  for (const id of [
+    'measurement-peak', 'measurement-stuck', 'measurement-implausible', 'measurement-derived',
+    'measurement-threshold', 'battery-low', 'boolean-alarm',
+  ]) {
+    // A threshold needs a bound before it reaches the window check.
+    const base = id === 'measurement-threshold' ? { min: 1 } : {};
+    await refuses(id, { ...base, lookbackHours: 0 }, /lookbackHours must be positive/);
+    await refuses(id, { ...base, lookbackHours: -3 }, /lookbackHours must be positive/);
+  }
+  await refuses('measurement-missing', { recentHours: 0 }, /recentHours must be positive/);
+  // A sane combination still passes.
+  const rate = rules.get('measurement-rate');
+  await assert.doesNotReject(() => rate.run(ctxFor(rate, { minSpanHours: 1, lookbackHours: 6 })));
+});
+
+test('M4 vocabulary: exclusive schema bounds are carried, not dropped', () => {
+  const { VOCABULARY_RANGES } = require('../dist/vocabulary.js');
+  assert.deepEqual(VOCABULARY_RANGES.get('wind.direction'), [0, 360, { max: true }]);
+  // Inclusive rows stay plain pairs, and the vendored count is unchanged.
+  assert.deepEqual(VOCABULARY_RANGES.get('air.relativeHumidity'), [0, 100]);
+  assert.equal(VOCABULARY_RANGES.size, 73);
 });
 
 test('measurement-outlier refuses a group too small to have an odd one out', async () => {

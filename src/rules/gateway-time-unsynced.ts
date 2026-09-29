@@ -19,13 +19,23 @@
  * up from the cause, on the wrong devices, with no indication that a gateway's clock is
  * the reason.
  *
- * Two signals, either sufficient:
+ * Three signals, any one sufficient, reported in this order of precedence:
  *
- *   - the gateway stopped supplying a timestamp at all, having previously supplied one.
- *     `time_since_gps_epoch` is only present with a lock, which makes its disappearance
- *     the cleanest available evidence.
- *   - the timestamp it supplies has diverged from the network server's clock beyond a
- *     tolerance no propagation delay can explain.
+ *   - the gateway stopped supplying a timestamp at all, having supplied one within the
+ *     history window (`inventoryHours`).
+ *   - it still stamps receptions (from its own clock) but GPS time is gone.
+ *     `time_since_gps_epoch` / `timeSinceGpsEpoch` is only present with a lock, which
+ *     makes its disappearance the cleanest available evidence — so it is counted on its
+ *     own, and a gateway that carried it within the history window and has now mostly
+ *     lost it raises "GPS time lost" even though every reception still has a `gwTime`.
+ *   - the timestamp it supplies has diverged from the network server's clock (`nsTime`)
+ *     beyond a tolerance no propagation delay can explain.
+ *
+ * "Previously" is judged over `inventoryHours`, not over the evaluation window: judged
+ * inside the window, a gateway that stops stamping entirely looks like a model that never
+ * stamped once the window has rolled past the last good reception, and the alert would
+ * resolve while the gateway is still broken. The same inventory trade-off as
+ * gateway-silent applies — a fault older than `inventoryHours` is forgotten.
  *
  * Disabled by default, for an honest reason: which time fields ChirpStack's PostgreSQL
  * integration writes into `rx_info` varies with version and with the gateway's own
@@ -57,20 +67,35 @@ const rule: Rule = {
     /** Window to judge over. */
     lookbackHours: 24,
     /**
-     * Fraction of receptions that must carry a usable timestamp (0–1).
+     * History establishing whether the gateway has ever supplied a timestamp, and GPS time
+     * in particular. Must be at least `lookbackHours`.
+     *
+     * The "never supplied one" exemption below is judged over this window rather than the
+     * evaluation window, so a gateway that has stopped stamping stays in breach for this
+     * long instead of resolving one lookback after the fault began.
+     */
+    inventoryHours: 168,
+    /**
+     * Fraction of receptions that must carry a usable timestamp (0–1). Applied twice: to
+     * any timestamp, and to GPS time for a gateway that has carried GPS time within
+     * `inventoryHours`.
      *
      * Not 1.0: a gateway briefly losing lock as satellites move is normal, and a check
      * that fires on it would fire on every healthy gateway eventually.
      */
     minTimestampedRatio: 0.5,
     /**
-     * Divergence between the gateway's clock and the event time that counts as unsynced,
-     * in seconds.
+     * Divergence between the gateway's clock and the network server's that counts as
+     * unsynced, in seconds.
      *
-     * Generous on purpose. The comparison is against ChirpStack's own event timestamp,
-     * which includes network-server queueing and the write to Postgres, so a second or
-     * two of apparent skew is normal on a loaded box and means nothing. Ten seconds is
-     * past anything the pipeline can account for.
+     * The comparison is `gwTime` against rx_info's `nsTime` — the network server's own
+     * receive clock — which carries backhaul latency and gateway-bridge queueing, so a
+     * second or two of apparent skew is normal and means nothing; ten seconds is past
+     * anything the path can account for. A reception without `nsTime` falls back to
+     * `event_up.time`, which is a much weaker reference: ChirpStack v4 derives it from the
+     * gateway's own time whenever that is within `rx_timestamp_max_drift` (30 s by
+     * default), so against it drift under that bound reads as roughly zero. The alert
+     * detail says which reference was used.
      */
     maxSkewSeconds: 10,
     /** Ignore gateways with fewer receptions than this — too few to judge. */
@@ -82,6 +107,7 @@ const rule: Rule = {
 
   async run(ctx) {
     const lookbackHours = int(ctx.params, 'lookbackHours');
+    const inventoryHours = int(ctx.params, 'inventoryHours');
     const minTimestampedRatio = num(ctx.params, 'minTimestampedRatio');
     const maxSkewSeconds = num(ctx.params, 'maxSkewSeconds');
     const minReceptions = int(ctx.params, 'minReceptions');
@@ -89,35 +115,61 @@ const rule: Rule = {
     if (!(minTimestampedRatio > 0) || minTimestampedRatio > 1) {
       throw new Error(`minTimestampedRatio must be in (0, 1] (got ${minTimestampedRatio})`);
     }
+    if (inventoryHours < lookbackHours) {
+      throw new Error(
+        `inventoryHours (${inventoryHours}) must be at least lookbackHours (${lookbackHours}) — ` +
+          'it is the history the evaluation window is judged against',
+      );
+    }
 
     const scope = resolveGatewayScope(ctx.params);
-    const rows = await gatewayTimekeeping(ctx, lookbackHours, scope);
+    const rows = await gatewayTimekeeping(ctx, lookbackHours, inventoryHours, scope);
 
     const findings: Finding[] = [];
     for (const gw of rows) {
       if (gw.receptions < minReceptions) continue;
 
-      const ratio = gw.timestamped / gw.receptions;
-
       // A gateway that has never supplied a timestamp is not a gateway that lost its
       // lock — it is a model that does not report one, or a ChirpStack version that does
       // not store it. Reporting that as a fault would flag every gateway on such a
       // deployment, forever, which is exactly the false-positive this check must not have.
-      if (gw.timestamped === 0) {
+      // "Never" means across the whole history window, not just this one.
+      if (gw.historyTimestamped === 0) {
         ctx.log.debug('gateway supplies no reception timestamps at all — not a sync fault', {
           gateway: gw.gatewayId,
         });
         continue;
       }
 
-      const missing = ratio < minTimestampedRatio;
-      const skewed = gw.maxSkewSeconds !== null && gw.maxSkewSeconds > maxSkewSeconds;
-      if (!missing && !skewed) continue;
+      const ratio = gw.timestamped / gw.receptions;
+      const gpsRatio = gw.gpsTimed / gw.receptions;
 
+      const missing = ratio < minTimestampedRatio;
+      // Only a gateway that has had GPS time can lose it; one without a GPS receiver
+      // stamping from its clock alone is judged on skew.
+      const gpsLost = !missing && gw.historyGpsTimed > 0 && gpsRatio < minTimestampedRatio;
+      const skewed = gw.maxSkewSeconds !== null && gw.maxSkewSeconds > maxSkewSeconds;
+      if (!missing && !gpsLost && !skewed) continue;
+
+      const skewReference =
+        gw.skewCompared === 0
+          ? null
+          : gw.skewAgainstNsTime === gw.skewCompared
+            ? 'nsTime'
+            : gw.skewAgainstNsTime === 0
+              ? 'eventTime'
+              : 'mixed';
+
+      const pct = (x: number) => Math.round(x * 100);
       const reason = missing
-        ? `only ${Math.round(ratio * 100)}% of receptions carried a timestamp ` +
-          `(threshold ${Math.round(minTimestampedRatio * 100)}%)`
-        : `clock diverged by up to ${gw.maxSkewSeconds}s (threshold ${maxSkewSeconds}s)`;
+        ? `only ${pct(ratio)}% of receptions carried a timestamp ` +
+          `(threshold ${pct(minTimestampedRatio)}%), having carried one within ${inventoryHours}h`
+        : gpsLost
+          ? `GPS time lost — only ${pct(gpsRatio)}% of receptions carried GPS time ` +
+            `(threshold ${pct(minTimestampedRatio)}%), having carried it within ` +
+            `${inventoryHours}h; it is stamping from its own clock`
+          : `clock diverged by up to ${gw.maxSkewSeconds}s from the network server ` +
+            `(threshold ${maxSkewSeconds}s)`;
 
       findings.push({
         subject: gatewaySubject(gw.gatewayId),
@@ -128,15 +180,32 @@ const rule: Rule = {
           receptionsInWindow: gw.receptions,
           timestampedReceptions: gw.timestamped,
           timestampedRatio: Math.round(ratio * 1000) / 1000,
+          gpsTimedReceptions: gw.gpsTimed,
+          gpsTimedRatio: Math.round(gpsRatio * 1000) / 1000,
+          historyTimestampedReceptions: gw.historyTimestamped,
+          historyGpsTimedReceptions: gw.historyGpsTimed,
           maxSkewSeconds: gw.maxSkewSeconds,
           avgSkewSeconds: gw.avgSkewSeconds,
           thresholdSkewSeconds: maxSkewSeconds,
+          // What the skew was measured against. 'eventTime' (or 'mixed') means rx_info
+          // carried no nsTime for some receptions, and on those drift under ChirpStack's
+          // rx_timestamp_max_drift (30 s default) is invisible — see maxSkewSeconds.
+          skewReference,
+          ...(skewReference === 'eventTime' || skewReference === 'mixed'
+            ? {
+                skewReferenceNote:
+                  'no nsTime in rx_info for some receptions; skew there is against ' +
+                  'event_up.time, which ChirpStack derives from the gateway clock when ' +
+                  'within rx_timestamp_max_drift, so small drift reads as zero',
+              }
+            : {}),
           thresholdTimestampedRatio: minTimestampedRatio,
-          // Which of the two signals fired, since they point at slightly different
-          // things: a lost lock versus a drifting fallback clock.
-          trigger: missing ? 'missing-timestamps' : 'clock-skew',
+          // Which signal fired, since they point at different things: no timestamp at
+          // all, a lost GPS lock behind a still-running clock, or a drifting clock.
+          trigger: missing ? 'missing-timestamps' : gpsLost ? 'gps-time-lost' : 'clock-skew',
           lastSeenAt: gw.lastSeen,
           lookbackHours,
+          inventoryHours,
         },
       });
     }
