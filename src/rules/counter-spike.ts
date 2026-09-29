@@ -14,6 +14,11 @@
  *   pulse.total            raw pulses, when the meter's unit is unknown
  *
  * Rate is the advance across the window divided by its span, so it is an average.
+ * The advance is the sum of the upward steps (see src/counter.ts), not last − first:
+ * a burst followed by a meter reset — 100 → 5000 → 0 → 200 — has last − first of
+ * +100 and would pass as a quiet meter, while the 4900 that ran through it before the
+ * reset is exactly the water this check exists to notice. The drop itself contributes
+ * nothing to the rate, and counter-stalled reports it as a decrease.
  * That deliberately misses a brief spike and reliably catches sustained flow, which
  * is the failure that actually drains a tank overnight. For genuinely instantaneous
  * limits, threshold a flow field if the device provides one.
@@ -23,7 +28,8 @@
  */
 
 import { int, num, round } from '../params';
-import { pathsLabel, resolvePaths, windowStats } from '../measurement';
+import { counterWindows } from '../counter';
+import { pathsLabel, resolvePaths } from '../measurement';
 import { resolveScope, SCOPE_PARAMS } from '../scope';
 import type { Finding, Rule } from '../types';
 
@@ -69,7 +75,7 @@ const rule: Rule = {
     if (minSpanHours <= 0) throw new Error('minSpanHours must be positive');
 
     const scope = resolveScope(ctx.params);
-    const stats = await windowStats(ctx, paths, lookbackHours, null, scope);
+    const stats = await counterWindows(ctx, paths, lookbackHours, scope);
     if (stats.length === 0) {
       ctx.log.debug('no device reports any candidate path', { paths: pathsLabel(paths) });
       return [];
@@ -84,9 +90,10 @@ const rule: Rule = {
         (new Date(s.lastAt).getTime() - new Date(s.firstAt).getTime()) / 3_600_000;
       if (spanHours < minSpanHours) continue;
 
-      const advance = s.last - s.first;
-      // A decrease is a meter reset, not consumption — counter-stalled reports that.
-      if (advance < 0) continue;
+      // Upward steps only. A decrease is a meter reset, not consumption, so it neither
+      // cancels what ran through the meter before it nor counts as flow itself —
+      // counter-stalled reports the reset.
+      const advance = s.rise;
 
       const rate = advance / spanHours;
       if (rate <= maxRate) continue;
@@ -97,7 +104,8 @@ const rule: Rule = {
         deviceName: s.deviceName,
         summary:
           `${name} ${s.matchedPath} consuming ${round(rate, 1)}${unit}/h ` +
-          `(${round(advance, 1)}${unit} over ${round(spanHours, 1)}h, limit ${maxRate}${unit}/h)`,
+          `(${round(advance, 1)}${unit} over ${round(spanHours, 1)}h, limit ${maxRate}${unit}/h)` +
+          (s.drops > 0 ? ' — counted across a counter reset' : ''),
         detail: {
           measurement: s.matchedPath,
           ratePerHour: round(rate, 2),
@@ -106,6 +114,7 @@ const rule: Rule = {
           unit: unit || null,
           firstValue: round(s.first, 2),
           lastValue: round(s.last, 2),
+          drops: s.drops,
           spanHours: round(spanHours, 2),
           samples: s.samples,
           candidatePaths: pathsLabel(paths),

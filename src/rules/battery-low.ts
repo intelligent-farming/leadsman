@@ -67,6 +67,12 @@ const rule: Rule = {
     const criticalAt = optNum(ctx.params, 'criticalAtVolts');
     const lookbackHours = num(ctx.params, 'lookbackHours');
 
+    if (lookbackHours <= 0) {
+      throw new Error(
+        'lookbackHours must be positive — an empty window holds no readings, so this ' +
+          'check could never fire',
+      );
+    }
     if (clearAt < raiseAt) {
       throw new Error(
         `clearAtVolts (${clearAt}) must be >= raiseAtVolts (${raiseAt}); a clear ` +

@@ -33,14 +33,20 @@ LoRaWAN MAC layer, so it works on a device whose payload codec emits nothing at 
 
 One concept often spans several paths, because which one a device emits depends on
 what kind of sensor it is. Every check therefore takes a **priority-ordered list**,
-resolves the first path present *per device*, and ignores devices carrying none of
-them. So a single entry covers a mixed fleet:
+resolves the first path present *per device* — in the newest uplink that carries any
+candidate — and ignores devices carrying none of them. So a single entry covers a mixed fleet:
 
 ```json
 { "rule": "measurement-threshold", "as": "frost-risk",
   "params": { "paths": ["air.temperature", "temperature", "leaf.temperature"],
               "min": 1.5, "unit": "C" } }
 ```
+
+`measurement-implausible` enforces the **Range** column above. It is not configured per
+path: one config entry covers all 73 paths that carry a declared bound, reading them
+straight from the vocabulary schema. It is named in the Checks column wherever that
+column lists other checks, but its coverage is the Range column itself rather than that
+list — a path with a range is checked whether or not it is annotated here.
 
 Groupings worth knowing, since these are the ones that bite if you only list one:
 
@@ -50,6 +56,8 @@ Groupings worth knowing, since these are the ones that bite if you only list one
 | Level / fill | `tank.level`, `tank.volume`, `water.level`, `tank.distance`, `linear.position`, `analog.ratio` |
 | Supply voltage | `battery`, `power.voltage`, `analog.voltage` |
 | Moisture / wetness | `soil.moisture`, `leaf.wetness`, `air.relativeHumidity` |
+| Canopy wetness, for a disease model | `leaf.wetness`, `air.relativeHumidity` — one band cannot serve both, so give each its own `mold-risk` entry |
+| Accumulation inputs | `air.temperature` (degree days), `air.par` (light integral), `rain.intensity` (rainfall) — all via `measurement-accumulation`, and note `method` differs between a rate and a per-report quantity |
 | Pressure | `pressure.gauge`, `pressure.absolute`, `water.pressure`, `air.pressure`, `pressure.differential` |
 | Cumulative total | `metering.water.total`, `metering.energy.total`, `pulse.total`, `device.runtime` |
 | Asserted flag | `water.leak`, `air.gasAlarm`, `action.smoke.detected`, `action.motion.detected`, `action.switch.state`, `action.contactState` |
@@ -67,66 +75,66 @@ Groupings worth knowing, since these are the ones that bite if you only list one
 
 | Path | Type | Unit | Range | Checks |
 |---|---|---|---|---|
-| `battery` | number | V | ≥ 0 | `battery-low`, `measurement-threshold` |
+| `battery` | number | V | ≥ 0 | `battery-low`, `measurement-threshold`, `measurement-implausible` |
 
 ### `temperature`
 
 | Path | Type | Unit | Range | Checks |
 |---|---|---|---|---|
-| `temperature` | number | °C | ≥ -273.15 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
+| `temperature` | number | °C | ≥ -273.15 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `mold-risk` (as the gate), `measurement-implausible`, `measurement-derived` |
 
 ### `tank`
 
 | Path | Type | Unit | Range | Checks |
 |---|---|---|---|---|
-| `tank.distance` | number | m | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
-| `tank.level` | number | % | ≥ 0, ≤ 100 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
-| `tank.volume` | number | L | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
+| `tank.distance` | number | m | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
+| `tank.level` | number | % | ≥ 0, ≤ 100 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
+| `tank.volume` | number | L | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
 
 ### `soil`
 
 | Path | Type | Unit | Range | Checks |
 |---|---|---|---|---|
-| `soil.depth` | number | cm | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
-| `soil.moisture` | number | % | ≥ 0, ≤ 100 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
-| `soil.temperature` | number | °C | ≥ -273.15 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
-| `soil.ec` | number | dS/m | ≥ 0, ≤ 621 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
-| `soil.pH` | number | — | ≥ 0, ≤ 14 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
-| `soil.n` | number | ppm | ≥ 0, ≤ 1000000 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
-| `soil.p` | number | ppm | ≥ 0, ≤ 1000000 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
-| `soil.k` | number | ppm | ≥ 0, ≤ 1000000 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
+| `soil.depth` | number | cm | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
+| `soil.moisture` | number | % | ≥ 0, ≤ 100 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible`, `soil-deficit-band` |
+| `soil.temperature` | number | °C | ≥ -273.15 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
+| `soil.ec` | number | dS/m | ≥ 0, ≤ 621 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
+| `soil.pH` | number | — | ≥ 0, ≤ 14 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
+| `soil.n` | number | ppm | ≥ 0, ≤ 1000000 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
+| `soil.p` | number | ppm | ≥ 0, ≤ 1000000 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
+| `soil.k` | number | ppm | ≥ 0, ≤ 1000000 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
 
 ### `air`
 
 | Path | Type | Unit | Range | Checks |
 |---|---|---|---|---|
 | `air.location` | string | — | `indoor`, `outdoor` | — |
-| `air.temperature` | number | °C | ≥ -273.15 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
-| `air.relativeHumidity` | number | % | ≥ 0, ≤ 100 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
-| `air.pressure` | number | hPa | ≥ 900, ≤ 1100 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
-| `air.co2` | number | ppm | ≥ 0, ≤ 1000000 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
-| `air.lightIntensity` | number | lux | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
-| `air.pm1_0` | number | µg/m³ | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
-| `air.pm2_5` | number | µg/m³ | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
-| `air.pm10` | number | µg/m³ | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
-| `air.tvoc` | number | ppb | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
-| `air.iaqIndex` | number | 0-500 | ≥ 0, ≤ 500 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
-| `air.solarIrradiance` | number | W/m² | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
-| `air.par` | number | µmol/m²/s | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
+| `air.temperature` | number | °C | ≥ -273.15 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `mold-risk` (as the gate), `measurement-implausible`, `measurement-derived` |
+| `air.relativeHumidity` | number | % | ≥ 0, ≤ 100 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `mold-risk`, `measurement-implausible`, `measurement-derived` |
+| `air.pressure` | number | hPa | ≥ 900, ≤ 1100 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
+| `air.co2` | number | ppm | ≥ 0, ≤ 1000000 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
+| `air.lightIntensity` | number | lux | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
+| `air.pm1_0` | number | µg/m³ | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
+| `air.pm2_5` | number | µg/m³ | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
+| `air.pm10` | number | µg/m³ | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
+| `air.tvoc` | number | ppb | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
+| `air.iaqIndex` | number | 0-500 | ≥ 0, ≤ 500 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
+| `air.solarIrradiance` | number | W/m² | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
+| `air.par` | number | µmol/m²/s | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
 | `air.gasAlarm` | boolean | true = gas detected / abnormal | — | `boolean-alarm` |
 
 ### `wind`
 
 | Path | Type | Unit | Range | Checks |
 |---|---|---|---|---|
-| `wind.speed` | number | m/s | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
-| `wind.direction` | number | ° | ≥ 0, < 360 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
+| `wind.speed` | number | m/s | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
+| `wind.direction` | number | ° | ≥ 0, < 360 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
 
 ### `rain`
 
 | Path | Type | Unit | Range | Checks |
 |---|---|---|---|---|
-| `rain.intensity` | number | mm/hour | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
+| `rain.intensity` | number | mm/hour | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
 | `rain.cumulative` | number | mm | ≥ 0 | `counter-spike`, `measurement-missing` |
 
 ### `water`
@@ -134,17 +142,17 @@ Groupings worth knowing, since these are the ones that bite if you only list one
 | Path | Type | Unit | Range | Checks |
 |---|---|---|---|---|
 | `water.leak` | boolean | — | — | `boolean-alarm` |
-| `water.temperature.min` | number | °C | ≥ -273.15 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
-| `water.temperature.max` | number | °C | ≥ -273.15 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
-| `water.temperature.avg` | number | °C | ≥ -273.15 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
-| `water.temperature.current` | number | °C | ≥ -273.15 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
-| `water.level` | number | m | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
-| `water.pressure` | number | liquid | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
-| `water.ec` | number | µS/cm | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
-| `water.ph` | number | — | ≥ 0, ≤ 14 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
-| `water.turbidity` | number | NTU | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
-| `water.residualChlorine` | number | mg/L | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
-| `water.dissolvedOxygen` | number | mg/L | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
+| `water.temperature.min` | number | °C | ≥ -273.15 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
+| `water.temperature.max` | number | °C | ≥ -273.15 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
+| `water.temperature.avg` | number | °C | ≥ -273.15 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
+| `water.temperature.current` | number | °C | ≥ -273.15 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
+| `water.level` | number | m | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
+| `water.pressure` | number | liquid | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
+| `water.ec` | number | µS/cm | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
+| `water.ph` | number | — | ≥ 0, ≤ 14 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
+| `water.turbidity` | number | NTU | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
+| `water.residualChlorine` | number | mg/L | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
+| `water.dissolvedOxygen` | number | mg/L | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
 | `water.orp` | number | mV | — | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
 
 ### `metering`
@@ -159,13 +167,13 @@ Groupings worth knowing, since these are the ones that bite if you only list one
 | Path | Type | Unit | Range | Checks |
 |---|---|---|---|---|
 | `action.motion.detected` | boolean | — | — | `boolean-alarm` |
-| `action.motion.count` | number | count | ≥ 0 | `counter-stalled`, `counter-spike` |
+| `action.motion.count` | number | count | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
 | `action.contactState` | string | — | `open`, `closed` | `boolean-alarm` |
 | `action.occupancy.occupied` | boolean | true | — | `boolean-alarm` |
-| `action.occupancy.duration` | number | s | ≥ 0 | `counter-stalled`, `counter-spike` |
+| `action.occupancy.duration` | number | s | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
 | `action.button.pressed` | boolean | true | — | `boolean-alarm` |
 | `action.button.event` | string | — | `single`, `double`, `triple`, `long`, `hold`, `release` | — |
-| `action.button.count` | number | count | ≥ 0 | `counter-stalled`, `counter-spike` |
+| `action.button.count` | number | count | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
 | `action.smoke.detected` | boolean | true | — | `boolean-alarm` |
 | `action.switch.state` | boolean | true | — | `boolean-alarm` |
 
@@ -174,23 +182,23 @@ Groupings worth knowing, since these are the ones that bite if you only list one
 | Path | Type | Unit | Range | Checks |
 |---|---|---|---|---|
 | `pressure.gauge` | number | kPa | — | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
-| `pressure.absolute` | number | kPa | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
+| `pressure.absolute` | number | kPa | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
 | `pressure.differential` | number | Pa | — | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
 
 ### `vibration`
 
 | Path | Type | Unit | Range | Checks |
 |---|---|---|---|---|
-| `vibration.velocityRms` | number | mm/s | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
-| `vibration.accelerationRms` | number | g | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
-| `vibration.accelerationPeak` | number | g | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
-| `vibration.peakFrequency` | number | Hz | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
+| `vibration.velocityRms` | number | mm/s | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
+| `vibration.accelerationRms` | number | g | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
+| `vibration.accelerationPeak` | number | g | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
+| `vibration.peakFrequency` | number | Hz | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
 | `vibration.accelerationX` | number | g | — | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
 | `vibration.accelerationY` | number | g | — | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
 | `vibration.accelerationZ` | number | g | — | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
-| `vibration.velocityX` | number | mm/s | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
-| `vibration.velocityY` | number | mm/s | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
-| `vibration.velocityZ` | number | mm/s | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
+| `vibration.velocityX` | number | mm/s | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
+| `vibration.velocityY` | number | mm/s | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
+| `vibration.velocityZ` | number | mm/s | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
 
 ### `tilt`
 
@@ -205,19 +213,19 @@ Groupings worth knowing, since these are the ones that bite if you only list one
 
 | Path | Type | Unit | Range | Checks |
 |---|---|---|---|---|
-| `power.voltage` | number | V | ≥ 0 | `battery-low`, `measurement-threshold` |
-| `power.current` | number | A | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
+| `power.voltage` | number | V | ≥ 0 | `battery-low`, `measurement-threshold`, `measurement-implausible` |
+| `power.current` | number | A | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
 | `power.active` | number | W | — | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
-| `power.apparent` | number | VA | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
-| `power.factor` | number | -1..1 | ≥ -1, ≤ 1 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
-| `power.frequency` | number | Hz | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
+| `power.apparent` | number | VA | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
+| `power.factor` | number | -1..1 | ≥ -1, ≤ 1 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
+| `power.frequency` | number | Hz | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
 
 ### `leaf`
 
 | Path | Type | Unit | Range | Checks |
 |---|---|---|---|---|
-| `leaf.wetness` | number | % | ≥ 0, ≤ 100 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
-| `leaf.temperature` | number | °C | ≥ -273.15 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
+| `leaf.wetness` | number | % | ≥ 0, ≤ 100 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `mold-risk`, `measurement-implausible` |
+| `leaf.temperature` | number | °C | ≥ -273.15 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `mold-risk` (as the gate), `measurement-implausible`, `measurement-derived` |
 
 ### `device`
 
@@ -236,33 +244,33 @@ Groupings worth knowing, since these are the ones that bite if you only list one
 
 | Path | Type | Unit | Range | Checks |
 |---|---|---|---|---|
-| `analog.current` | number | mA | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
+| `analog.current` | number | mA | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
 | `analog.voltage` | number | V | — | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
-| `analog.ratio` | number | % | ≥ 0, ≤ 100 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
+| `analog.ratio` | number | % | ≥ 0, ≤ 100 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
 | `analog.raw` | number | — | — | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
 
 ### `pulse`
 
 | Path | Type | Unit | Range | Checks |
 |---|---|---|---|---|
-| `pulse.count` | number | count | ≥ 0 | `counter-stalled`, `counter-spike` |
+| `pulse.count` | number | count | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
 | `pulse.total` | number | count | ≥ 0 | `counter-stalled`, `counter-spike` |
 
 ### `people`
 
 | Path | Type | Unit | Range | Checks |
 |---|---|---|---|---|
-| `people.in` | number | count | ≥ 0 | `counter-stalled`, `counter-spike` |
-| `people.out` | number | count | ≥ 0 | `counter-stalled`, `counter-spike` |
+| `people.in` | number | count | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
+| `people.out` | number | count | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
 | `people.total` | number | in - out | — | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
-| `people.present` | number | count | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
+| `people.present` | number | count | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
 
 ### `hvac`
 
 | Path | Type | Unit | Range | Checks |
 |---|---|---|---|---|
-| `hvac.setpoint` | number | °C | ≥ -273.15 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
-| `hvac.valvePosition` | number | % | ≥ 0, ≤ 100 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
+| `hvac.setpoint` | number | °C | ≥ -273.15 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
+| `hvac.valvePosition` | number | % | ≥ 0, ≤ 100 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
 | `hvac.mode` | string | — | — | — |
 
 ### `sound`
@@ -283,7 +291,7 @@ Groupings worth knowing, since these are the ones that bite if you only list one
 
 | Path | Type | Unit | Range | Checks |
 |---|---|---|---|---|
-| `linear.position` | number | % | ≥ 0, ≤ 100 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
+| `linear.position` | number | % | ≥ 0, ≤ 100 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
 | `linear.displacement` | number | mm | — | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
 
 ## Device categories (37)

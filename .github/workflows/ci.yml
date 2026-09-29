@@ -46,8 +46,10 @@ jobs:
     runs-on: ubuntu-latest
     # The smoke suite covers config and rule-contract logic without a database.
     # This job is what actually validates the SQL: migrations apply, the partial
-    # unique index behaves, and every check's query runs against a ChirpStack-shaped
-    # event_up. A check whose SQL is subtly wrong passes unit tests and fails here.
+    # unique index behaves, the resolver/engine/rule suites exercise each check's SQL,
+    # and the checks listed in test/fixtures/integration.json run end to end against a
+    # ChirpStack-shaped event store. A check whose SQL is subtly wrong passes unit tests
+    # and fails here.
     services:
       postgres:
         image: postgres:16-alpine
@@ -98,7 +100,7 @@ jobs:
       - name: Resolver and engine tests
         env:
           LEADSMAN_TEST_DATABASE_URL: postgres://events:test@127.0.0.1:5432/chirpstack_events
-        run: node --test --test-reporter=spec test/resolver.js test/engine.js
+        run: node --test --test-reporter=spec test/resolver.js test/engine.js test/gateway.js test/network.js test/checks.js
 
       - name: Verify config and schema
         run: node dist/cli.js verify

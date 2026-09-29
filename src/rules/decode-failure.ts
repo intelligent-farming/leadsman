@@ -16,6 +16,13 @@
  *
  * Common causes: device onboarded before its codec existed, a codec-version rollback
  * that lost the decoder, or a firmware change altering the payload format.
+ *
+ * What the defaults actually ask: at least `minFailures` (5) undecoded uplinks AND at
+ * least half of the window's uplinks undecoded (`minFailureRatio` 0.5) raises a
+ * warning; essentially everything undecoded (≥ 99 %) escalates to critical. So a codec
+ * that decodes nothing is critical, and one that fails on most payloads — the
+ * signature of a firmware format change — is a warning. `minFailureRatio: 1` narrows
+ * the check to the decodes-nothing case alone.
  */
 
 import { int, num, round } from '../params';
@@ -34,9 +41,10 @@ interface Row {
 const rule: Rule = {
   id: 'decode-failure',
   description:
-    'Flags devices whose uplinks arrive with a NULL, JSON-null, or empty decoded ' +
-    'object, meaning the device profile has a missing or broken payload codec. Silent ' +
-    'under every other check, because the radio link is healthy.',
+    'Flags devices where at least half of the uplinks in the window (minFailureRatio) ' +
+    'arrive with a NULL, JSON-null, or empty decoded object — a missing, broken, or ' +
+    'outdated payload codec — escalating to critical when essentially all of them ' +
+    '(99 %) fail. Silent under every other check, because the radio link is healthy.',
   defaultSeverity: 'warning',
   /** Uplinks arriving, codec producing nothing. The fix is always the same: look at the
    *  device profile's payload codec.
@@ -48,9 +56,10 @@ const rule: Rule = {
     /** Need at least this many undecoded uplinks before alerting. */
     minFailures: 5,
     /**
-     * Fraction of uplinks in the window that must be undecoded (0–1). Set to 1 to
-     * alert only when nothing at all decodes; lower it to catch intermittent
-     * decoder failures on variable-format payloads.
+     * Fraction of uplinks in the window that must be undecoded (0–1). The default 0.5
+     * raises when at least half fail — a warning — and the finding escalates to
+     * critical at 99 %. Set to 1 to alert only when nothing at all decodes; lower it to
+     * catch intermittent decoder failures on variable-format payloads.
      */
     minFailureRatio: 0.5,
     /** Narrow this check to part of the fleet — see src/scope.ts. */
@@ -90,7 +99,7 @@ const rule: Rule = {
               count(*)                 AS total,
               max(time) FILTER (WHERE object IS NULL OR jsonb_typeof(object) = 'null' OR object = '{}'::jsonb) AS last_failure
          FROM event_up
-        WHERE time > now() - make_interval(hours => $1::int)
+        WHERE time > now() - make_interval(secs => $1::float8 * 3600)
           ${sc.sql}
         GROUP BY dev_eui
        HAVING count(*) FILTER (WHERE object IS NULL OR jsonb_typeof(object) = 'null' OR object = '{}'::jsonb) >= $2::int
@@ -116,7 +125,8 @@ const rule: Rule = {
           `${name}${profile}: ${failed} of ${total} uplinks did not decode ` +
           `(${round(ratio * 100, 0)}%) — check the payload codec`,
         // Nothing decoding at all is a provisioning error; partial failure is more
-        // likely a payload-format change worth looking at but not an outage.
+        // likely a payload-format change worth looking at but not an outage. 99 % rather
+        // than 100 % so one stray decodable frame in a day does not hide an outage.
         severity: ratio >= 0.99 ? 'critical' : undefined,
         detail: {
           deviceProfileName: row.device_profile_name,

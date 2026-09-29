@@ -18,7 +18,8 @@ const assert = require('node:assert/strict');
 const h = require('./helpers/db.js');
 const {
   latestReadings, latestBooleans, windowStats, pathPresence, latestCoordinates,
-  resolvePaths,
+  bandDwell, windowTrend, windowAccumulation, groupDeviation, triggerResponse,
+  booleanDwell, latestPairs, bandResidency, resolvePaths,
 } = require('../dist/measurement.js');
 const { resolveScope, ANY_DEVICE } = require('../dist/scope.js');
 
@@ -291,6 +292,896 @@ if (!h.available) {
     assert.deepEqual(presence.map((r) => r.devEui), ['aa']);
   });
 
+  // ── bandDwell: duration inside a band ───────────────────────────────────────
+  // This is the one resolver whose answer is a length of time rather than a value,
+  // and every case below distinguishes it from an aggregate that would look the same
+  // on a chart: total vs longest, broken vs unbroken, measured vs assumed.
+
+  /** Hourly humidity readings, most recent last. `null` means the uplink is missing. */
+  async function series(devEui, values, { gate = null, startMinutesAgo = null } = {}) {
+    const start = startMinutesAgo ?? values.length * 60;
+    for (let i = 0; i < values.length; i += 1) {
+      if (values[i] === null) continue;
+      const object = { air: { relativeHumidity: values[i] } };
+      if (gate !== null && gate[i] !== null && gate[i] !== undefined) {
+        object.air.temperature = gate[i];
+      }
+      await h.uplink(env.db, { devEui, minutesAgo: start - i * 60, object });
+    }
+  }
+
+  const RH = () => P('air.relativeHumidity');
+  const TEMP = { paths: [['air', 'temperature']], band: { min: 15, max: 25 } };
+
+  test('bandDwell: measures the run from first in-band sample to last', async () => {
+    // Four consecutive hourly readings in band span three hours, not four: the
+    // duration is what was measured, not what the sampling interval implies.
+    await series('aa', [70, 95, 95, 95, 95, 70]);
+    const rows = await bandDwell(h.ctx(env.store), RH(), { min: 90, max: null }, 24, 2);
+
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].hours, 3);
+    assert.equal(rows[0].samples, 4);
+    assert.equal(rows[0].max, 95);
+  });
+
+  test('bandDwell: returns the LONGEST run, not the total time in band', async () => {
+    // 2h + 4h. A sum would say six hours and report an infection that did not happen.
+    await series('aa', [95, 95, 95, 40, 95, 95, 95, 95, 95, 40]);
+    const rows = await bandDwell(h.ctx(env.store), RH(), { min: 90, max: null }, 24, 2);
+
+    assert.equal(rows[0].hours, 4, 'the second run, not the sum of both');
+  });
+
+  test('bandDwell: one out-of-band reading breaks the run', async () => {
+    await series('aa', [95, 95, 95, 40, 95, 95, 95]);
+    const rows = await bandDwell(h.ctx(env.store), RH(), { min: 90, max: null }, 24, 2);
+    assert.equal(rows[0].hours, 2);
+  });
+
+  test('bandDwell: a reporting gap longer than maxGapHours breaks the run', async () => {
+    // Readings 3, 4 and 5 never arrived. The canopy may have dried in that window and
+    // nothing in the store says otherwise, so the run cannot be bridged across it.
+    await series('aa', [95, 95, 95, null, null, null, 95, 95, 95]);
+
+    const broken = await bandDwell(h.ctx(env.store), RH(), { min: 90, max: null }, 24, 2);
+    assert.equal(broken[0].hours, 2, 'a 4h gap at maxGapHours=2 must split the run');
+
+    // The same data with a tolerant gap setting is one continuous run.
+    const bridged = await bandDwell(h.ctx(env.store), RH(), { min: 90, max: null }, 24, 6);
+    assert.equal(bridged[0].hours, 8);
+  });
+
+  test('bandDwell: a single in-band reading is zero hours, not one', async () => {
+    await series('aa', [40, 95, 40]);
+    const rows = await bandDwell(h.ctx(env.store), RH(), { min: 90, max: null }, 24, 2);
+    assert.equal(rows[0].hours, 0);
+    assert.equal(rows[0].samples, 1);
+  });
+
+  test('bandDwell: a device that never entered the band is reported with zero hours', async () => {
+    // Present-but-zero rather than absent: the caller has to be able to tell "nothing
+    // is at risk" from "nothing is being measured".
+    await series('aa', [40, 45, 50, 42]);
+    const rows = await bandDwell(h.ctx(env.store), RH(), { min: 90, max: null }, 24, 2);
+
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].hours, 0);
+    assert.equal(rows[0].samples, 0);
+    assert.equal(rows[0].startedAt, null);
+    assert.equal(rows[0].windowSamples, 4);
+  });
+
+  test('bandDwell: the gate excludes samples whose own uplink was out of range', async () => {
+    // Nine hours at 95% RH, but the first four were at 8C — the cold saturated night
+    // that a humidity-only check reports as an infection period and a grower ignores.
+    await series('aa', [95, 95, 95, 95, 95, 95, 95, 95, 95],
+      { gate: [8, 8, 8, 8, 18, 18, 18, 18, 18] });
+
+    const gated = await bandDwell(
+      h.ctx(env.store), RH(), { min: 90, max: null }, 24, 2, TEMP,
+    );
+    assert.equal(gated[0].hours, 4, 'only the warm half counts');
+    assert.equal(gated[0].gateMin, 18);
+    assert.equal(gated[0].gateMax, 18);
+
+    const ungated = await bandDwell(h.ctx(env.store), RH(), { min: 90, max: null }, 24, 2);
+    assert.equal(ungated[0].hours, 8, 'and without the gate the whole night counts');
+  });
+
+  test('bandDwell: a sample with no gate value at all does not count', async () => {
+    // The pairing is same-uplink, not nearest-in-time: a humidity reading with no
+    // temperature beside it is a moment nothing is known about.
+    await series('aa', [95, 95, 95, 95], { gate: [18, null, null, 18] });
+    const rows = await bandDwell(
+      h.ctx(env.store), RH(), { min: 90, max: null }, 24, 6, TEMP,
+    );
+
+    assert.equal(rows[0].hours, 0, 'two in-band samples three hours apart, each alone');
+    assert.equal(rows[0].gateSamples, 2);
+    assert.equal(rows[0].windowSamples, 4);
+  });
+
+  test('bandDwell: gateSamples is what tells a caller the gate blinded a device', async () => {
+    await series('aa', [95, 95, 95, 95]); // humidity only, no temperature ever
+    const rows = await bandDwell(
+      h.ctx(env.store), RH(), { min: 90, max: null }, 24, 2, TEMP,
+    );
+
+    assert.equal(rows[0].hours, 0);
+    assert.equal(rows[0].gateSamples, 0, 'zero coverage is the signal, not an empty result');
+    assert.equal(rows[0].windowSamples, 4);
+  });
+
+  test('bandDwell: endedAt equal to lastSampleAt is how "still ongoing" is known', async () => {
+    await series('aa', [40, 95, 95, 95]); // the run reaches the newest reading
+    const running = await bandDwell(h.ctx(env.store), RH(), { min: 90, max: null }, 24, 2);
+    // Compared as instants: pg returns timestamptz as a Date, and two Dates for the
+    // same moment are not the same object. A rule doing this with === never fires.
+    assert.equal(+new Date(running[0].endedAt), +new Date(running[0].lastSampleAt));
+
+    await h.reset(env.db);
+    await series('aa', [95, 95, 95, 40]); // it dried out an hour ago
+    const done = await bandDwell(h.ctx(env.store), RH(), { min: 90, max: null }, 24, 2);
+    assert.notEqual(+new Date(done[0].endedAt), +new Date(done[0].lastSampleAt));
+  });
+
+  test('bandDwell: a closed band excludes readings above it as well as below', async () => {
+    await series('aa', [88, 92, 92, 92, 99, 92]);
+    const rows = await bandDwell(h.ctx(env.store), RH(), { min: 90, max: 95 }, 24, 2);
+    assert.equal(rows[0].hours, 2, '99 breaks the run from above');
+  });
+
+  test('bandDwell: resolves path priority per device, like every other resolver', async () => {
+    await h.uplink(env.db, {
+      devEui: 'aa', minutesAgo: 120, object: { leaf: { wetness: 95 }, air: { relativeHumidity: 10 } },
+    });
+    await h.uplink(env.db, {
+      devEui: 'aa', minutesAgo: 60, object: { leaf: { wetness: 95 }, air: { relativeHumidity: 10 } },
+    });
+
+    const wetnessFirst = await bandDwell(
+      h.ctx(env.store), P('leaf.wetness', 'air.relativeHumidity'), { min: 90, max: null }, 24, 2,
+    );
+    assert.equal(wetnessFirst[0].matchedPath, 'leaf.wetness');
+    assert.equal(wetnessFirst[0].hours, 1);
+
+    const humidityFirst = await bandDwell(
+      h.ctx(env.store), P('air.relativeHumidity', 'leaf.wetness'), { min: 90, max: null }, 24, 2,
+    );
+    assert.equal(humidityFirst[0].matchedPath, 'air.relativeHumidity');
+    assert.equal(humidityFirst[0].hours, 0, 'the winning path never entered the band');
+  });
+
+  test('bandDwell: per-device runs do not leak across devices', async () => {
+    await series('aa', [95, 95, 95, 95]);
+    await series('bb', [95, 40, 95, 40]);
+    const rows = await bandDwell(h.ctx(env.store), RH(), { min: 90, max: null }, 24, 2);
+    const byDev = Object.fromEntries(rows.map((r) => [r.devEui, r.hours]));
+    assert.deepEqual(byDev, { aa: 3, bb: 0 });
+  });
+
+  test('bandDwell: honours the device scope', async () => {
+    for (const m of [240, 180, 120, 60]) {
+      await h.uplink(env.db, { devEui: 'aa', minutesAgo: m, profile: 'p1', object: { air: { relativeHumidity: 95 } } });
+      await h.uplink(env.db, { devEui: 'bb', minutesAgo: m, profile: 'p2', object: { air: { relativeHumidity: 95 } } });
+    }
+    const rows = await bandDwell(
+      h.ctx(env.store), RH(), { min: 90, max: null }, 24, 2, null,
+      resolveScope({ deviceProfiles: ['p1'] }),
+    );
+    assert.deepEqual(rows.map((r) => r.devEui), ['aa']);
+  });
+
+  test('bandDwell: readings older than the window are not part of any run', async () => {
+    // 48h of saturation, but a 6h window can only ever report 6h of it.
+    await series('aa', Array(48).fill(95));
+    const rows = await bandDwell(h.ctx(env.store), RH(), { min: 90, max: null }, 6, 2);
+    assert.ok(rows[0].hours <= 6, `expected at most 6h, got ${rows[0].hours}`);
+    assert.ok(rows[0].hours >= 4, `expected the window to be nearly full, got ${rows[0].hours}`);
+  });
+
+  // ── bandDwell: total mode ───────────────────────────────────────────────────
+
+  test('bandDwell: total mode adds every run, longest mode takes one', async () => {
+    // Two spells in band: 3 and 5 hourly readings, each followed by a dry reading. The
+    // two modes are two different agronomic questions and must not be interchangeable:
+    // an infection period wants the longest run (4h first-to-last), chill hours wants
+    // all of it — carried forward, each in-band reading banks the hour after it, 3 + 5.
+    await series('aa', [95, 95, 95, 40, 95, 95, 95, 95, 95, 40]);
+
+    const longest = await bandDwell(h.ctx(env.store), RH(), { min: 90, max: null }, 24, 2);
+    assert.equal(longest[0].hours, 4);
+
+    const total = await bandDwell(
+      h.ctx(env.store), RH(), { min: 90, max: null }, 24, 2, null, undefined, 'total',
+    );
+    assert.equal(total[0].hours, 8, 'both runs, added, each reading banking its hour');
+    assert.equal(total[0].samples, 8, 'and every in-band reading: 3 + 5');
+  });
+
+  test('bandDwell: total mode still reports the longest run timestamps', async () => {
+    // "When" has no meaning for a total, so the timestamps describe a real stretch
+    // rather than a span stitched together out of unrelated ones.
+    await series('aa', [95, 95, 40, 95, 95, 95, 95]);
+    const total = await bandDwell(
+      h.ctx(env.store), RH(), { min: 90, max: null }, 24, 2, null, undefined, 'total',
+    );
+    // 2h carried forward from the first spell; 3h plus the latest reading's hour up to
+    // now (it is 60 minutes old) from the second.
+    assert.ok(Math.abs(total[0].hours - 6) < 0.01, `2h + 4h, got ${total[0].hours}`);
+    const span =
+      (new Date(total[0].endedAt) - new Date(total[0].startedAt)) / 3_600_000;
+    assert.ok(Math.abs(span - 3) < 0.01, `timestamps span the longest run, got ${span}`);
+  });
+
+  // ── windowTrend: least squares ──────────────────────────────────────────────
+
+  test('windowTrend: recovers a known slope and reports a perfect fit', async () => {
+    // A clean 2 units/hour ramp, hourly.
+    for (let i = 0; i < 12; i += 1) {
+      await h.uplink(env.db, { devEui: 'aa', minutesAgo: (11 - i) * 60, object: { v: i * 2 } });
+    }
+    const [t] = await windowTrend(h.ctx(env.store), P('v'), 24);
+    assert.ok(Math.abs(t.slopePerHour - 2) < 0.01, `slope ${t.slopePerHour}`);
+    assert.ok(t.r2 > 0.999, `r2 ${t.r2}`);
+    assert.equal(t.samples, 12);
+  });
+
+  test('windowTrend: a bad endpoint cannot invent a trend the way endpoints can', async () => {
+    // Twelve flat readings and one corrupted final sample. The endpoint method reads
+    // this as a steep trend; the fit does not, and reports a fit nobody should trust.
+    for (let i = 0; i < 12; i += 1) {
+      await h.uplink(env.db, { devEui: 'aa', minutesAgo: (12 - i) * 60, object: { v: 50 } });
+    }
+    await h.uplink(env.db, { devEui: 'aa', minutesAgo: 0, object: { v: 120 } });
+
+    const [w] = await windowStats(h.ctx(env.store), P('v'), 24);
+    const endpointSlope = (w.last - w.first) /
+      ((new Date(w.lastAt) - new Date(w.firstAt)) / 3_600_000);
+    assert.ok(endpointSlope > 5, `endpoints read a steep trend: ${endpointSlope}/h`);
+
+    const [t] = await windowTrend(h.ctx(env.store), P('v'), 24);
+    assert.ok(t.slopePerHour < endpointSlope / 2, 'least squares is dragged far less');
+    assert.ok(t.r2 < 0.5, `and reports a fit nobody should believe: r2 ${t.r2}`);
+  });
+
+  test('windowTrend: a single reading produces no row rather than a zero slope', async () => {
+    await h.uplink(env.db, { devEui: 'aa', minutesAgo: 30, object: { v: 5 } });
+    assert.deepEqual(await windowTrend(h.ctx(env.store), P('v'), 24), []);
+  });
+
+  // ── windowAccumulation ──────────────────────────────────────────────────────
+
+  test('windowAccumulation: integral is the area, and base floors at zero', async () => {
+    // 6 hourly readings at 20 °C, base 10 → 10 degree-hours per hour over 5 spans.
+    for (let i = 0; i < 6; i += 1) {
+      await h.uplink(env.db, {
+        devEui: 'aa', minutesAgo: (5 - i) * 60, object: { air: { temperature: 20 } },
+      });
+    }
+    const [a] = await windowAccumulation(
+      h.ctx(env.store), P('air.temperature'), 24, 'integral', 10, 3,
+    );
+    assert.ok(Math.abs(a.total - 50) < 0.1, `50 degree-hours expected, got ${a.total}`);
+    assert.ok(Math.abs(a.coveredHours - 5) < 0.01);
+  });
+
+  test('windowAccumulation: hours below the base contribute nothing, not a negative', async () => {
+    // The degree-day definition. Cancelling cold hours against warm ones would make a
+    // frosty night erase a warm afternoon and report a crop as behind when it is not.
+    for (let i = 0; i < 5; i += 1) {
+      await h.uplink(env.db, {
+        devEui: 'aa', minutesAgo: (4 - i) * 60,
+        object: { air: { temperature: i < 2 ? 0 : 20 } },
+      });
+    }
+    const [a] = await windowAccumulation(
+      h.ctx(env.store), P('air.temperature'), 24, 'integral', 10, 3,
+    );
+    assert.ok(a.total > 0, `never negative, got ${a.total}`);
+    // Two hours at 0 °C contribute 0; the ramp and the warm hours contribute the rest.
+    assert.ok(a.total <= 25.1, `and no more than the warm hours justify, got ${a.total}`);
+  });
+
+  test('windowAccumulation: a gap contributes nothing and is reported as a gap', async () => {
+    // Holding the last value across a silent day would manufacture degree days out of
+    // a dead radio, and an index that counts its own outages is worse than none.
+    await h.uplink(env.db, { devEui: 'aa', minutesAgo: 600, object: { air: { temperature: 20 } } });
+    await h.uplink(env.db, { devEui: 'aa', minutesAgo: 540, object: { air: { temperature: 20 } } });
+    await h.uplink(env.db, { devEui: 'aa', minutesAgo: 60, object: { air: { temperature: 20 } } });
+    await h.uplink(env.db, { devEui: 'aa', minutesAgo: 0, object: { air: { temperature: 20 } } });
+
+    const [a] = await windowAccumulation(
+      h.ctx(env.store), P('air.temperature'), 24, 'integral', 10, 2,
+    );
+    assert.ok(Math.abs(a.coveredHours - 2) < 0.02, `two 1h spans, got ${a.coveredHours}`);
+    assert.ok(Math.abs(a.gapHours - 8) < 0.02, `and an 8h gap, got ${a.gapHours}`);
+    assert.ok(Math.abs(a.total - 20) < 0.2, `only the covered hours count, got ${a.total}`);
+  });
+
+  test('windowAccumulation: sum ignores time, which is why it is the wrong default', async () => {
+    // Same readings, twice the cadence. The integral is unchanged; the sum doubles.
+    for (let i = 0; i < 5; i += 1) {
+      await h.uplink(env.db, { devEui: 'aa', minutesAgo: (4 - i) * 60, object: { v: 10 } });
+    }
+    const [sparse] = await windowAccumulation(h.ctx(env.store), P('v'), 24, 'sum', null, 3);
+    const [sparseI] = await windowAccumulation(h.ctx(env.store), P('v'), 24, 'integral', null, 3);
+
+    await h.reset(env.db);
+    for (let i = 0; i < 9; i += 1) {
+      await h.uplink(env.db, { devEui: 'aa', minutesAgo: (8 - i) * 30, object: { v: 10 } });
+    }
+    const [dense] = await windowAccumulation(h.ctx(env.store), P('v'), 24, 'sum', null, 3);
+    const [denseI] = await windowAccumulation(h.ctx(env.store), P('v'), 24, 'integral', null, 3);
+
+    assert.equal(sparse.total, 50);
+    assert.equal(dense.total, 90, 'the sum scales with reporting cadence');
+    assert.ok(Math.abs(sparseI.total - denseI.total) < 0.2,
+      'the integral does not — 40 unit-hours either way');
+  });
+
+  // ── groupDeviation ──────────────────────────────────────────────────────────
+
+  /** n probes reading `values[i]`, six readings each. */
+  async function probes(values) {
+    for (let d = 0; d < values.length; d += 1) {
+      for (let k = 0; k < 6; k += 1) {
+        await h.uplink(env.db, {
+          devEui: `p${d}`, minutesAgo: k * 60, object: { soil: { moisture: values[d] } },
+        });
+      }
+    }
+  }
+
+  test('groupDeviation: finds the odd one out against the group median', async () => {
+    await probes([30, 31, 30, 29, 18]);
+    const rows = await groupDeviation(h.ctx(env.store), P('soil.moisture'), 24);
+    const odd = rows.find((r) => r.devEui === 'p4');
+    assert.equal(odd.groupMedian, 30);
+    assert.equal(odd.groupSize, 5);
+    assert.ok(odd.deviations < -3, `the dry probe is far out: ${odd.deviations}`);
+    for (const r of rows.filter((x) => x.devEui !== 'p4')) {
+      assert.ok(Math.abs(r.deviations) < 2, `${r.devEui} is not an outlier`);
+    }
+  });
+
+  test('groupDeviation: MAD does not let one bad sensor hide inside its own spread', async () => {
+    // The property standard deviation lacks. With six probes, one far-out reading
+    // inflates sigma enough to fall within two of them; the median absolute deviation
+    // does not move at all.
+    const values = [30, 30, 31, 30, 29, 80];
+    await probes(values);
+    const rows = await groupDeviation(h.ctx(env.store), P('soil.moisture'), 24);
+    const odd = rows.find((r) => r.devEui === 'p5');
+
+    const mean = values.reduce((a, b) => a + b, 0) / values.length;
+    const sd = Math.sqrt(values.reduce((a, b) => a + (b - mean) ** 2, 0) / values.length);
+    assert.ok(Math.abs(80 - mean) / sd < 2.3, 'under sigma it is barely an outlier');
+    assert.ok(odd.deviations > 20, `under MAD it is unmissable: ${odd.deviations}`);
+  });
+
+  test('groupDeviation: a perfectly uniform group yields null, not a division by zero', async () => {
+    await probes([30, 30, 30, 30]);
+    const rows = await groupDeviation(h.ctx(env.store), P('soil.moisture'), 24);
+    assert.ok(rows.every((r) => r.deviations === null), 'no spread means "cannot tell"');
+  });
+
+  // ── triggerResponse ─────────────────────────────────────────────────────────
+
+  /** A counter advancing at `minutesAgo`, with a response series around it. */
+  async function irrigation({ jump, moisture }) {
+    // moisture[i] pairs with hour i, counting back from 12h ago.
+    let total = 1000;
+    for (let i = 0; i < 12; i += 1) {
+      if (i === 4) total += jump;
+      await h.uplink(env.db, {
+        devEui: 'aa', deviceName: 'block-3', minutesAgo: (11 - i) * 60,
+        object: { metering: { water: { total } }, soil: { moisture: moisture[i] } },
+      });
+    }
+  }
+
+  test('triggerResponse: pairs a counter advance with what the response did after it', async () => {
+    await irrigation({ jump: 500, moisture: [20, 20, 20, 20, 20, 26, 28, 28, 27, 27, 26, 26] });
+    const [r] = await triggerResponse(
+      h.ctx(env.store), P('metering.water.total'), P('soil.moisture'), 48, 100, 6, 'rising',
+    );
+    assert.equal(r.triggerDelta, 500);
+    assert.equal(r.baseline, 20, 'the last reading at or before the trigger');
+    assert.equal(r.extreme, 28, 'and the furthest it got inside the window');
+    assert.equal(r.change, 8);
+  });
+
+  test('triggerResponse: an irrigation that did nothing shows no movement', async () => {
+    await irrigation({ jump: 500, moisture: Array(12).fill(20) });
+    const [r] = await triggerResponse(
+      h.ctx(env.store), P('metering.water.total'), P('soil.moisture'), 48, 100, 6, 'rising',
+    );
+    assert.equal(r.change, 0, 'the counter turned and the root zone never wetted');
+  });
+
+  test('triggerResponse: a trigger too recent to judge is not reported at all', async () => {
+    // Reporting an irrigation before the water could reach the probe is an alert
+    // guaranteed to be wrong rather than merely likely to be.
+    let total = 1000;
+    for (let i = 0; i < 6; i += 1) {
+      if (i === 5) total += 500;
+      await h.uplink(env.db, {
+        devEui: 'aa', minutesAgo: (5 - i) * 30,
+        object: { metering: { water: { total } }, soil: { moisture: 20 } },
+      });
+    }
+    assert.deepEqual(
+      await triggerResponse(
+        h.ctx(env.store), P('metering.water.total'), P('soil.moisture'), 48, 100, 6, 'rising',
+      ),
+      [], 'the 6h response window has not elapsed',
+    );
+  });
+
+  test('triggerResponse: an advance below the delta is not a trigger', async () => {
+    await irrigation({ jump: 20, moisture: Array(12).fill(20) });
+    assert.deepEqual(
+      await triggerResponse(
+        h.ctx(env.store), P('metering.water.total'), P('soil.moisture'), 48, 100, 6, 'rising',
+      ),
+      [], 'a 20-litre drift is not an irrigation',
+    );
+  });
+
+  // ── booleanDwell ────────────────────────────────────────────────────────────
+
+  /** A flag series, newest last. */
+  async function flags(values, gapMinutes = 30) {
+    for (let i = 0; i < values.length; i += 1) {
+      await h.uplink(env.db, {
+        devEui: 'aa', deviceName: 'coolroom', minutesAgo: (values.length - 1 - i) * gapMinutes,
+        object: { action: { contactState: values[i] ? 'open' : 'closed' } },
+      });
+    }
+  }
+  const TRUE = ['true', '1', 'open'];
+
+  test('booleanDwell: measures the CURRENT run, not the longest in the window', async () => {
+    // The door stood open for hours yesterday and is shut now. An alert engine
+    // answering "what is wrong at this moment" must not report that as a problem.
+    await flags([true, true, true, true, true, false, false, true]);
+    const [r] = await booleanDwell(h.ctx(env.store), P('action.contactState'), 24, TRUE, 2);
+    assert.equal(r.asserted, true);
+    assert.equal(r.hours, 0, 'one asserted reading in the current run');
+    assert.equal(r.samples, 1);
+  });
+
+  test('booleanDwell: a flag that is clear now reports zero however long it was set', async () => {
+    await flags([true, true, true, true, false]);
+    const [r] = await booleanDwell(h.ctx(env.store), P('action.contactState'), 24, TRUE, 2);
+    assert.equal(r.asserted, false);
+    assert.equal(r.hours, 0);
+    assert.equal(r.startedAt, null);
+  });
+
+  test('booleanDwell: an unbroken current run is measured end to end', async () => {
+    await flags([false, true, true, true, true, true], 30);
+    const [r] = await booleanDwell(h.ctx(env.store), P('action.contactState'), 24, TRUE, 2);
+    assert.equal(r.asserted, true);
+    assert.ok(Math.abs(r.hours - 2) < 0.02, `five readings 30 min apart = 2h, got ${r.hours}`);
+    assert.equal(r.samples, 5);
+  });
+
+  test('booleanDwell: a reporting gap breaks the run', async () => {
+    // The device was silent for three hours. It was not observed asserted throughout,
+    // whatever it said either side.
+    await h.uplink(env.db, { devEui: 'aa', minutesAgo: 300, object: { action: { contactState: 'open' } } });
+    await h.uplink(env.db, { devEui: 'aa', minutesAgo: 240, object: { action: { contactState: 'open' } } });
+    await h.uplink(env.db, { devEui: 'aa', minutesAgo: 60, object: { action: { contactState: 'open' } } });
+    await h.uplink(env.db, { devEui: 'aa', minutesAgo: 0, object: { action: { contactState: 'open' } } });
+
+    const [r] = await booleanDwell(h.ctx(env.store), P('action.contactState'), 24, TRUE, 2);
+    assert.ok(Math.abs(r.hours - 1) < 0.02, `only the run since the gap, got ${r.hours}`);
+  });
+
+  // ── latestPairs ─────────────────────────────────────────────────────────────
+
+  test('latestPairs: takes both values from ONE uplink, never across two', async () => {
+    // A temperature from 04:00 with a humidity from 16:00 gives a VPD that is
+    // arithmetically valid and physically meaningless.
+    await h.uplink(env.db, {
+      devEui: 'aa', minutesAgo: 120, object: { air: { temperature: 5, relativeHumidity: 95 } },
+    });
+    await h.uplink(env.db, {
+      devEui: 'aa', minutesAgo: 60, object: { air: { temperature: 30 } }, // humidity dropped
+    });
+
+    const [p] = await latestPairs(
+      h.ctx(env.store), P('air.temperature'), P('air.relativeHumidity'), 24,
+    );
+    assert.equal(p.primary, 5, 'the newest COMPLETE pair, not the newest uplink');
+    assert.equal(p.secondary, 95);
+  });
+
+  test('latestPairs: a device reporting only one of the two is absent', async () => {
+    await h.uplink(env.db, { devEui: 'aa', minutesAgo: 30, object: { air: { temperature: 20 } } });
+    assert.deepEqual(
+      await latestPairs(h.ctx(env.store), P('air.temperature'), P('air.relativeHumidity'), 24),
+      [],
+    );
+  });
+
+  test('latestPairs: both sides resolve by candidate priority, per device', async () => {
+    await h.uplink(env.db, {
+      devEui: 'aa', minutesAgo: 30, object: { air: { temperature: 20, relativeHumidity: 50 } },
+    });
+    await h.uplink(env.db, {
+      devEui: 'bb', minutesAgo: 30, object: { temperature: 25, air: { relativeHumidity: 40 } },
+    });
+    const rows = await latestPairs(
+      h.ctx(env.store), P('air.temperature', 'temperature'), P('air.relativeHumidity'), 24,
+    );
+    const byDev = Object.fromEntries(rows.map((r) => [r.devEui, r.primaryPath]));
+    assert.deepEqual(byDev, { aa: 'air.temperature', bb: 'temperature' });
+  });
+
+  // ── bandResidency ───────────────────────────────────────────────────────────
+  // The distinction the whole rule rests on: three blocks can break the same two
+  // bounds and need three different corrections. If residency cannot tell them
+  // apart, soil-deficit-band is just a threshold with extra steps.
+
+  /** Hourly soil-moisture readings, oldest first. */
+  async function moisture(devEui, values) {
+    for (let i = 0; i < values.length; i += 1) {
+      await h.uplink(env.db, {
+        devEui, minutesAgo: (values.length - 1 - i) * 60,
+        object: { soil: { moisture: values[i] } },
+      });
+    }
+  }
+  const SOIL = () => P('soil.moisture');
+
+  test('bandResidency: splits the window into below, in-band and above', async () => {
+    // 3 intervals below, 2 in band, 2 above. The last reading has no interval after
+    // it, so 8 readings account for 7 hours.
+    await moisture('aa', [10, 10, 10, 22, 22, 35, 35, 22]);
+    const [r] = await bandResidency(h.ctx(env.store), SOIL(), 18, 28, 24, 6);
+
+    assert.equal(r.hoursBelow, 3);
+    assert.equal(r.hoursInBand, 2);
+    assert.equal(r.hoursAbove, 2);
+    assert.equal(r.coveredHours, 7);
+    assert.equal(r.lastValue, 22);
+    assert.equal(r.lastState, 'in');
+  });
+
+  test('bandResidency: time is carried forward from each reading, not backward', async () => {
+    // One dry reading followed by an hour of silence then a wet one: the hour belongs
+    // to the DRY reading, because that is what was observed when it started.
+    await moisture('aa', [10, 35, 35]);
+    const [r] = await bandResidency(h.ctx(env.store), SOIL(), 18, 28, 24, 6);
+    assert.equal(r.hoursBelow, 1, 'the interval after the dry reading is dry time');
+    assert.equal(r.hoursAbove, 1);
+  });
+
+  test('bandResidency: separates under-watered from oscillating', async () => {
+    // Both blocks are out of band for the same share of the window, and they need
+    // opposite corrections: one needs more water, one needs smaller, more frequent
+    // sets. A min/max threshold reports these identically.
+    await moisture('dry', [10, 10, 10, 10, 10, 10, 22, 22]);
+    await moisture('swing', [10, 10, 10, 35, 35, 35, 22, 22]);
+    const rows = await bandResidency(h.ctx(env.store), SOIL(), 18, 28, 24, 6);
+    const by = Object.fromEntries(rows.map((r) => [r.devEui, r]));
+
+    assert.equal(by.dry.hoursBelow + by.dry.hoursAbove, 6);
+    assert.equal(by.swing.hoursBelow + by.swing.hoursAbove, 6, 'same total out of band');
+
+    assert.equal(by.dry.hoursAbove, 0, 'the dry block never went over');
+    assert.equal(by.swing.hoursBelow, 3);
+    assert.equal(by.swing.hoursAbove, 3, 'the swinging block split its time');
+  });
+
+  test('bandResidency: a gap is attributed to no state at all', async () => {
+    // A block that went quiet at 30 % and came back at 12 % was not observed at
+    // either value in between. Spreading the gap across a state would invent
+    // evidence for whichever side happened to bound it.
+    await h.uplink(env.db, { devEui: 'aa', minutesAgo: 600, object: { soil: { moisture: 35 } } });
+    await h.uplink(env.db, { devEui: 'aa', minutesAgo: 540, object: { soil: { moisture: 35 } } });
+    await h.uplink(env.db, { devEui: 'aa', minutesAgo: 60,  object: { soil: { moisture: 10 } } });
+    await h.uplink(env.db, { devEui: 'aa', minutesAgo: 0,   object: { soil: { moisture: 10 } } });
+
+    const [r] = await bandResidency(h.ctx(env.store), SOIL(), 18, 28, 24, 2);
+    assert.equal(r.hoursAbove, 1, 'only the observed hour above');
+    assert.equal(r.hoursBelow, 1);
+    assert.equal(r.gapHours, 8, 'the 8h silence belongs to neither side');
+    assert.equal(r.coveredHours, 2);
+  });
+
+  test('bandResidency: the boundary values are inside the band, not outside', async () => {
+    // Exactly on the floor or the ceiling is in band. An operator who sets floor 18
+    // means "18 is acceptable", and off-by-one here would report a block sitting
+    // precisely on target as failing.
+    await moisture('aa', [18, 28, 18, 28]);
+    const [r] = await bandResidency(h.ctx(env.store), SOIL(), 18, 28, 24, 6);
+    assert.equal(r.hoursBelow, 0);
+    assert.equal(r.hoursAbove, 0);
+    assert.equal(r.hoursInBand, 3);
+  });
+
+  test('bandResidency: reports the current state, which drives the summary', async () => {
+    await moisture('aa', [10, 10, 10, 10, 22]);
+    const [back] = await bandResidency(h.ctx(env.store), SOIL(), 18, 28, 24, 6);
+    assert.equal(back.lastState, 'in', 'recovered by the latest reading');
+
+    await h.reset(env.db);
+    await moisture('bb', [22, 22, 10, 10, 10]);
+    const [still] = await bandResidency(h.ctx(env.store), SOIL(), 18, 28, 24, 6);
+    assert.equal(still.lastState, 'below', 'still out of band now');
+  });
+
+  test('bandResidency: honours the device scope, so one instance is one block', async () => {
+    for (const m of [240, 180, 120, 60]) {
+      await h.uplink(env.db, { devEui: 'aa', minutesAgo: m, profile: 'block-7', object: { soil: { moisture: 10 } } });
+      await h.uplink(env.db, { devEui: 'bb', minutesAgo: m, profile: 'block-9', object: { soil: { moisture: 10 } } });
+    }
+    const rows = await bandResidency(
+      h.ctx(env.store), SOIL(), 18, 28, 24, 6, resolveScope({ deviceProfiles: ['block-7'] }),
+    );
+    assert.deepEqual(rows.map((r) => r.devEui), ['aa']);
+  });
+
+  // ── fact-pass regressions: dwell, sustain, accumulation, outlier, pairing ─────
+
+  /** A rule and a live context over the scratch store, with its defaults applied. */
+  function liveRule(id, params = {}, openDevEuis = new Set()) {
+    const { loadRules } = require('../dist/registry.js');
+    const rule = loadRules().get(id);
+    return [rule, h.ctx(env.store, {
+      params: { ...rule.defaultParams, ...params }, kind: id, openDevEuis,
+    })];
+  }
+
+  /** Hourly temperature readings on one device; the last value is `endMinutesAgo` old. */
+  async function temps(devEui, values, endMinutesAgo = 0) {
+    for (let i = 0; i < values.length; i += 1) {
+      if (values[i] === null) continue;
+      await h.uplink(env.db, {
+        devEui, minutesAgo: endMinutesAgo + (values.length - 1 - i) * 60,
+        object: { air: { temperature: values[i] } },
+      });
+    }
+  }
+
+  const FROST = { paths: ['air.temperature'], min: 1.5, max: null, sustainMinutes: 30 };
+
+  test('H1 bandDwell: current mode is the run that includes the latest reading', async () => {
+    // A 3h run yesterday, then warm, then one in-band reading now. The longest run is
+    // 3h; the CURRENT run is the single reading at the end.
+    await temps('aa', [-1, -1, -1, -1, ...Array(17).fill(10), -5]);
+    const band = { min: null, max: 1.5, strict: true };
+    const [longest] = await bandDwell(h.ctx(env.store), P('air.temperature'), band, 24, 1.5);
+    assert.equal(longest.hours, 3);
+    const [current] = await bandDwell(
+      h.ctx(env.store), P('air.temperature'), band, 24, 1.5, null, undefined, 'current',
+    );
+    assert.equal(current.hours, 0);
+    assert.equal(current.samples, 1);
+
+    // And a latest reading out of band means no current run at all.
+    await h.reset(env.db);
+    await temps('aa', [-1, -1, -1, 10]);
+    const [none] = await bandDwell(
+      h.ctx(env.store), P('air.temperature'), band, 24, 1.5, null, undefined, 'current',
+    );
+    assert.equal(none.hours, 0);
+    assert.equal(none.samples, 0);
+    assert.equal(none.startedAt, null);
+  });
+
+  test('H1 measurement-threshold: an old breach cannot vouch for a spike now', async () => {
+    // 3h at -1 C yesterday, 17h at 10 C, then one corrupt -5 now.
+    await temps('aa', [-1, -1, -1, -1, ...Array(17).fill(10), -5]);
+    const [rule, ctx] = liveRule('measurement-threshold', FROST);
+    assert.deepEqual(await rule.run(ctx), [], 'a single-sample breach must not raise');
+  });
+
+  test('H1 measurement-threshold: only the side the latest reading broke is measured', async () => {
+    // Six hours above max, then one reading below min. The above-max run was long,
+    // but it is not the breach being reported.
+    await temps('aa', [40, 40, 40, 40, 40, 40, -5]);
+    const [rule, ctx] = liveRule('measurement-threshold', { ...FROST, max: 35 });
+    assert.deepEqual(await rule.run(ctx), []);
+  });
+
+  test('H1 measurement-threshold: a breach that has held up to now still raises', async () => {
+    await temps('aa', [10, 10, 1, 0.5, 0.2]);
+    const [rule, ctx] = liveRule('measurement-threshold', FROST);
+    const found = await rule.run(ctx);
+    assert.equal(found.length, 1);
+    assert.equal(found[0].detail.sustainedMinutes, 120);
+  });
+
+  test('M1 measurement-threshold: readings exactly on the bound are not in breach', async () => {
+    // 3h resting on 1.5 exactly, then one 1.4. The breach test is strict, so the
+    // sustain run must be too: one breaching sample, not three hours.
+    await temps('aa', [1.5, 1.5, 1.5, 1.5, 1.4]);
+    const [rule, ctx] = liveRule('measurement-threshold', FROST);
+    assert.deepEqual(await rule.run(ctx), []);
+  });
+
+  test('M2 measurement-threshold: a reporting gap breaks the sustain run', async () => {
+    // -1 C at 8h, 7h, 6h ago, silence for five hours, then -1 C at 1h ago and now.
+    await temps('aa', [-1, -1, -1, null, null, null, null, -1, -1]);
+    const params = { ...FROST, sustainMinutes: 120 };
+    const [rule, ctx] = liveRule('measurement-threshold', params);
+    assert.deepEqual(await rule.run(ctx), [], 'the default 90 min gap must split the run');
+
+    // A deployment that genuinely reports every few hours says so explicitly.
+    const [rule2, ctx2] = liveRule('measurement-threshold', { ...params, maxGapMinutes: 360 });
+    const bridged = await rule2.run(ctx2);
+    assert.equal(bridged.length, 1);
+    assert.equal(bridged[0].detail.sustainedMinutes, 480);
+  });
+
+  test('H11 bandDwell: total mode does not lose an interval per fragmented run', async () => {
+    // Seven nights of six hourly cold readings, each followed by a warm reading. The
+    // tree banked 42 chill hours; first-to-last per run would say 35.
+    const values = [];
+    for (let n = 0; n < 7; n += 1) values.push(3, 3, 3, 3, 3, 3, 15);
+    await temps('aa', values);
+    const [total] = await bandDwell(
+      h.ctx(env.store), P('air.temperature'), { min: 0, max: 7.2 }, 200, 3,
+      null, undefined, 'total',
+    );
+    assert.ok(Math.abs(total.hours - 42) < 0.01, `42 chill hours, got ${total.hours}`);
+
+    const [rule, ctx] = liveRule('measurement-dwell', {
+      paths: ['air.temperature'], dwellHours: 40, lookbackHours: 200, minSamples: 24,
+    });
+    assert.deepEqual(await rule.run(ctx), [], '42h is not short of a 40h target');
+  });
+
+  test('H11 bandDwell: total mode credits the latest reading up to now, capped', async () => {
+    // Three cold readings, the latest 2h old, maxGap 1h: 1 + 1 + min(2, 1) = 3.
+    await temps('aa', [3, 3, 3], 120);
+    const [total] = await bandDwell(
+      h.ctx(env.store), P('air.temperature'), { min: 0, max: 7.2 }, 24, 1,
+      null, undefined, 'total',
+    );
+    assert.ok(Math.abs(total.hours - 3) < 0.01, `got ${total.hours}`);
+  });
+
+  test('M18 windowAccumulation: the trailing interval up to now is covered', async () => {
+    // Five hourly readings, the latest 50 minutes old: 4h between readings plus the
+    // 50 minutes since, held at the last value.
+    await temps('aa', [20, 20, 20, 20, 20], 50);
+    const [a] = await windowAccumulation(
+      h.ctx(env.store), P('air.temperature'), 24, 'integral', 10, 3,
+    );
+    assert.ok(Math.abs(a.coveredHours - (4 + 50 / 60)) < 0.02, `got ${a.coveredHours}`);
+    assert.ok(Math.abs(a.total - 10 * (4 + 50 / 60)) < 0.2, `got ${a.total}`);
+
+    // A trailing silence longer than maxGapHours is a gap, like any other.
+    await h.reset(env.db);
+    await temps('aa', [20, 20, 20], 300);
+    const [b] = await windowAccumulation(
+      h.ctx(env.store), P('air.temperature'), 24, 'integral', 10, 3,
+    );
+    assert.ok(Math.abs(b.coveredHours - 2) < 0.02, `got ${b.coveredHours}`);
+    assert.ok(Math.abs(b.gapHours - 5) < 0.02, `got ${b.gapHours}`);
+  });
+
+  test('M17/M18 measurement-accumulation: judged on the coverage-projected total', async () => {
+    // 20 C constant, base 10: 10 GDD a day. 21 hourly readings ending now cover 20h of
+    // 24 (0.83). Unscaled that is ~8.3 GDD and "short of 9"; projected it is 10.
+    await temps('aa', Array(21).fill(20));
+    const [rule, ctx] = liveRule('measurement-accumulation', {
+      paths: ['air.temperature'], min: 9, minCoverage: 0.75, lookbackHours: 24,
+    });
+    assert.deepEqual(await rule.run(ctx), []);
+
+    const [rule2, ctx2] = liveRule('measurement-accumulation', {
+      paths: ['air.temperature'], min: 11, minCoverage: 0.75, lookbackHours: 24,
+    });
+    const [f] = await rule2.run(ctx2);
+    assert.ok(Math.abs(f.detail.projectedTotal - 10) < 0.05, `got ${f.detail.projectedTotal}`);
+    assert.ok(f.detail.observedTotal < f.detail.projectedTotal);
+    assert.ok(Math.abs(f.detail.coverage - 20 / 24) < 0.01, `got ${f.detail.coverage}`);
+    assert.match(f.summary, /observed over 83% of the window, projected/);
+  });
+
+  test('H12 groupDeviation: devices below minSamples do not shape the group', async () => {
+    // Eight well-sampled probes, one clearly dry; three one-sample probes also dry.
+    const good = [30, 31, 29, 30, 31, 29, 30, 18];
+    for (let d = 0; d < good.length; d += 1) {
+      for (let k = 0; k < 6; k += 1) {
+        await h.uplink(env.db, {
+          devEui: `g${d}`, minutesAgo: k * 60, object: { soil: { moisture: good[d] } },
+        });
+      }
+    }
+    for (let d = 0; d < 3; d += 1) {
+      await h.uplink(env.db, { devEui: `s${d}`, minutesAgo: 10, object: { soil: { moisture: 17 } } });
+    }
+
+    const rows = await groupDeviation(
+      h.ctx(env.store), P('soil.moisture'), 24, undefined, 6,
+    );
+    assert.equal(rows.length, 8, 'the sparse devices are not in the result');
+    assert.ok(rows.every((r) => r.groupSize === 8), 'and not in the group size');
+    const odd = rows.find((r) => r.devEui === 'g7');
+    assert.equal(odd.groupMedian, 30);
+    assert.ok(odd.deviations < -3, `the dry probe is still found: ${odd.deviations}`);
+
+    const [rule, ctx] = liveRule('measurement-outlier', { paths: ['soil.moisture'] });
+    const found = await rule.run(ctx);
+    assert.deepEqual(found.map((f) => f.devEui), ['g7']);
+    assert.match(found[0].summary, /8 devices\)/);
+  });
+
+  const METER = 'a840410001810001';
+  const PROBE = 'a840410001810002';
+  const PROBE2 = 'a840410001810003';
+
+  /** A meter advancing 5h in, and probe series on other devices, hourly over 12h. */
+  async function splitIrrigation(probes) {
+    let total = 1000;
+    for (let i = 0; i < 12; i += 1) {
+      if (i === 4) total += 500;
+      await h.uplink(env.db, {
+        devEui: METER, deviceName: 'header-meter', minutesAgo: (11 - i) * 60,
+        object: { metering: { water: { total } } },
+      });
+      for (const [eui, series] of Object.entries(probes)) {
+        await h.uplink(env.db, {
+          devEui: eui, deviceName: `probe-${eui.slice(-1)}`, minutesAgo: (11 - i) * 60,
+          object: { soil: { moisture: series[i] } },
+        });
+      }
+    }
+  }
+
+  test('H10 triggerResponse: a mapped trigger is judged on its response devices', async () => {
+    await splitIrrigation({ [PROBE]: [20, 20, 20, 20, 20, 26, 28, 28, 27, 27, 26, 26] });
+    const args = [
+      h.ctx(env.store), P('metering.water.total'), P('soil.moisture'), 48, 100, 6, 'rising',
+    ];
+    assert.deepEqual(await triggerResponse(...args), [], 'unmapped: the meter has no moisture');
+
+    const [r] = await triggerResponse(...args, undefined, { [METER]: [PROBE] });
+    assert.equal(r.devEui, METER);
+    assert.equal(r.paired, true);
+    assert.equal(r.responseDevEui, PROBE);
+    assert.equal(r.baseline, 20);
+    assert.equal(r.change, 8);
+  });
+
+  test('H10 response-missing: fires across devices, and ANY responding probe clears it', async () => {
+    const flat = Array(12).fill(20);
+    await splitIrrigation({ [PROBE]: flat, [PROBE2]: flat });
+    const params = { responseDevices: { [METER.toUpperCase()]: [PROBE, PROBE2] } };
+    const [rule, ctx] = liveRule('response-missing', params);
+    const [f] = await rule.run(ctx);
+    assert.equal(f.devEui, METER);
+    assert.equal(f.detail.paired, true);
+    assert.equal(f.detail.responseDevices.length, 2);
+    assert.match(f.summary, /soil\.moisture on any of 2 response devices/);
+
+    await h.reset(env.db);
+    await splitIrrigation({ [PROBE]: flat, [PROBE2]: [20, 20, 20, 20, 20, 24, 25, 25, 25, 25, 25, 25] });
+    const [rule2, ctx2] = liveRule('response-missing', params);
+    assert.deepEqual(await rule2.run(ctx2), [], 'one probe wetted: the water arrived');
+  });
+
+  test('L18 owned resolvers keep a fractional lookback', async () => {
+    // Math.round(0.25) was 0: an empty window that matched nothing.
+    await h.uplink(env.db, { devEui: 'aa', minutesAgo: 10, object: { v: 5 } });
+    await h.uplink(env.db, { devEui: 'aa', minutesAgo: 5, object: { v: 6 } });
+    const ctx = h.ctx(env.store);
+    assert.equal((await bandDwell(ctx, P('v'), { min: 0, max: 10 }, 0.25, 1)).length, 1);
+    assert.equal((await windowTrend(ctx, P('v'), 0.25)).length, 1);
+    assert.equal((await windowAccumulation(ctx, P('v'), 0.25, 'sum', null, 1)).length, 1);
+    assert.equal((await groupDeviation(ctx, P('v'), 0.25)).length, 1);
+    assert.equal((await bandResidency(ctx, P('v'), 0, 10, 0.25, 1)).length, 1);
+  });
+
   // ── malformed input must not reach SQL ──────────────────────────────────────
 
   test('resolvePaths rejects candidates that could alter the query shape', async () => {
@@ -312,5 +1203,196 @@ if (!h.available) {
 
     const { rows: alive } = await env.db.query('SELECT count(*)::int AS n FROM event_up');
     assert.equal(alive[0].n, 1, 'event_up must still exist');
+  });
+
+  // ── H2: "latest reading" is the latest uplink CARRYING the reading ──────────
+  // Multi-frame devices interleave data frames with status/heartbeat frames. Taking
+  // the newest uplink and then looking for the path in it resolved open alerts on
+  // every frame that omitted the field, and re-raised them on the next data frame.
+
+  const { loadRules } = require('../dist/registry.js');
+  const ruleCtx = (id, params, openDevEuis = new Set()) => {
+    const rule = loadRules().get(id);
+    return [rule, h.ctx(env.store, { params: { ...rule.defaultParams, ...params }, openDevEuis })];
+  };
+
+  test('H2 latestReadings: a newer frame lacking every candidate does not hide the reading', async () => {
+    await h.uplink(env.db, { devEui: 'aa', minutesAgo: 30, object: { battery: 3.1 } });
+    await h.uplink(env.db, { devEui: 'aa', minutesAgo: 5, object: { status: { rssi: -80 } } });
+    const rows = await latestReadings(h.ctx(env.store), P('battery', 'power.voltage'), 24);
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].value, 3.1);
+    assert.equal(rows[0].matchedPath, 'battery');
+  });
+
+  test('H2 latestReadings: priority still applies within the chosen uplink', async () => {
+    // Newest usable uplink carries only the second candidate: it wins over an older
+    // uplink carrying the first — "latest reading" first, then priority inside it.
+    await h.uplink(env.db, { devEui: 'aa', minutesAgo: 30, object: { air: { temperature: 20 } } });
+    await h.uplink(env.db, { devEui: 'aa', minutesAgo: 5, object: { temperature: 4, air: { temperature: 'n/a' } } });
+    const rows = await latestReadings(h.ctx(env.store), P('air.temperature', 'temperature'), 24);
+    assert.equal(rows[0].matchedPath, 'temperature');
+    assert.equal(rows[0].value, 4);
+  });
+
+  test('H2 latestReadings: JSON null and array objects are not uplinks with telemetry', async () => {
+    await h.uplink(env.db, { devEui: 'aa', minutesAgo: 30, object: { temperature: 7 } });
+    await h.uplink(env.db, { devEui: 'aa', minutesAgo: 10, object: [99] });
+    await env.db.query(
+      `INSERT INTO event_up (time, dev_eui, object) VALUES (now() - interval '5 minutes', 'aa', 'null'::jsonb)`,
+    );
+    const rows = await latestReadings(h.ctx(env.store), [['0'], ['temperature']], 24);
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].matchedPath, 'temperature', 'an array must not answer path "0"');
+    assert.equal(rows[0].value, 7);
+  });
+
+  test('H2 battery-low: an open alert stays open across a status-only frame', async () => {
+    await h.uplink(env.db, { devEui: 'aa', minutesAgo: 30, object: { battery: 3.1 } });
+    await h.uplink(env.db, { devEui: 'aa', minutesAgo: 5, object: { status: 'ok' } });
+    const [rule, ctx] = ruleCtx('battery-low', {}, new Set(['aa']));
+    const findings = await rule.run(ctx);
+    assert.deepEqual(findings.map((f) => f.devEui), ['aa']);
+    assert.equal(findings[0].detail.value, 3.1);
+  });
+
+  test('H2 measurement-threshold: an open frost alert survives a battery-only frame', async () => {
+    await h.uplink(env.db, { devEui: 'aa', minutesAgo: 30, object: { temperature: -3 } });
+    await h.uplink(env.db, { devEui: 'aa', minutesAgo: 5, object: { battery: 3.6 } });
+    const [rule, ctx] = ruleCtx('measurement-threshold', { min: 1.5 }, new Set(['aa']));
+    const findings = await rule.run(ctx);
+    assert.deepEqual(findings.map((f) => f.devEui), ['aa']);
+    assert.equal(findings[0].detail.value, -3);
+  });
+
+  test('H2 boolean-alarm: a heartbeat omitting the flag does not clear a leak', async () => {
+    await h.uplink(env.db, { devEui: 'aa', minutesAgo: 30, object: { water: { leak: true } } });
+    await h.uplink(env.db, { devEui: 'aa', minutesAgo: 5, object: { battery: 3.6 } });
+    await h.uplink(env.db, { devEui: 'bb', minutesAgo: 30, object: { water: { leak: true } } });
+    await h.uplink(env.db, { devEui: 'bb', minutesAgo: 5, object: { water: { leak: null }, battery: 3.6 } });
+    const rows = await latestBooleans(h.ctx(env.store), P('water.leak'), 24, ['true']);
+    assert.deepEqual(rows.map((r) => [r.devEui, r.value]), [['aa', true], ['bb', true]],
+      'a JSON null at the path is absent, not false');
+
+    const [rule, ctx] = ruleCtx('boolean-alarm', {}, new Set(['aa']));
+    assert.deepEqual((await rule.run(ctx)).map((f) => f.devEui), ['aa', 'bb']);
+
+    // Only a frame that actually reports false clears it.
+    await h.uplink(env.db, { devEui: 'aa', minutesAgo: 1, object: { water: { leak: false } } });
+    assert.deepEqual((await rule.run(ctx)).map((f) => f.devEui), ['bb']);
+  });
+
+  test('H2 latestCoordinates: a battery-only frame does not hide the last fix', async () => {
+    await h.uplink(env.db, { devEui: 'aa', minutesAgo: 30, object: { position: { latitude: 42.5, longitude: -93.6 } } });
+    await h.uplink(env.db, { devEui: 'aa', minutesAgo: 5, object: { battery: 3.6 } });
+    const rows = await latestCoordinates(
+      h.ctx(env.store), P('position.latitude'), P('position.longitude'), 24,
+    );
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].lat, 42.5);
+  });
+
+  test('M21 latestCoordinates: a (0, 0) no-fix frame is skipped, not treated as a position', async () => {
+    await h.uplink(env.db, { devEui: 'aa', minutesAgo: 30, object: { position: { latitude: 42.5, longitude: -93.6 } } });
+    await h.uplink(env.db, { devEui: 'aa', minutesAgo: 5, object: { position: { latitude: 0, longitude: 0 } } });
+    await h.uplink(env.db, { devEui: 'zz', minutesAgo: 5, object: { position: { latitude: 0, longitude: 0 } } });
+    // One coordinate at zero is a real place (the equator or the meridian).
+    await h.uplink(env.db, { devEui: 'eq', minutesAgo: 5, object: { position: { latitude: 0, longitude: 32.5 } } });
+    const rows = await latestCoordinates(
+      h.ctx(env.store), P('position.latitude'), P('position.longitude'), 24,
+    );
+    const byDev = Object.fromEntries(rows.map((r) => [r.devEui, [r.lat, r.lon]]));
+    assert.deepEqual(byDev, { aa: [42.5, -93.6], eq: [0, 32.5] });
+  });
+
+  // ── H4 / M3: measurement-missing watches every listed path ──────────────────
+
+  /** 40 decoded uplinks over the last ~7 days, then `recent` frames in the last 6h. */
+  async function probeHistory(devEui, full, recent, recentCount = 6) {
+    for (let i = 0; i < 40; i += 1) {
+      await h.uplink(env.db, { devEui, minutesAgo: (14 + i * 3) * 60, object: full });
+    }
+    for (let i = 1; i <= recentCount; i += 1) {
+      await h.uplink(env.db, { devEui, minutesAgo: i * 50, object: recent });
+    }
+  }
+  const SOIL4 = ['soil.moisture', 'soil.temperature', 'soil.ec', 'soil.pH'];
+
+  test('H4 measurement-missing: one element of a multi-path probe vanishing is caught', async () => {
+    const full = { soil: { moisture: 30, temperature: 18, ec: 400, pH: 6.5 } };
+    await probeHistory('probe', full, { soil: { moisture: 30, temperature: 18, pH: 6.5 } });
+    await probeHistory('fine', full, full);
+
+    const [rule, ctx] = ruleCtx('measurement-missing', { paths: SOIL4 });
+    const findings = await rule.run(ctx);
+    assert.deepEqual(findings.map((f) => f.devEui), ['probe']);
+    assert.deepEqual(findings[0].detail.measurements, ['soil.ec']);
+    assert.match(findings[0].summary, /stopped reporting soil\.ec:/);
+    assert.deepEqual(findings[0].detail.stillReporting, ['soil.moisture', 'soil.temperature', 'soil.pH']);
+  });
+
+  test('H4 measurement-missing: several vanished paths are named in one finding', async () => {
+    const full = { soil: { moisture: 30, temperature: 18, ec: 400, pH: 6.5 } };
+    await probeHistory('probe', full, { soil: { moisture: 30 } });
+    const [rule, ctx] = ruleCtx('measurement-missing', { paths: SOIL4 });
+    const findings = await rule.run(ctx);
+    assert.equal(findings.length, 1);
+    assert.deepEqual(findings[0].detail.measurements, ['soil.temperature', 'soil.ec', 'soil.pH']);
+    assert.match(findings[0].summary, /soil\.temperature, soil\.ec, soil\.pH/);
+  });
+
+  test('H4 measurement-missing: aliases from different codecs do not false-alarm', async () => {
+    // Each device only ever reports its own codec's alias.
+    await probeHistory('a', { battery: 3.6 }, { battery: 3.6 });
+    await probeHistory('b', { power: { voltage: 12 } }, { power: { voltage: 12 } });
+    const [rule, ctx] = ruleCtx('measurement-missing', { paths: ['battery', 'power.voltage'] });
+    assert.deepEqual(await rule.run(ctx), []);
+  });
+
+  test('M3 measurement-missing: undecodable uplinks are not "still decoding"', async () => {
+    // Recent frames all failed to decode (object NULL, or JSON null): decode-failure's
+    // alert, not a vanished field.
+    await probeHistory('dead', { soil: { moisture: 30 } }, null, 3);
+    for (let i = 1; i <= 3; i += 1) {
+      await env.db.query(
+        `INSERT INTO event_up (time, dev_eui, object)
+         VALUES (now() - make_interval(mins => $1::int), 'dead', 'null'::jsonb)`, [i * 40],
+      );
+    }
+    const [rule, ctx] = ruleCtx('measurement-missing', { paths: ['soil.moisture'] });
+    assert.deepEqual(await rule.run(ctx), []);
+    const presence = await pathPresence(h.ctx(env.store), P('soil.moisture'), 168, 12);
+    assert.equal(presence[0].recentUplinks, 0);
+  });
+
+  // ── L18: fractional lookbacks ───────────────────────────────────────────────
+
+  test('L18 resolvers: a lookback under half an hour is not rounded to zero', async () => {
+    await h.uplink(env.db, { devEui: 'aa', minutesAgo: 5, object: { temperature: 3, water: { leak: true },
+      position: { latitude: 1, longitude: 2 } } });
+    await h.uplink(env.db, { devEui: 'aa', minutesAgo: 25, object: { temperature: 9 } });
+    assert.equal((await latestReadings(h.ctx(env.store), P('temperature'), 0.25)).length, 1);
+    assert.equal((await latestBooleans(h.ctx(env.store), P('water.leak'), 0.25, ['true'])).length, 1);
+    assert.equal((await latestCoordinates(
+      h.ctx(env.store), P('position.latitude'), P('position.longitude'), 0.25)).length, 1);
+    // 0.25 h is 15 minutes: the 25-minute-old reading is outside it.
+    const stats = await windowStats(h.ctx(env.store), P('temperature'), 0.25);
+    assert.equal(stats[0].samples, 1);
+  });
+
+  // ── M4: exclusive vocabulary bounds ─────────────────────────────────────────
+
+  test('M4 measurement-implausible: wind.direction honours its exclusive maximum', async () => {
+    for (let i = 1; i <= 3; i += 1) {
+      await h.uplink(env.db, { devEui: 'wrap', minutesAgo: i * 10, object: { wind: { direction: 360 } } });
+      await h.uplink(env.db, { devEui: 'far', minutesAgo: i * 10, object: { wind: { direction: 540 } } });
+      await h.uplink(env.db, { devEui: 'ok', minutesAgo: i * 10, object: { wind: { direction: 359.9 } } });
+    }
+    const [rule, ctx] = ruleCtx('measurement-implausible', {});
+    const findings = await rule.run(ctx);
+    assert.deepEqual(findings.map((f) => f.devEui).sort(), ['far', 'wrap']);
+    const wrap = findings.find((f) => f.devEui === 'wrap');
+    assert.match(wrap.summary, /max 360, exclusive/);
+    assert.equal(wrap.detail.paths[0].maxExclusive, true);
   });
 }

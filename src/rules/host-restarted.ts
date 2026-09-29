@@ -31,7 +31,7 @@
 import { forDuration } from '../gateway';
 import { int } from '../params';
 import { engineSubject } from '../subject';
-import type { Rule } from '../types';
+import type { Rule, SoundingContext } from '../types';
 
 const rule: Rule = {
   id: 'host-restarted',
@@ -53,8 +53,10 @@ const rule: Rule = {
      * This is the width of the alert's own window, not a threshold on the outage. It
      * needs to be comfortably longer than the sounding schedule so a restart cannot slip
      * between two soundings unreported, and short enough that the alert resolves by
-     * itself once the restart is old news. At the default 15-minute schedule, 120
-     * minutes survives several missed soundings while a site settles down after a reboot.
+     * itself once the restart is old news: the alert is reported on every sounding
+     * while the restart is younger than this, and resolves on the first one after. At
+     * the default 15-minute schedule, 120 minutes survives several missed soundings
+     * while a site settles down after a reboot.
      */
     withinMinutes: 120,
     /**
@@ -88,10 +90,17 @@ const rule: Rule = {
     const upMinutes = (Date.now() - startedMs) / 60_000;
     if (upMinutes > withinMinutes) return [];
 
-    // The gap runs from the last completed sounding to the restart — not to now. Time
-    // since the restart is time the engine has been back and working, and counting it as
-    // downtime would overstate every outage by one sounding interval.
-    const previous = ctx.engine.previousRunAt;
+    // The gap runs from the last sounding that completed BEFORE the restart, to the
+    // restart — not to now. Time since the restart is time the engine has been back and
+    // working, and counting it as downtime would overstate every outage by one sounding
+    // interval.
+    //
+    // ctx.engine.previousRunAt is simply the latest completed sounding. On the first
+    // sounding after a restart that is the pre-restart one and can be used as is; on
+    // every later sounding it is a post-restart one, the gap would read as 0, and the
+    // alert would resolve after a single sounding instead of staying open for
+    // withinMinutes. So once the latest run is after the restart, look further back.
+    const previous = await lastRunBefore(ctx, ctx.engine.previousRunAt, startedAt, startedMs);
     const previousMs = previous === null ? null : Date.parse(previous);
     const gapMinutes =
       previousMs === null || Number.isNaN(previousMs)
@@ -134,5 +143,39 @@ const rule: Rule = {
     ];
   },
 };
+
+/**
+ * The most recent sounding that finished before the event store started.
+ *
+ * `latest` (the engine's previousRunAt) answers it without a query whenever it predates
+ * the restart. Otherwise leadsman.run is asked directly. A query failure is reported as
+ * null — no evidence of a gap — for the same reason a missing start time is: reporting an
+ * outage on no evidence would be worse than staying quiet.
+ */
+async function lastRunBefore(
+  ctx: SoundingContext,
+  latest: string | null,
+  startedAt: string,
+  startedMs: number,
+): Promise<string | null> {
+  if (latest === null) return null;
+  const latestMs = Date.parse(latest);
+  if (!Number.isNaN(latestMs) && latestMs < startedMs) return latest;
+  try {
+    const rows = await ctx.query<{ at: string | null }>(
+      `SELECT max(finished_at)::text AS at
+         FROM leadsman.run
+        WHERE finished_at IS NOT NULL
+          AND finished_at < $1::timestamptz`,
+      [startedAt],
+    );
+    return rows[0]?.at ?? null;
+  } catch (err) {
+    ctx.log.warn('could not read the last sounding before the restart', {
+      error: (err as Error).message,
+    });
+    return null;
+  }
+}
 
 export default rule;

@@ -91,7 +91,8 @@ const rule: Rule = {
   },
   requires: [
     { table: 'event_up', columns: ['dev_eui', 'time'] },
-    { table: 'event_join', columns: ['dev_eui', 'time'] },
+    // The scope columns too: the join discriminator is filtered by the same device scope.
+    { table: 'event_join', columns: ['dev_eui', 'time', 'device_name', 'device_profile_name'] },
   ],
 
   async run(ctx) {
@@ -111,7 +112,7 @@ const rule: Rule = {
               count(*) FILTER (
                 WHERE time > now() - make_interval(mins => $2::int))      AS uplinks_in_window
          FROM event_up
-        WHERE time > now() - make_interval(hours => $1::int)
+        WHERE time > now() - make_interval(secs => $1::float8 * 3600)
           ${sc.sql}`,
       [inventoryHours, silentMinutes, ...sc.values],
     );
@@ -135,13 +136,21 @@ const rule: Rule = {
     // network server, so joins-without-uplinks is a completely different fault from
     // silence on both — it points at the application layer or the codec, not the radio
     // path. Worth one extra query to avoid sending the operator to check the wrong thing.
+    //
+    // Scoped exactly like the uplink query. An instance narrowed to part of the fleet is
+    // diagnosing that part; a join from a device outside it says nothing about whether
+    // this fleet's radio path is up, and counting it would flip the diagnosis to "the
+    // payload path" on the strength of a device this check was told to ignore.
+    // $1 silentMinutes, $2 inventoryHours, then the scope's two.
+    const jsc = scopeClause(scope, 3);
     const joinRows = await ctx.query<JoinRow>(
       `SELECT max(time)                                                AS last_join,
               count(*) FILTER (
                 WHERE time > now() - make_interval(mins => $1::int))   AS joins_recent
          FROM event_join
-        WHERE time > now() - make_interval(hours => $2::int)`,
-      [silentMinutes, inventoryHours],
+        WHERE time > now() - make_interval(secs => $2::float8 * 3600)
+          ${jsc.sql}`,
+      [silentMinutes, inventoryHours, ...jsc.values],
     );
     const joinsRecent = Number(joinRows[0]?.joins_recent ?? 0);
 

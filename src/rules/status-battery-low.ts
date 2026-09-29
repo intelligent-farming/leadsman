@@ -23,6 +23,22 @@
  * Both are respected rather than thresholded, so a mains-powered node does not generate
  * a permanent alert.
  *
+ * ── the latest report decides ───────────────────────────────────────────────────
+ * Each device is judged on its *most recent* status event in the window, and only that
+ * one. The flags and thresholds are applied to that row after it is chosen, never
+ * before: filtering first would pick the latest *low* reading instead, so a battery
+ * replaced three days ago (95 % now) or a node moved to mains yesterday would stay
+ * alerted until the old low reading aged out of the two-week window.
+ *
+ *   latest says external power (ignoreExternalPower)  no finding — an open alert resolves
+ *   latest says battery unavailable                   no finding — an open alert resolves.
+ *       The device has said it cannot measure; there is no current evidence the battery
+ *       is low, and repeating an older reading as though it were current is the
+ *       stale-alert failure above. A node that loses its battery measurement is still
+ *       covered by the checks that watch it go quiet (device-silent, fleet-silent).
+ *   otherwise                                          raise/clear hysteresis on the
+ *                                                      latest percentage
+ *
  * ── windows ─────────────────────────────────────────────────────────────────────
  * Status events are *rare* — they arrive on the profile's DevStatusReq interval, often
  * daily or less. A real store had 38 status rows against 9,195 uplinks for the same
@@ -41,7 +57,9 @@ import type { Finding, Rule } from '../types';
 interface Row {
   dev_eui: string;
   device_name: string | null;
-  battery_level: string;
+  battery_level: string | null;
+  battery_level_unavailable: boolean | null;
+  external_power_source: boolean | null;
   at: string;
   readings: string;
 }
@@ -49,8 +67,8 @@ interface Row {
 const rule: Rule = {
   id: 'status-battery-low',
   description:
-    'Flags devices whose MAC-layer battery percentage (event_status, from DevStatusAns) ' +
-    'is below threshold. Independent of the payload codec, so it still reports on a ' +
+    'Flags devices whose latest MAC-layer battery percentage (event_status, from ' +
+    'DevStatusAns) is below threshold. Independent of the payload codec, so it still reports on a ' +
     'device whose decoding is broken — the companion to decode-failure.',
   defaultSeverity: 'warning',
   /** Same, as a MAC-layer percentage.
@@ -59,7 +77,10 @@ const rule: Rule = {
   defaultParams: {
     /** Raise at or below this percentage. */
     raiseAtPercent: 20,
-    /** Hold the alert open until it recovers past this. Must be >= raiseAtPercent. */
+    /**
+     * Hold the alert open until the latest reading recovers past this. Must be
+     * >= raiseAtPercent.
+     */
     clearAtPercent: 25,
     /** Escalate to critical at or below this. null disables escalation. */
     criticalAtPercent: 10,
@@ -69,10 +90,13 @@ const rule: Rule = {
      */
     lookbackHours: 336,
     /**
-     * Skip devices reporting external_power_source. A mains-powered node's battery
-     * figure is meaningless and would alert forever.
+     * Skip devices whose latest status reports external_power_source. A mains-powered
+     * node's battery figure is meaningless and would alert forever; an open alert
+     * resolves once the device reports external power.
      */
     ignoreExternalPower: true,
+    /** Narrow this check to part of the fleet — see src/scope.ts. */
+    ...SCOPE_PARAMS,
   },
   requires: [
     {
@@ -103,33 +127,39 @@ const rule: Rule = {
       );
     }
 
-    const sc = scopeClause(resolveScope(ctx.params), 4);
+    const sc = scopeClause(resolveScope(ctx.params), 2);
 
-    // Fetch everything at or below the *clear* threshold: that covers new breaches and
-    // devices still recovering. The raise/clear decision is made per device below.
+    // The latest status row per device, unfiltered by level or flags — see "the latest
+    // report decides" above. `battery_level IS NOT NULL` is deliberately absent too: a
+    // newer row without a number must not be skipped in favour of an older one with it.
     const rows = await ctx.query<Row>(
       `SELECT DISTINCT ON (dev_eui)
               dev_eui,
               device_name,
               battery_level,
+              battery_level_unavailable,
+              external_power_source,
               time     AS at,
               count(*) OVER (PARTITION BY dev_eui) AS readings
          FROM event_status
-        WHERE time > now() - make_interval(hours => $1::int)
-          AND battery_level IS NOT NULL
-          -- The device told us the number is not usable; believe it.
-          AND battery_level_unavailable IS NOT TRUE
-          AND ($2::boolean IS NOT TRUE OR external_power_source IS NOT TRUE)
-          AND battery_level <= $3::real
+        WHERE time > now() - make_interval(secs => $1::float8 * 3600)
           ${sc.sql}
         ORDER BY dev_eui, time DESC`,
-      [Math.round(lookbackHours), ignoreExternal, clearAt, ...sc.values],
+      [lookbackHours, ...sc.values],
     );
 
     const findings: Finding[] = [];
 
     for (const row of rows) {
+      // The device told us the number is not usable; believe it. No finding, so an open
+      // alert resolves rather than being held open on a reading the device disowns.
+      if (row.battery_level_unavailable === true) continue;
+      // A mains-powered node's percentage is meaningless and would alert forever.
+      if (ignoreExternal && row.external_power_source === true) continue;
+      if (row.battery_level === null) continue;
+
       const pct = Number(row.battery_level);
+      if (!Number.isFinite(pct)) continue;
       // Devices already in breach are held against the looser clear threshold.
       const limit = ctx.openDevEuis.has(row.dev_eui) ? clearAt : raiseAt;
       if (pct > limit) continue;

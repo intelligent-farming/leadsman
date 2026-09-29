@@ -8,7 +8,7 @@
   "//delivery": "NO DELIVERY BY DEFAULT — with no `notify` block, alerts are recorded and nothing is pushed. `leadsman status` and the leadsman.open_alert view show them. To deliver, add a notify block naming destinations and routing the two alert classes: \"notify\": {\"destinations\": {\"oncall\": {\"provider\": \"twilio\", \"to\": [\"+15125550123\"]}, \"agent\": {\"webhookUrl\": \"http://localhost:8644/hermes/agent\", \"webhookAuth\": \"hmac\"}}, \"routing\": {\"fact\": \"oncall\", \"situation\": \"agent\"}}. Providers: webhook, twilio, telegram, signal, slack. Every message leads \"Alert from <name>: \"; set LEADSMAN_INSTANCE_NAME (or notify.instanceName) to name this edge device, so several devices can share one channel. Unnamed installs report as \"Leadsman\". Credentials come from the environment only — see the Environment table in the README.",
   "//suppress": "SUPPRESSION IS ON BY DEFAULT, and is the only default-on behaviour in this file that withholds anything. While a fleet-silent or gateway-silent alert is open, device-silent alerts are recorded with detail.suppressedBy and NOT delivered — because a gateway outage makes every device behind it look silent, and those alerts each name a sensor that is working fine. Nothing is dropped: they stay in `leadsman status` and leadsman.open_alert throughout, and any that is still open when the outage alert resolves is delivered then, so a node that really is dead is still reported. Override with e.g. \"suppress\": [{\"while\": [\"fleet-silent\"], \"mute\": [\"device-silent\", \"signal-degraded\"]}], where each `mute` entry matches a check's `as` name OR its rule id. Set \"suppress\": [] to deliver every alert regardless of cause.",
   "//heartbeat": "NO HEARTBEAT BY DEFAULT. The one fault this engine cannot report is its own: while the host is down, Leadsman is down, and nothing is raised at all — a six-hour power cut looks exactly like a quiet night. A heartbeat inverts that, pushing a liveness ping off the box after every sounding so something external can alarm when the pings stop. That receiver must be somewhere the outage cannot reach; a watchdog on the same edge device dies with it. Add \"heartbeat\": {\"url\": \"https://hc-ping.example/abc123\", \"auth\": \"none\"} — or point it at a Hermes route with \"auth\": \"hmac\" and set LEADSMAN_WEBHOOK_TOKEN_HEARTBEAT. Also settable as LEADSMAN_HEARTBEAT_URL, and testable with `leadsman test-notify`. host-restarted reports the same outage retrospectively; the two are complements, and a deployment that cares about outages wants both.",
-  "//chirpstack": "OPTIONAL, and only gateway-deaf and gateway-never-seen use it. rx_info tells you which gateways ARE forwarding, which covers a gateway that stopped. It cannot show a gateway that is connected but hearing nothing, or one registered and never heard from — both are simply absent from the telemetry, indistinguishable from a gateway that was never installed. Those need the network server's own registry. Set LEADSMAN_CHIRPSTACK_CONFIG=/shared/config.json (the file intelligent-farming-stack's provisioner writes, holding chirpStackUrl + apiKey + tenantId — the same one leftenant reads), or add \"chirpstack\": {\"url\": \"http://chirpstack-rest-api:8090\", \"tenantId\": \"...\", \"configFile\": \"/shared/config.json\"}. The API key is read ONLY from that file, never from here, so this config stays committable. Unconfigured, those two checks report `skipped` in leadsman.run rather than quietly finding nothing.",
+  "//chirpstack": "OPTIONAL. gateway-deaf and gateway-never-seen need it; gateway-silent uses it when present to leave an online-but-silent gateway to gateway-deaf (set its onlineWithinMinutes to null if gateway-deaf is disabled). rx_info tells you which gateways ARE forwarding, which covers a gateway that stopped. It cannot show a gateway that is connected but hearing nothing, or one registered and never heard from — both are simply absent from the telemetry, indistinguishable from a gateway that was never installed. Those need the network server's own registry. Set LEADSMAN_CHIRPSTACK_CONFIG=/shared/config.json (the file intelligent-farming-stack's provisioner writes, holding chirpStackUrl + apiKey + tenantId — the same one leftenant reads), or add \"chirpstack\": {\"url\": \"http://chirpstack-rest-api:8090\", \"tenantId\": \"...\", \"configFile\": \"/shared/config.json\"}. The API key is read ONLY from that file, never from here, so this config stays committable. Unconfigured, those two checks report `skipped` in leadsman.run rather than quietly finding nothing.",
   "//hostAddress": "OPTIONAL, and only host-address-changed uses it — but it is what turns \"the site is dark\" into \"the address moved from X to Y, re-point the gateways\". Leadsman cannot discover this itself: it runs in a bridged container, where the only visible addresses are on the docker network. It must be injected. Defaults to reading `gatewayBridgeHost` from the same /shared/config.json as `chirpstack` above, which is literally the address the stack detected on the host and handed to gateways. Or set LEADSMAN_HOST_ADDRESS directly. Unconfigured, the check is skipped.",
   "checks": [
     {
@@ -50,7 +50,7 @@
       }
     },
     {
-      "//": "A field silently vanished from the codec output while uplinks keep decoding. Without this, every check on that field just stops matching the device and nothing fires — silence looks identical to health. Add one instance per measurement you actually depend on.",
+      "//": "A field silently vanished from the codec output while uplinks keep decoding. Without this, every check on that field just stops matching the device and nothing fires — silence looks identical to health. List every field you depend on in one instance; each listed path is tracked separately.",
       "rule": "measurement-missing",
       "as": "soil-moisture-missing",
       "enabled": true,
@@ -76,10 +76,19 @@
       }
     },
     {
+      "//": "A reading physics does not permit: negative humidity, pH above 14, a byte-order bug turning 21.5C into 5504C. ENABLED, and it needs no configuration at all — the bounds come from the normalized vocabulary's own schema, 73 paths with a declared physical range. This is a DATA-INTEGRITY check, not an agronomic one: a breach means the sensor or the codec is wrong, and the value has been poisoning every average, trend and accumulation downstream of it. Enable it on day one alongside decode-failure.",
+      "rule": "measurement-implausible",
+      "enabled": true,
+      "params": {
+        "lookbackHours": 24,
+        "minBreaches": 3
+      }
+    },
+    {
       "//": "═══ NETWORK LAYER — faults that never appear in event_up ═══ Every check above reads decoded telemetry. These read the other tables ChirpStack's integration writes, and they catch devices that look perfectly healthy in event_up. Enabled by default: they need no crop- or site-specific tuning, and two of them keep working when the payload codec is broken."
     },
     {
-      "//": "ChirpStack's own diagnosis, from event_log: codec failures, MIC errors, OTAA failures. The only check that reports what the network server explicitly recorded rather than inferring it. Filters on level (2 = ERROR) rather than a code allowlist, so a code added by a future ChirpStack version still reaches you with its own description. Code 7 is excluded because frame-counter retransmission is normal LoRaWAN behaviour that every healthy device logs.",
+      "//": "ChirpStack's own diagnosis, from event_log: codec failures, MIC errors, OTAA failures. The only check that reports what the network server explicitly recorded rather than inferring it. Filters on level (2 = ERROR) rather than a code allowlist, so a code added by a future ChirpStack version still reaches you with its own description. Code 7 (frame-counter retransmission) is logged at level 1, below the default minLevel; it is also excluded so that lowering minLevel to 1 does not alert on normal retransmissions.",
       "rule": "device-log-error",
       "enabled": true,
       "params": {
@@ -92,7 +101,7 @@
       }
     },
     {
-      "//": "Battery percentage from the LoRaWAN MAC layer (DevStatusAns), not the payload codec. This is the check that still works when decoding is broken — exactly when a flat battery would otherwise go unnoticed, because every codec-based check has already gone quiet. Mains-powered nodes and devices reporting battery_level_unavailable are skipped rather than thresholded. Note the two-week window: status events arrive on the device profile's DevStatusReq interval, often daily or less.",
+      "//": "Battery percentage from the LoRaWAN MAC layer (DevStatusAns), not the payload codec. This is the check that still works when decoding is broken — exactly when a flat battery would otherwise go unnoticed, because every codec-based check has already gone quiet. Each device is judged on its latest status report; one now reporting external power or battery_level_unavailable is not thresholded, so an open alert resolves. Note the two-week window: status events arrive on the device profile's DevStatusReq interval, often daily or less.",
       "rule": "status-battery-low",
       "enabled": true,
       "params": {
@@ -115,7 +124,7 @@
       }
     },
     {
-      "//": "Repeated rejoins. Each one discards queued downlinks and resets ADR, so the device restarts at its slowest data rate. Judged on joins relative to uplinks as well as joins alone — a device that joins more often than it reports is effectively down, however few joins that is in absolute terms. Usually a power-cycling device, a failing downlink path, or a key mismatch after re-provisioning.",
+      "//": "Repeated rejoins. Each one discards queued downlinks and resets ADR, so the device restarts at its slowest data rate. Judged on joins relative to uplinks as well as joins alone — a device that joins more often than it reports (at least 2 joins, even with no uplinks at all) is effectively down and raises critical; a warning fires above one join per ten uplinks. Usually a power-cycling device, a failing downlink path, or a key mismatch after re-provisioning.",
       "rule": "join-churn",
       "enabled": true,
       "params": {
@@ -126,7 +135,7 @@
       }
     },
     {
-      "//": "Confirmed downlinks that were never acknowledged — a command you sent did not land. Silent in the telemetry: a valve that failed to open produces no anomalous reading, and a scheduler assuming success moves on. Disabled by default because event_ack only receives rows for CONFIRMED downlinks; enable it if you actuate anything.",
+      "//": "Confirmed downlinks ChirpStack marked unacknowledged — a command you sent did not land. ChirpStack writes that verdict on the device's next uplink (Class A) or after the Class B/C timeout, so a device that never uplinks again produces no row. Silent in the telemetry: a valve that failed to open produces no anomalous reading, and a scheduler assuming success moves on. Disabled by default because event_ack only receives rows for CONFIRMED downlinks; enable it if you actuate anything.",
       "rule": "downlink-unacked",
       "enabled": false,
       "params": {
@@ -510,6 +519,30 @@
       }
     },
     {
+      "//": "POST-VERAISON DEFICIT BAND for winegrapes. After veraison the block is held in a deliberate deficit — enough stress to concentrate colour and flavour and stop vegetative growth, not so much that the vine shuts down — and BOTH ways out are expensive, in opposite directions. Too dry: sugar accumulation stalls, berries shrivel, a badly stressed vine drops leaves and exposes fruit. Too wet: berries swell and can split, flavour dilutes, ripening is delayed and laterals restart. What this reports that a min/max threshold cannot is PERSISTENCE AND ASYMMETRY — 60% of three days below the floor is a block being under-watered, while 30% below AND 30% above is one being pulsed too hard, and the second gets worse if you add water. TWO IMPORTANT LIMITS: (1) the rule does NOT know it is post-veraison — leadsman has no crop or growth stage, so activeMonths is a calendar proxy and a warm year moves veraison by weeks; treat it as roughly the right part of the season. (2) floor and ceiling are raw VWC and are SOIL-SPECIFIC — 18% is dry in clay and wet in sand, so set them from this block's own calibration. Adding fieldCapacity and wiltingPoint does not change what fires; it adds the depletion fraction to the alert, which is the number that transfers between blocks. DISABLED, and scoped to nothing useful as written: one instance per block.",
+      "rule": "soil-deficit-band",
+      "as": "post-veraison-deficit",
+      "enabled": false,
+      "activeMonths": [8, 9, 10],
+      "params": {
+        "paths": [
+          "soil.moisture"
+        ],
+        "floor": 18,
+        "ceiling": 28,
+        "lookbackHours": 72,
+        "maxOutOfBandFraction": 0.25,
+        "minCoverage": 0.6,
+        "maxGapHours": 6,
+        "minSamples": 12,
+        "clearMarginFraction": 0.05,
+        "fieldCapacity": null,
+        "wiltingPoint": null,
+        "unit": "%",
+        "deviceNamePattern": "%block-7%"
+      }
+    },
+    {
       "//": "═══ TANK AND WATER LEVEL — level arrives as a percentage, a volume, a depth, or an ullage distance depending on the sensor. Order the candidates by what you prefer to threshold on. ═══"
     },
     {
@@ -786,7 +819,7 @@
       "//": "═══ PLANT AND DISEASE ═══"
     },
     {
-      "//": "Prolonged leaf wetness is the primary driver of fungal infection periods. Threshold plus duration is the real model; this is the threshold half.",
+      "//": "Prolonged leaf wetness is the primary driver of fungal infection periods. This is the threshold half of the model — it says wetness is high right now. The duration half is the mold-risk entries below, which is what an infection period actually is.",
       "rule": "measurement-threshold",
       "as": "leaf-wetness-high",
       "enabled": false,
@@ -799,6 +832,60 @@
         "unit": "%",
         "clearMargin": 10,
         "lookbackHours": 12
+      }
+    },
+    {
+      "//": "GRAPES — botrytis bunch rot. Infection needs free water or near-saturation held on the tissue for hours while it is warm enough for the spores to germinate, which is why this is a duration check with a temperature gate and not a humidity threshold. Both halves matter: 90% RH alone fires on every cold clear autumn night and infects nothing, and 20C alone fires every afternoon. The 15-28C gate is the range cited for late-season infection, with the optimum near 21C for berries; four hours is the short end of the published wetness requirement — it is what suffices AT the optimum, where 12-24h is typical across the rest of the band, so this entry is deliberately sensitive — lengthen it if the block reports more risk than it has. DISABLED, and scoped to nothing useful as written: set deviceNamePattern or deviceProfiles to the vineyard's own devices before enabling, or every humidity sensor on the site reports vineyard risk.",
+      "rule": "mold-risk",
+      "as": "grape-botrytis-risk",
+      "enabled": false,
+      "params": {
+        "paths": [
+          "air.relativeHumidity"
+        ],
+        "humidityMin": 90,
+        "humidityMax": null,
+        "temperaturePaths": [
+          "air.temperature",
+          "temperature",
+          "leaf.temperature"
+        ],
+        "temperatureMin": 15,
+        "temperatureMax": 28,
+        "dwellHours": 4,
+        "lookbackHours": 24,
+        "maxGapHours": 2,
+        "minSamples": 4,
+        "clearDwellHours": 1,
+        "unit": "%",
+        "deviceNamePattern": "%vineyard%"
+      }
+    },
+    {
+      "//": "OLIVES — peacock spot (Venturia oleaginea), the wet-season leaf disease that defoliates a grove. It runs cooler and slower than botrytis, and the 10-20C gate is chosen to match the TWELVE-HOUR dwell rather than to bracket germination: conidia germinate from about 5C to 30C with an optimum near 20C, but the minimum wetness needed for infection is 12h only between about 10C and 20C — it rises to 18h at 5C and 24h at 25C. Pairing a 12h dwell with a wider gate would claim infections the wetness never supported. For olive anthracnose, the warmer autumn fruit rot, copy this entry with temperatureMin 18 / temperatureMax 25 and dwellHours 8 rather than widening this one — one entry spanning 10-25C would raise a peacock-spot alert for anthracnose weather and an agent cannot tell them apart from the alert. DISABLED and scoped by name, as above. Where the grove has wetness sensors, add a THIRD entry pointing paths at leaf.wetness with its own humidityMin rather than adding the path here: a wetness percentage and a relative humidity are different quantities and 90 does not mean the same thing in both.",
+      "rule": "mold-risk",
+      "as": "olive-peacock-spot-risk",
+      "enabled": false,
+      "params": {
+        "paths": [
+          "air.relativeHumidity"
+        ],
+        "humidityMin": 90,
+        "humidityMax": null,
+        "temperaturePaths": [
+          "leaf.temperature",
+          "air.temperature",
+          "temperature"
+        ],
+        "temperatureMin": 10,
+        "temperatureMax": 20,
+        "dwellHours": 12,
+        "lookbackHours": 36,
+        "maxGapHours": 3,
+        "minSamples": 6,
+        "clearDwellHours": 3,
+        "unit": "%",
+        "deviceNamePattern": "%olive%"
       }
     },
     {
@@ -832,6 +919,255 @@
         "unit": " g/h",
         "clearMargin": 2,
         "lookbackHours": 6
+      }
+    },
+    {
+      "//": "═══ ACCUMULATION — how much, not how high. Nothing else in this engine integrates over time, and most of the numbers a grower plans against are totals. Read the method parameter carefully: \"integral\" is the area under the curve and is right for anything that is a RATE or a persisting level; \"sum\" adds readings and is right ONLY when each reading is already a per-report quantity. A sum over a rate silently scales with how often the device reports. ═══"
+    },
+    {
+      "//": "GROWING DEGREE DAYS, base 10C, over the last 24h. scale 1/24 converts the C-hours integral into C-days. Reported as info and routed nowhere by default: a daily GDD figure is a planning input, not an alarm. The min bound is the useful half for most operations — a block running COLD against its expected accumulation is the one that will miss its harvest window, and no other rule in this engine can express that. Set min/max from your own phenology model.",
+      "rule": "measurement-accumulation",
+      "as": "growing-degree-days",
+      "enabled": false,
+      "params": {
+        "paths": [
+          "air.temperature",
+          "temperature"
+        ],
+        "method": "integral",
+        "base": 10,
+        "scale": 0.0416667,
+        "min": 8,
+        "max": null,
+        "unit": " GDD",
+        "lookbackHours": 24,
+        "maxGapHours": 3,
+        "minCoverage": 0.8,
+        "minSamples": 6
+      }
+    },
+    {
+      "//": "DAILY LIGHT INTEGRAL for a greenhouse, mol/m2/day from PAR in umol/m2/s. scale 0.0036 = 3600 seconds / 1e6 micromoles. The common minimum target under glass is 10-12; high-light crops want 12-18 and high-wire fruiting vegetables such as tomato and cucumber want 25-30, while low-light crops need only 3-6 — so SET min FROM YOUR CROP, and 12 below is the high-light figure, not a universal one. Below target the crop loses yield silently for weeks and nothing else here would say so. base null because there is no threshold below which light does not count.",
+      "rule": "measurement-accumulation",
+      "as": "daily-light-integral-low",
+      "enabled": false,
+      "params": {
+        "paths": [
+          "air.par"
+        ],
+        "method": "integral",
+        "base": null,
+        "scale": 0.0036,
+        "min": 12,
+        "max": null,
+        "unit": " mol/m²/d",
+        "lookbackHours": 24,
+        "maxGapHours": 2,
+        "minCoverage": 0.9,
+        "minSamples": 12
+      }
+    },
+    {
+      "//": "CHILL ACCUMULATION for deciduous fruit and nuts — almonds, pistachios, cherries, apples. Hours between 0 and 7.2C since dormancy; a warm winter that fails to break dormancy shows up as poor, uneven bloom months later, when nothing can be done about it. Two things make this different from every other check in the file: mode \"total\" adds every cold spell together rather than taking the longest, crediting each reading with the time until the next (capped at maxGapHours) so fragmented cold is not under-counted, because chill does not care whether the cold came in one stretch or twelve; and comparison \"atMost\" fires when the dwell FALLS SHORT of the target, which is a direction no other rule can express — a thing that did not happen often enough leaves no reading for a threshold to catch. The numbers below are a 7-day window against a 100-hour target; set both from your own chill model and variety.",
+      "rule": "measurement-dwell",
+      "as": "chill-hours-short",
+      "enabled": false,
+      "activeMonths": [11, 12, 1, 2],
+      "params": {
+        "paths": [
+          "air.temperature",
+          "temperature"
+        ],
+        "min": 0,
+        "max": 7.2,
+        "mode": "total",
+        "comparison": "atMost",
+        "dwellHours": 100,
+        "lookbackHours": 168,
+        "maxGapHours": 3,
+        "minSamples": 100,
+        "clearDwellHours": 10,
+        "unit": "C"
+      }
+    },
+    {
+      "//": "═══ DERIVED QUANTITIES — computed from two readings on the SAME uplink. None of these is on any path, because no sensor emits them. ═══"
+    },
+    {
+      "//": "VAPOUR PRESSURE DEFICIT, kPa. The governing number under glass: it, not humidity, drives transpiration and stomatal closure, and 85% RH means nothing without the temperature beside it. Most crops sit well between 0.4 and 1.2 kPa; above ~1.5 the plant closes down, below ~0.4 it stops transpiring and calcium stops moving. Both bounds are set here because both directions are a real fault.",
+      "rule": "measurement-derived",
+      "as": "vpd-out-of-band",
+      "enabled": false,
+      "params": {
+        "formula": "vpd",
+        "paths": [
+          "air.temperature",
+          "temperature"
+        ],
+        "humidityPaths": [
+          "air.relativeHumidity"
+        ],
+        "min": 0.4,
+        "max": 1.5,
+        "lookbackHours": 6,
+        "clearMargin": 0.1
+      }
+    },
+    {
+      "//": "DELTA-T, the wet-bulb depression, C. The standard spray-suitability metric: below about 2 the droplets do not evaporate and drift onto whatever is downwind, above about 8 they evaporate before they land and the chemical is wasted. Outside 2-8 the spray should not go out. Route this to whoever holds the wand, not to an agent — the number IS the decision.",
+      "rule": "measurement-derived",
+      "as": "delta-t-unsuitable",
+      "enabled": false,
+      "params": {
+        "formula": "deltaT",
+        "paths": [
+          "air.temperature",
+          "temperature"
+        ],
+        "humidityPaths": [
+          "air.relativeHumidity"
+        ],
+        "min": 2,
+        "max": 8,
+        "lookbackHours": 3,
+        "clearMargin": 0.5
+      }
+    },
+    {
+      "//": "TEMPERATURE-HUMIDITY INDEX for livestock. The standard classification is comfort below 68, mild stress 68-72, moderate 72-80 and severe above 80; milk yield in high-producing cows starts falling around 68 (Zimbelman et al. 2009); 72, the bound set here, is the older Armstrong (1994) threshold — lower it to 68 for high-yielding herds. Shade, sprinklers and fans are the response. Point the scope at the sensors in the barn or the loafing area rather than a weather station in an open field.",
+      "rule": "measurement-derived",
+      "as": "livestock-heat-stress",
+      "enabled": false,
+      "params": {
+        "formula": "thi",
+        "paths": [
+          "air.temperature",
+          "temperature"
+        ],
+        "humidityPaths": [
+          "air.relativeHumidity"
+        ],
+        "min": null,
+        "max": 72,
+        "lookbackHours": 3,
+        "clearMargin": 2,
+        "deviceNamePattern": "%barn%"
+      }
+    },
+    {
+      "//": "═══ CROSS-DEVICE COMPARISON — one sensor against its neighbours, which is the only way to catch a probe that is plausibly wrong. SCOPE EACH INSTANCE TO ONE COMPARABLE GROUP: comparing a greenhouse probe with a dryland one produces a true statement about two unrelated numbers. One entry per irrigation valve or block is the intended shape. ═══"
+    },
+    {
+      "//": "A soil probe disagreeing with the others on its valve: a drifting sensor, a blocked lateral, an emitter that failed, or a line somebody shut last season and forgot. Every probe is individually within range, so no per-device check can see this. Direction \"below\" because a probe reading drier than its neighbours is the irrigation fault worth a truck roll; set \"either\" to catch leaks too. Reported as a situation — it could equally be the one probe installed at the correct depth.",
+      "rule": "measurement-outlier",
+      "as": "soil-probe-outlier",
+      "enabled": false,
+      "params": {
+        "paths": [
+          "soil.moisture"
+        ],
+        "maxDeviations": 3,
+        "direction": "below",
+        "minAbsoluteDifference": 4,
+        "minGroupSize": 4,
+        "lookbackHours": 24,
+        "minSamples": 6,
+        "unit": "%",
+        "deviceNamePattern": "%valve-7-%"
+      }
+    },
+    {
+      "//": "═══ ACTUATION VERIFICATION — the action happened and nothing followed. downlink-unacked catches a command that was never acknowledged; this catches one that WAS, from a device reporting happily, whose physical effect never arrived. ═══"
+    },
+    {
+      "//": "Water was delivered and the root zone never wetted: a blocked lateral, a clogged dripper, or water running past the root zone down a crack. The operator believes this irrigation happened — the counter advanced and every check is green — and finds out at harvest. The meter and probe are usually separate devices: set responseDevices to { \"<meter deveui>\": [\"<probe deveui>\", …] } or this check cannot fire. Tune responseWindowHours to how long water actually takes to reach your probe depth in your soil (hours in heavy clay), and minChange to comfortably above the probe's noise floor.",
+      "rule": "response-missing",
+      "as": "irrigation-ineffective",
+      "enabled": false,
+      "params": {
+        "paths": [
+          "metering.water.total",
+          "pulse.total"
+        ],
+        "triggerDelta": 500,
+        "responseDevices": null,
+        "responsePaths": [
+          "soil.moisture"
+        ],
+        "direction": "rising",
+        "minChange": 3,
+        "responseWindowHours": 6,
+        "lookbackHours": 48
+      }
+    },
+    {
+      "//": "═══ FORECAST — the only checks here that read the future. They need a top-level \"forecast\" block naming a provider, a centroid lat/lng and an API key; without one they skip cleanly and say so. ONE HTTP CALL per sounding is shared by every entry below, so adding forecast checks costs quota only once. The subject is the SITE, not a device: a forecast is about a place. ═══"
+    },
+    {
+      "//": "FROST TONIGHT. This is the single highest-value check in the file, because it is the only one that arrives in time to matter: a frost alert at 04:10 tells a grower their crop is already frosted, and the same alert at 18:00 the evening before is the difference between running the fans and losing the block. withinHours 14 covers an evening decision through to dawn; activeMonths keeps it quiet through summer.",
+      "rule": "forecast-threshold",
+      "as": "frost-forecast",
+      "enabled": false,
+      "severity": "critical",
+      "activeMonths": [1, 2, 3, 4, 9, 10, 11, 12],
+      "params": {
+        "paths": [
+          "air.temperature"
+        ],
+        "min": 1.5,
+        "max": null,
+        "withinHours": 14,
+        "minHours": 1,
+        "unit": "C"
+      }
+    },
+    {
+      "//": "RAIN BEFORE THE SPRAY DRIES. Residue washes off and the money goes on the ground; on heavy ground it is also the machinery-off-the-block call. Uses the forecast-only path forecast.precipitationProbability rather than rain.intensity, because a 70% chance of rain is the decision input and a predicted 0.4 mm/hour is not.",
+      "rule": "forecast-threshold",
+      "as": "rain-forecast",
+      "enabled": false,
+      "params": {
+        "paths": [
+          "forecast.precipitationProbability"
+        ],
+        "min": null,
+        "max": 60,
+        "withinHours": 8,
+        "minHours": 2,
+        "unit": "%"
+      }
+    },
+    {
+      "//": "HEAT EVENT AHEAD — bring the harvest forward, pre-irrigate, move stock into shade. minHours 3 asks for a sustained afternoon rather than one hour the model overshot.",
+      "rule": "forecast-threshold",
+      "as": "heat-forecast",
+      "enabled": false,
+      "activeMonths": [4, 5, 6, 7, 8, 9, 10],
+      "params": {
+        "paths": [
+          "air.temperature"
+        ],
+        "min": null,
+        "max": 38,
+        "withinHours": 36,
+        "minHours": 3,
+        "unit": "C"
+      }
+    },
+    {
+      "//": "WIND CLOSING THE SPRAY WINDOW. Paired with delta-t-unsuitable above, this is the forecast half of the spray decision: delta-T says whether conditions are right now, this says how long they will stay right.",
+      "rule": "forecast-threshold",
+      "as": "spray-wind-forecast",
+      "enabled": false,
+      "params": {
+        "paths": [
+          "wind.speed"
+        ],
+        "min": null,
+        "max": 8,
+        "withinHours": 6,
+        "minHours": 1,
+        "unit": " m/s"
       }
     },
     {
@@ -995,7 +1331,7 @@
       "//": "═══ ASSET TRACKING ═══"
     },
     {
-      "//": "Box fence: replace the bounds with your property corners. Use shape 'radius' with a tight radiusMetres for a fixed asset that should never move — that is a theft alarm.",
+      "//": "Box fence: replace the bounds with your property corners. Use shape 'radius' with a tight radiusMetres for a fixed asset that should never move — that is a theft alarm. clearMargin is metres for both shapes: once raised, the asset must be back inside by that much before the alert resolves.",
       "rule": "geofence-breach",
       "as": "asset-left-property",
       "enabled": false,
@@ -1015,7 +1351,7 @@
         "centerLat": null,
         "centerLon": null,
         "radiusMetres": null,
-        "clearMargin": 0.0005,
+        "clearMargin": 25,
         "lookbackHours": 24
       }
     }

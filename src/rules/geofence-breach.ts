@@ -15,6 +15,26 @@
  *     for a circular area or a single fixed asset that should not move at all
  *     (set a 50 m radius on a pump and you have a theft alarm).
  *
+ * ## Hysteresis
+ *
+ * `clearMargin` is metres for both shapes. While an alert is open the fence is
+ * SHRUNK by the margin — the radius drops to radius − margin, and each edge of a box
+ * moves inward by the margin — so an asset parked on the line cannot resolve and
+ * re-raise on GPS jitter alone. A box is still judged in degrees; the margin is
+ * converted using 1° of latitude ≈ 111 320 m and 1° of longitude ≈ 111 320 m ×
+ * cos(latitude) at the box's mid-latitude, which is well inside GPS error for any
+ * field-sized fence. If the margin is wider than half the box, the shrunk edges meet
+ * at the centre line rather than crossing, so the fence cannot invert.
+ *
+ * ## No fix is not a position
+ *
+ * Many trackers report latitude 0, longitude 0 when they have no satellite fix. That
+ * point is in the Gulf of Guinea, and treating it as real raises a critical breach
+ * thousands of kilometres out for every tracker that wakes up indoors. It is skipped
+ * here (and logged at debug) even though the resolver also drops it, so this rule's
+ * behaviour does not depend on the resolver's. The cost is that an asset genuinely at
+ * 0°, 0° is never judged, which no farm needs.
+ *
  * Distance is computed in TypeScript rather than SQL deliberately: PostGIS is not
  * available in the stack's plain `postgres:16-alpine` image, and a haversine over the
  * handful of rows a fleet's trackers produce is not worth an extension dependency.
@@ -24,6 +44,9 @@ import { int, num, optNum, round, str } from '../params';
 import { latestCoordinates, resolvePaths } from '../measurement';
 import { resolveScope, SCOPE_PARAMS } from '../scope';
 import type { Finding, Rule } from '../types';
+
+/** Metres per degree of latitude (and of longitude at the equator). */
+const METRES_PER_DEGREE = 111_320;
 
 /** Great-circle distance in metres. Earth radius 6 371 008.8 m (mean). */
 function haversineMetres(
@@ -69,9 +92,10 @@ const rule: Rule = {
     centerLon: null,
     radiusMetres: null,
     /**
-     * Hysteresis in metres (radius) or degrees (box). An asset parked on the fence
-     * line would otherwise resolve and re-raise on GPS jitter alone, notifying each
-     * time. Applied outward, so a breaching asset must come back inside by this much.
+     * Hysteresis in metres, for both shapes. An asset parked on the fence line would
+     * otherwise resolve and re-raise on GPS jitter alone, notifying each time. Applied
+     * inward while an alert is open, so a breaching asset must come back inside the
+     * fence by at least this much before the alert resolves.
      */
     clearMargin: 25,
     /** How far back to look for a device's most recent fix. */
@@ -129,7 +153,24 @@ const rule: Rule = {
     const fixes = await latestCoordinates(ctx, latPaths, lonPaths, lookbackHours, scope);
     const findings: Finding[] = [];
 
+    // Box margin in degrees: latitude is uniform, longitude shrinks with cos(latitude).
+    // The floor on cos keeps a polar box from dividing by ~0; nobody fences a pole.
+    const midLat = (north + south) / 2;
+    const marginLat = clearMargin / METRES_PER_DEGREE;
+    const marginLon =
+      clearMargin / (METRES_PER_DEGREE * Math.max(0.01, Math.cos((midLat * Math.PI) / 180)));
+    // Never shrink past the centre line, or a wide margin would invert the box.
+    const shrinkLat = Math.min(marginLat, (north - south) / 2);
+    const shrinkLon = Math.min(marginLon, (east - west) / 2);
+
     for (const f of fixes) {
+      if (f.lat === 0 && f.lon === 0) {
+        ctx.log.debug('skipping a (0, 0) position — a tracker with no fix, not a location', {
+          devEui: f.devEui, at: f.at,
+        });
+        continue;
+      }
+
       const open = ctx.openDevEuis.has(f.devEui);
       const name = f.deviceName ?? f.devEui;
 
@@ -160,26 +201,37 @@ const rule: Rule = {
         continue;
       }
 
-      const margin = open ? clearMargin : 0;
+      // While open the box shrinks, exactly as the radius does above: an asset that
+      // breached must come back inside by the margin, not merely touch the line.
+      const dLat = open ? shrinkLat : 0;
+      const dLon = open ? shrinkLon : 0;
       const outside: string[] = [];
-      if (f.lat > north + margin) outside.push('north');
-      if (f.lat < south - margin) outside.push('south');
-      if (f.lon > east + margin) outside.push('east');
-      if (f.lon < west - margin) outside.push('west');
+      if (f.lat > north - dLat) outside.push('north');
+      if (f.lat < south + dLat) outside.push('south');
+      if (f.lon > east - dLon) outside.push('east');
+      if (f.lon < west + dLon) outside.push('west');
       if (outside.length === 0) continue;
 
+      // Held open inside the fence but within the margin: say so, rather than claim
+      // the asset is outside when an operator looking at the map can see it is not.
+      const beyondFence =
+        f.lat > north || f.lat < south || f.lon > east || f.lon < west;
       findings.push({
         devEui: f.devEui,
         deviceName: f.deviceName,
-        summary:
-          `${name} is outside the permitted area to the ${outside.join(' and ')} ` +
-          `at ${round(f.lat, 5)}, ${round(f.lon, 5)}`,
+        summary: beyondFence
+          ? `${name} is outside the permitted area to the ${outside.join(' and ')} ` +
+            `at ${round(f.lat, 5)}, ${round(f.lon, 5)}`
+          : `${name} is back inside the permitted area but within the ${clearMargin}m ` +
+            `clear margin of the ${outside.join(' and ')} edge at ` +
+            `${round(f.lat, 5)}, ${round(f.lon, 5)}`,
         detail: {
           shape,
           outsideEdges: outside,
           latitude: round(f.lat, 6),
           longitude: round(f.lon, 6),
           bounds: { north, south, east, west },
+          withinClearMargin: !beyondFence,
           clearMargin,
           fixAt: f.at,
         },

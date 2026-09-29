@@ -39,6 +39,7 @@ import { resolve } from 'node:path';
 import type {
   CheckConfig,
   ChirpStackConfig,
+  ForecastConfig,
   HeartbeatConfig,
   HostAddressConfig,
   LeadsmanConfig,
@@ -124,6 +125,49 @@ function readOptString(
   return typeof v === 'string' && v.length > 0 ? v : undefined;
 }
 
+/**
+ * A list of whole numbers inside an inclusive range, deduplicated and sorted.
+ *
+ * Used by `activeMonths` and `activeHours`. An empty array is refused rather than
+ * treated as "all": `"activeMonths": []` reads like a placeholder and would silently
+ * disable the check forever, which is exactly the kind of quiet nothing this engine
+ * tries not to do.
+ */
+function intList(
+  value: unknown,
+  min: number,
+  max: number,
+  at: string,
+): number[] | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (!Array.isArray(value)) throw new ConfigError(`${at} must be an array of whole numbers`);
+  if (value.length === 0) {
+    throw new ConfigError(
+      `${at} must not be empty — omit it to run at every value, or set "enabled": false ` +
+        'to turn the check off',
+    );
+  }
+  const out = new Set<number>();
+  for (const [i, v] of value.entries()) {
+    if (typeof v !== 'number' || !Number.isInteger(v) || v < min || v > max) {
+      throw new ConfigError(`${at}[${i}] must be a whole number from ${min} to ${max}`);
+    }
+    out.add(v);
+  }
+  return [...out].sort((a, b) => a - b);
+}
+
+/** A latitude or longitude, rejected at config time rather than at the first API call. */
+function coordinate(value: unknown, min: number, max: number, at: string): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    throw new ConfigError(`${at} must be a number (got ${JSON.stringify(value)})`);
+  }
+  if (value < min || value > max) {
+    throw new ConfigError(`${at} must be between ${min} and ${max} (got ${value})`);
+  }
+  return value;
+}
+
 /** Same check the webhook destinations apply, so a typo'd URL fails at config time. */
 function assertHttpUrl(value: string, at: string): void {
   try {
@@ -194,12 +238,17 @@ export function parseConfig(raw: unknown): LeadsmanConfig {
       throw new ConfigError(`${at}.notifyTo must be a destination name string`);
     }
 
+    const activeMonths = intList(entry.activeMonths, 1, 12, `${at}.activeMonths`);
+    const activeHours = intList(entry.activeHours, 0, 23, `${at}.activeHours`);
+
     checks.push({
       rule,
       as: kind,
       notifyTo: entry.notifyTo as string | undefined,
       enabled: entry.enabled !== false, // absent means enabled
       severity: entry.severity as Severity | undefined,
+      activeMonths,
+      activeHours,
       params: (entry.params as Record<string, unknown>) ?? {},
     });
   });
@@ -696,6 +745,58 @@ export function parseConfig(raw: unknown): LeadsmanConfig {
     };
   }
 
+  // ── forecast ────────────────────────────────────────────────────────────────
+  // The one block permitted to hold a credential, and the only reason a config file
+  // might not be safe to commit. Enabled only by an explicit `forecast` block: an
+  // environment key alone is not consent to start calling a metered third-party API.
+  let forecast: ForecastConfig | undefined;
+  if (raw.forecast !== undefined) {
+    if (!isPlainObject(raw.forecast)) {
+      throw new ConfigError('config.forecast must be an object');
+    }
+    const rawFc = raw.forecast;
+
+    const provider = rawFc.provider ?? 'weatherbit';
+    if (provider !== 'weatherbit') {
+      throw new ConfigError(
+        `config.forecast.provider must be "weatherbit" (got ${JSON.stringify(provider)})`,
+      );
+    }
+
+    // Coordinates are required and validated here rather than at the first call: a
+    // transposed pair or a string "34.05" fails at 3am against a metered API otherwise,
+    // and a silently wrong point returns a real forecast for the wrong hemisphere.
+    const latitude = coordinate(rawFc.latitude, -90, 90, 'config.forecast.latitude');
+    const longitude = coordinate(rawFc.longitude, -180, 180, 'config.forecast.longitude');
+
+    const hours = rawFc.hours === undefined ? 48 : rawFc.hours;
+    if (typeof hours !== 'number' || !Number.isInteger(hours) || hours < 1 || hours > 240) {
+      throw new ConfigError('config.forecast.hours must be a whole number from 1 to 240');
+    }
+
+    const apiKey = rawFc.apiKey;
+    if (apiKey !== undefined && (typeof apiKey !== 'string' || apiKey.length === 0)) {
+      throw new ConfigError('config.forecast.apiKey must be a non-empty string when present');
+    }
+    const baseUrl = rawFc.baseUrl;
+    if (baseUrl !== undefined) {
+      if (typeof baseUrl !== 'string') {
+        throw new ConfigError('config.forecast.baseUrl must be a string');
+      }
+      assertHttpUrl(baseUrl, 'config.forecast.baseUrl');
+    }
+
+    forecast = {
+      provider: 'weatherbit',
+      latitude,
+      longitude,
+      apiKey: apiKey as string | undefined,
+      hours,
+      timeoutMs: typeof rawFc.timeoutMs === 'number' ? rawFc.timeoutMs : 8_000,
+      baseUrl: baseUrl as string | undefined,
+    };
+  }
+
   const enabledCount = checks.filter((c) => c.enabled).length;
   if (enabledCount > maxChecksPerRun) {
     throw new ConfigError(
@@ -712,6 +813,7 @@ export function parseConfig(raw: unknown): LeadsmanConfig {
     suppress,
     heartbeat,
     chirpstack,
+    forecast,
     hostAddress,
     checks,
   };

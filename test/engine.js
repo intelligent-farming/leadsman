@@ -811,6 +811,254 @@ if (!h.available) {
 
   // ── every rule's SQL actually executes ──────────────────────────────────────
 
+  test('soil-deficit-band: real telemetry separates two blocks with the same miss', async () => {
+    // End to end, and the point of the rule in one test: two blocks spend the SAME
+    // share of the window out of the same band and need opposite corrections. A
+    // min/max threshold would report them identically.
+    const { loadRules } = require('../dist/registry.js');
+    const rule = loadRules().get('soil-deficit-band');
+
+    // 24 hourly readings each. block-dry sits under the floor; block-swing alternates
+    // between well under and well over it.
+    const dry =   [...Array(14).fill(11), ...Array(10).fill(22)];
+    const swing = [...Array(7).fill(11), ...Array(7).fill(34), ...Array(10).fill(22)];
+    for (const [devEui, name, series] of [
+      ['aa', 'block-dry', dry], ['bb', 'block-swing', swing],
+    ]) {
+      for (let i = 0; i < series.length; i += 1) {
+        await h.uplink(env.db, {
+          devEui, deviceName: name, minutesAgo: (series.length - 1 - i) * 60,
+          object: { soil: { moisture: series[i] } },
+        });
+      }
+    }
+
+    const summary = await runSounding({
+      config: {
+        schedule: '* * * * *', statementTimeoutMs: 15_000,
+        checks: [{
+          rule: 'soil-deficit-band', as: 'post-veraison-deficit', enabled: true,
+          params: {
+            ...rule.defaultParams,
+            floor: 18, ceiling: 28, lookbackHours: 24,
+            maxOutOfBandFraction: 0.25, minCoverage: 0.6, minSamples: 12,
+            fieldCapacity: 32, wiltingPoint: 12,
+          },
+        }],
+      },
+      rules: new Map([['soil-deficit-band', rule]]),
+      store: env.store, log: h.quietLogger(),
+    });
+
+    assert.equal(summary.raised, 2, 'both blocks are out of band');
+    const open = await openAlerts();
+    const byName = Object.fromEntries(open.map((a) => [a.dev_eui, a.summary]));
+
+    assert.match(byName.aa, /below the 18% floor/);
+    assert.doesNotMatch(byName.aa, /swinging/);
+    // The block that must NOT be given more water.
+    assert.match(byName.bb, /swinging across the band/);
+    assert.match(byName.bb, /sets too large and too far apart/);
+
+    const detail = await env.store.query(
+      `SELECT dev_eui, detail->>'pattern' AS pattern,
+              (detail->>'depletionFraction')::numeric AS depletion
+         FROM leadsman.alert ORDER BY dev_eui`,
+    );
+    assert.deepEqual(detail.map((r) => r.pattern), ['below', 'oscillating']);
+    // Both ended at 22 % VWC: (32 - 22) / (32 - 12) = 0.5 depleted.
+    assert.equal(Number(detail[0].depletion), 0.5);
+  });
+
+  // ── seasonal gating and the forecast source, through the runner ─────────────
+  // Both are engine-level rather than rule-level, so they are only exercised here.
+
+  test('a check outside its active months is skipped, not run', async () => {
+    // Recorded as `skipped` for the same reason an unconfigured prerequisite is: a
+    // frost check that returned nothing in July is indistinguishable from one that
+    // ran and found no frost, and only one of those means the check is working.
+    let ran = 0;
+    const rule = fakeRule('seasonal', async () => { ran += 1; return [finding('aa')]; });
+    const month = new Date().getUTCMonth() + 1;
+    const otherMonth = month === 1 ? 2 : 1;
+
+    const summary = await runSounding({
+      config: {
+        schedule: '* * * * *', statementTimeoutMs: 15_000, timezone: 'UTC',
+        checks: [{ rule: 'seasonal', as: 'seasonal', enabled: true, activeMonths: [otherMonth] }],
+      },
+      rules: new Map([['seasonal', rule]]),
+      store: env.store, log: h.quietLogger(),
+    });
+
+    assert.equal(ran, 0, 'the rule must not execute at all');
+    assert.equal(summary.results[0].status, 'skipped');
+    assert.equal(summary.raised, 0);
+    assert.deepEqual(await openAlerts(), []);
+
+    // And the skip is recorded, so `leadsman status` can tell dormant from broken.
+    const runs = await env.store.query(
+      "SELECT status FROM leadsman.run WHERE kind = 'seasonal'",
+    );
+    assert.equal(runs[0].status, 'skipped');
+  });
+
+  test('a check inside its active window runs normally', async () => {
+    const rule = fakeRule('seasonal', async () => [finding('aa')]);
+    const month = new Date().getUTCMonth() + 1;
+    const hour = new Date().getUTCHours();
+
+    const summary = await runSounding({
+      config: {
+        schedule: '* * * * *', statementTimeoutMs: 15_000, timezone: 'UTC',
+        checks: [{
+          rule: 'seasonal', as: 'seasonal', enabled: true,
+          activeMonths: [month], activeHours: [hour],
+        }],
+      },
+      rules: new Map([['seasonal', rule]]),
+      store: env.store, log: h.quietLogger(),
+    });
+    assert.equal(summary.raised, 1);
+  });
+
+  test('a forecast rule is skipped when no forecast block is configured', async () => {
+    // Skipped rather than run blind, which is the whole point of `needs`: a forecast
+    // check returning nothing looks exactly like good weather forever.
+    const { loadRules } = require('../dist/registry.js');
+    const rule = loadRules().get('forecast-threshold');
+
+    const summary = await runSounding({
+      config: {
+        schedule: '* * * * *', statementTimeoutMs: 15_000,
+        checks: [{ rule: 'forecast-threshold', as: 'frost-forecast', enabled: true, params: {} }],
+      },
+      rules: new Map([['forecast-threshold', rule]]),
+      store: env.store, log: h.quietLogger(),
+    });
+
+    assert.equal(summary.results[0].status, 'skipped');
+    assert.equal(summary.errors, 0, 'unconfigured is not an error');
+  });
+
+  test('forecast: one sounding, one HTTP call, shared by every forecast check', async () => {
+    // The requirement that shapes the whole design: adding forecast checks must cost
+    // provider quota once, not once per check.
+    const { loadRules } = require('../dist/registry.js');
+    const rule = loadRules().get('forecast-threshold');
+
+    let hits = 0;
+    const iso = (h2) => new Date(Date.now() + h2 * 3_600_000).toISOString().slice(0, 19);
+
+    // Not the `receiver` helper above: that one parses every request as JSON and
+    // records it, and a Weatherbit stub has to answer GETs with a body instead.
+    const http2 = require('node:http');
+    const sockets = new Set();
+    const server = http2.createServer((req, res) => {
+      hits += 1;
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        city_name: 'Dunnigan',
+        data: [
+          { timestamp_utc: iso(2), temp: 4, wind_spd: 2 },
+          { timestamp_utc: iso(4), temp: -2.5, wind_spd: 12 },
+          { timestamp_utc: iso(6), temp: 0.5, wind_spd: 3 },
+        ],
+      }));
+    });
+    server.on('connection', (sock) => { sockets.add(sock); sock.on('close', () => sockets.delete(sock)); });
+    await new Promise((r) => server.listen(0, '127.0.0.1', r));
+    const port = server.address().port;
+
+    try {
+      const summary = await runSounding({
+        config: {
+          schedule: '* * * * *', statementTimeoutMs: 15_000,
+          forecast: {
+            provider: 'weatherbit', latitude: 38.795, longitude: -121.993,
+            apiKey: 'test-key', hours: 48, timeoutMs: 2000,
+            baseUrl: `http://127.0.0.1:${port}`,
+          },
+          checks: [
+            { rule: 'forecast-threshold', as: 'frost-forecast', enabled: true, severity: 'critical',
+              params: { paths: ['air.temperature'], min: 1.5, max: null, withinHours: 12, unit: 'C',
+                        locationLabel: 'Yolo 12A' } },
+            { rule: 'forecast-threshold', as: 'wind-forecast', enabled: true,
+              params: { paths: ['wind.speed'], min: null, max: 8, withinHours: 12,
+                        unit: ' m/s', locationLabel: 'Yolo 12A' } },
+            { rule: 'forecast-threshold', as: 'heat-forecast', enabled: true,
+              params: { paths: ['air.temperature'], min: null, max: 40, withinHours: 12, unit: 'C' } },
+          ],
+        },
+        rules: new Map([['forecast-threshold', rule]]),
+        store: env.store, log: h.quietLogger(),
+      });
+
+      assert.equal(hits, 1, 'three forecast checks must share one provider call');
+      assert.equal(summary.raised, 2, 'frost and wind breach; heat does not');
+
+      const open = await openAlerts();
+      const frost = open.find((a) => a.kind === 'frost-forecast');
+      assert.ok(frost, 'the frost alert was raised');
+      assert.equal(frost.severity, 'critical');
+      assert.match(frost.summary, /Yolo 12A/);
+      assert.match(frost.summary, /-2\.5C \(below 1\.5C\)/);
+
+      // A forecast is about a place, so both alerts are about the site — and they
+      // must not collide with each other, since they share a subject id.
+      const subjects = await env.store.query(
+        'SELECT kind, subject_kind, subject_id FROM leadsman.alert ORDER BY kind',
+      );
+      assert.deepEqual(subjects.map((r) => r.subject_kind), ['site', 'site']);
+      assert.deepEqual(subjects.map((r) => r.kind), ['frost-forecast', 'wind-forecast']);
+    } finally {
+      server.close();
+      for (const sock of sockets) sock.destroy();
+    }
+  });
+
+  test('a forecast provider failure fails only its own checks, not the sounding', async () => {
+    // A metered third-party API is the least reliable thing in the stack, and it must
+    // not be able to stop the database-backed checks from running.
+    const { loadRules } = require('../dist/registry.js');
+    const rules = new Map([
+      ['forecast-threshold', loadRules().get('forecast-threshold')],
+      ['local', fakeRule('local', async () => [finding('aa')])],
+    ]);
+
+    const http2 = require('node:http');
+    const sockets = new Set();
+    const server = http2.createServer((req, res) => { res.writeHead(500).end(); });
+    server.on('connection', (s2) => { sockets.add(s2); s2.on('close', () => sockets.delete(s2)); });
+    await new Promise((r) => server.listen(0, '127.0.0.1', r));
+
+    try {
+      const summary = await runSounding({
+        config: {
+          schedule: '* * * * *', statementTimeoutMs: 15_000,
+          forecast: {
+            provider: 'weatherbit', latitude: 1, longitude: 2, apiKey: 'k',
+            hours: 24, timeoutMs: 2000,
+            baseUrl: `http://127.0.0.1:${server.address().port}`,
+          },
+          checks: [
+            { rule: 'forecast-threshold', as: 'frost-forecast', enabled: true, params: {} },
+            { rule: 'local', as: 'local', enabled: true },
+          ],
+        },
+        rules, store: env.store, log: h.quietLogger(),
+      });
+
+      const byKind = Object.fromEntries(summary.results.map((r) => [r.kind, r.status]));
+      assert.equal(byKind['frost-forecast'], 'error');
+      assert.equal(byKind.local, 'ok', 'the local check still ran');
+      assert.equal(summary.raised, 1);
+    } finally {
+      server.close();
+      for (const sock of sockets) sock.destroy();
+    }
+  });
+
   test('every rule executes its real SQL against the database on its own defaults', async () => {
     // The smoke suite has a similar test, but it stubs `query` — so parameter binding,
     // SQL syntax, and casts are never exercised. That gap let a $-placeholder collision
@@ -826,7 +1074,13 @@ if (!h.available) {
 
     // Rules that legitimately refuse to run until configured. Anything else must
     // execute cleanly; anything new landing here is a deliberate decision.
-    const NEEDS_CONFIG = new Set(['measurement-threshold', 'geofence-breach']);
+    const NEEDS_CONFIG = new Set([
+      'measurement-threshold', 'geofence-breach', 'measurement-accumulation',
+      // Declares needs: ['forecast'], and the runner skips it rather than running it
+      // blind. Called directly here with no source, so it refuses — which is the
+      // behaviour a direct caller should get.
+      'forecast-threshold',
+    ]);
 
     const failures = [];
     for (const [id, rule] of rules) {
@@ -853,6 +1107,190 @@ if (!h.available) {
 
     assert.deepEqual(failures, [], `rules failed against a real database:\n  ${failures.join('\n  ')}`);
     assert.ok(rules.size >= 18, `expected at least 18 rules, found ${rules.size}`);
+  });
+
+  // ── threshold hysteresis, both directions ───────────────────────────────────
+  // clearMargin is set by nine entries in the shipped configs and asserted by nothing.
+  // It is the mechanism that stops a critical alert oscillating: without it a reading
+  // resting on the bound resolves and re-raises every sounding, and every re-raise is
+  // a fresh SMS at 04:00. The two tests below are the same mechanism against opposite
+  // bounds, because the widening has to flip sign between them — min widens UP to
+  // min+margin, max widens DOWN to max-margin. One sign error and the alert either
+  // never clears on one side or clears instantly on the other, and no existing test
+  // would notice.
+
+  /** The example config's frost-risk and heat-stress entries, by name. */
+  const tempCheck = (as, params) => {
+    const { loadRules } = require('../dist/registry.js');
+    const rule = loadRules().get('measurement-threshold');
+    return {
+      rules: new Map([['measurement-threshold', rule]]),
+      check: {
+        rule: 'measurement-threshold', as, enabled: true,
+        params: {
+          ...rule.defaultParams,
+          paths: ['air.temperature', 'temperature', 'leaf.temperature'],
+          unit: 'C', lookbackHours: 6, ...params,
+        },
+      },
+    };
+  };
+
+  const soundCheck = ({ rules, check }) =>
+    runSounding({
+      config: { schedule: '* * * * *', statementTimeoutMs: 15_000, checks: [check] },
+      rules, store: env.store, log: h.quietLogger(),
+    });
+
+  test('frost-risk: an alert survives a recovery that stops short of the clear margin', async () => {
+    // The shipped entry: raise below 1.5C, clear only above 1.5 + 1 = 2.5C.
+    const cfg = tempCheck('frost-risk', { min: 1.5, max: null, clearMargin: 1 });
+
+    // 04:10 — the orchard is at 0.8C.
+    await h.uplink(env.db, {
+      devEui: 'aa', deviceName: 'orchard-east', minutesAgo: 60,
+      object: { air: { temperature: 0.8 } },
+    });
+    const first = await soundCheck(cfg);
+    assert.equal(first.raised, 1);
+    const open = await openAlerts();
+    assert.equal(open.length, 1);
+    assert.equal(open[0].kind, 'frost-risk');
+    assert.match(open[0].summary, /0\.8C is below min 1\.5C/);
+
+    // 04:40 — 2.0C. Back above the raise line, still inside the margin. Resolving here
+    // is the bug: the next dip re-raises and the grower is texted twice for one frost.
+    await h.uplink(env.db, {
+      devEui: 'aa', deviceName: 'orchard-east', minutesAgo: 30,
+      object: { air: { temperature: 2.0 } },
+    });
+    const second = await soundCheck(cfg);
+    assert.equal(second.resolved, 0, '2.0C is inside the clear margin — must stay open');
+    assert.equal((await openAlerts()).length, 1);
+
+    // 05:10 — 3.0C, past the clear line. Now it is genuinely over.
+    await h.uplink(env.db, {
+      devEui: 'aa', deviceName: 'orchard-east', minutesAgo: 0,
+      object: { air: { temperature: 3.0 } },
+    });
+    const third = await soundCheck(cfg);
+    assert.equal(third.resolved, 1, '3.0C is past min + clearMargin — must resolve');
+    assert.deepEqual(await openAlerts(), []);
+
+    // One alert row for one frost, opened and closed — not three.
+    const all = await allAlerts();
+    assert.equal(all.length, 1);
+    assert.ok(all[0].resolved_at);
+  });
+
+  test('heat-stress: the same margin widens downward against an upper bound', async () => {
+    // The mirror case, and the one a sign error breaks silently: raise above 35C, clear
+    // only below 35 - 2 = 33C. A margin applied in the frost direction here would clear
+    // at 37C — above the raise line — so the alert could never resolve at all.
+    const cfg = tempCheck('heat-stress', { min: null, max: 35, clearMargin: 2 });
+
+    await h.uplink(env.db, {
+      devEui: 'bb', deviceName: 'glasshouse-2', minutesAgo: 60,
+      object: { air: { temperature: 38.4 } },
+    });
+    const first = await soundCheck(cfg);
+    assert.equal(first.raised, 1);
+    assert.match((await openAlerts())[0].summary, /38\.4C is above max 35C/);
+
+    // 34C: below the raise line, above the clear line. Still open.
+    await h.uplink(env.db, {
+      devEui: 'bb', deviceName: 'glasshouse-2', minutesAgo: 30,
+      object: { air: { temperature: 34 } },
+    });
+    assert.equal((await soundCheck(cfg)).resolved, 0, '34C is inside the clear margin');
+    assert.equal((await openAlerts()).length, 1);
+
+    // 32C: past max - clearMargin. Resolved.
+    await h.uplink(env.db, {
+      devEui: 'bb', deviceName: 'glasshouse-2', minutesAgo: 0,
+      object: { air: { temperature: 32 } },
+    });
+    assert.equal((await soundCheck(cfg)).resolved, 1, '32C is past max - clearMargin');
+    assert.deepEqual(await openAlerts(), []);
+
+    // And the margin must not be reachable from the wrong side: a device that was never
+    // open does not raise at 34C, or the hysteresis would be a second, looser threshold.
+    await h.uplink(env.db, {
+      devEui: 'cc', deviceName: 'glasshouse-3', minutesAgo: 0,
+      object: { air: { temperature: 34 } },
+    });
+    const fresh = await soundCheck(cfg);
+    assert.equal(fresh.raised, 0, '34C must not raise on a device with no open alert');
+  });
+
+  test('mold-risk: real telemetry raises one alert and it lands on the agent route', async () => {
+    // End to end, because every other test of this rule stops short of the thing it
+    // was asked for: uplinks in, one alert out, delivered to the destination the
+    // fact/situation split reserves for a model rather than to the on-call phone.
+    const { loadRules } = require('../dist/registry.js');
+    const rule = loadRules().get('mold-risk');
+
+    // Nine hourly uplinks from a vineyard block. The first three are a cold saturated
+    // night — 96% at 8C, which infects nothing — and the last six are the real thing.
+    const rh = [96, 96, 96, 96, 96, 96, 96, 96, 96];
+    const temp = [8, 8, 8, 18, 19, 19, 20, 19, 18];
+    for (let i = 0; i < rh.length; i += 1) {
+      await h.uplink(env.db, {
+        devEui: 'aa', deviceName: 'vineyard-north', minutesAgo: 540 - i * 60,
+        object: { air: { relativeHumidity: rh[i], temperature: temp[i] } },
+      });
+    }
+    // A greenhouse sensor just as wet but far too warm for botrytis: it must not fire,
+    // or the gate is doing nothing and the agent pays for it every sounding.
+    for (let i = 0; i < rh.length; i += 1) {
+      await h.uplink(env.db, {
+        devEui: 'bb', deviceName: 'glasshouse-1', minutesAgo: 540 - i * 60,
+        object: { air: { relativeHumidity: 96, temperature: 31 } },
+      });
+    }
+
+    const agent = await receiver((req, res) => { res.writeHead(204); res.end(); });
+    const oncall = await receiver((req, res) => { res.writeHead(204); res.end(); });
+    try {
+      const summary = await runSounding({
+        config: {
+          schedule: '* * * * *',
+          statementTimeoutMs: 15_000,
+          notify: {
+            destinations: {
+              agent: { webhookUrl: agent.url, timeoutMs: 2000 },
+              oncall: { webhookUrl: oncall.url, timeoutMs: 2000 },
+            },
+            // The whole point of the class: facts wake a person, situations go to a model.
+            routing: { fact: 'oncall', situation: 'agent' },
+          },
+          checks: [{
+            rule: 'mold-risk', as: 'grape-botrytis-risk', enabled: true,
+            params: { ...rule.defaultParams, dwellHours: 4, minSamples: 4 },
+          }],
+        },
+        rules: new Map([['mold-risk', rule]]),
+        store: env.store,
+        log: h.quietLogger(),
+      });
+
+      assert.equal(summary.raised, 1, 'the vineyard block only');
+      assert.equal(oncall.received.length, 0, 'a situation must not wake the on-call phone');
+      assert.equal(agent.received.length, 1);
+
+      const body = agent.received[0].body;
+      assert.equal(body.kind, 'grape-botrytis-risk');
+      assert.equal(body.devEui, 'aa');
+      // Five hours of warm saturation, measured first-to-last across six readings.
+      assert.equal(body.detail.dwellHours, 5);
+      assert.equal(body.detail.requiredHours, 4);
+      assert.equal(body.detail.ongoing, true);
+      assert.deepEqual(body.detail.temperatureRange, [18, 20]);
+      assert.match(body.summary, /vineyard-north/);
+    } finally {
+      await agent.close();
+      await oncall.close();
+    }
   });
 
   test('every rule declares tables and columns that exist', async () => {

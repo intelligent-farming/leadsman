@@ -14,6 +14,7 @@
  * The meaningful figure is the *best* gateway's RSSI per uplink (that is the link
  * that actually carried it), averaged over the window — not the mean across all
  * gateways, which drops as soon as a distant gateway starts hearing the device.
+ * SNR is that same gateway's SNR, so the two figures describe one link.
  */
 
 import { int, num, round } from '../params';
@@ -65,28 +66,40 @@ const rule: Rule = {
     const snrThreshold =
       snrRaw === null || snrRaw === undefined ? null : num(ctx.params, 'snrThresholdDb');
 
-    const sc = scopeClause(resolveScope(ctx.params), 5);
+    const sc = scopeClause(resolveScope(ctx.params), 5, 'e');
 
-    // jsonb_typeof guards against a ChirpStack version (or an integration quirk)
-    // storing rx_info as something other than an array — without it, a single odd
-    // row aborts the sounding.
+    // A ChirpStack version (or an integration quirk) can store rx_info as something
+    // other than an array, and a single such row must not abort the sounding. The guard
+    // is the CASE inside the lateral call, not the WHERE clause: Postgres does not
+    // evaluate AND conditions in written order, so `jsonb_typeof(...) = 'array' AND
+    // jsonb_array_length(...) > 0` can still run the second on the non-array row and fail
+    // with "cannot get array length of a non-array". CASE branches are evaluated in order.
+    //
+    // Best gateway per uplink is one gateway: the entry with the highest RSSI, and its
+    // SNR — not the maximum SNR across entries, which can come from a different gateway
+    // than the one whose RSSI is reported. Ties on RSSI go to the higher SNR.
     const rows = await ctx.query<Row>(
       `WITH per_uplink AS (
-         SELECT dev_eui,
-                device_name,
-                (SELECT max((g->>'rssi')::numeric)
-                   FROM jsonb_array_elements(rx_info) AS g
-                  WHERE g ? 'rssi')                     AS best_rssi,
-                (SELECT max((g->>'snr')::numeric)
-                   FROM jsonb_array_elements(rx_info) AS g
-                  WHERE g ? 'snr')                      AS best_snr,
-                jsonb_array_length(rx_info)             AS gateway_count
-           FROM event_up
-          WHERE time > now() - make_interval(hours => $1::int)
-            AND rx_info IS NOT NULL
+         SELECT e.dev_eui,
+                e.device_name,
+                best.rssi                                  AS best_rssi,
+                best.snr                                   AS best_snr,
+                CASE WHEN jsonb_typeof(e.rx_info) = 'array'
+                     THEN jsonb_array_length(e.rx_info) END AS gateway_count
+           FROM event_up e
+           CROSS JOIN LATERAL (
+             SELECT (g->>'rssi')::numeric AS rssi,
+                    (g->>'snr')::numeric  AS snr
+               FROM jsonb_array_elements(
+                      CASE WHEN jsonb_typeof(e.rx_info) = 'array'
+                           THEN e.rx_info ELSE '[]'::jsonb END) AS g
+              WHERE g ? 'rssi'
+              ORDER BY 1 DESC NULLS LAST, 2 DESC NULLS LAST
+              LIMIT 1
+           ) best
+          WHERE e.time > now() - make_interval(secs => $1::float8 * 3600)
+            AND e.rx_info IS NOT NULL
             ${sc.sql}
-            AND jsonb_typeof(rx_info) = 'array'
-            AND jsonb_array_length(rx_info) > 0
        )
        SELECT dev_eui,
               max(device_name)          AS device_name,

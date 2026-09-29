@@ -52,8 +52,12 @@ const rule: Rule = {
      *
      * ChirpStack updates last-seen from the gateway's stats interval, commonly 30
      * seconds. Fifteen minutes tolerates a missed interval or two without treating a
-     * genuinely disconnected gateway as merely deaf — that one is gateway-silent's, and
-     * the two should not both fire for the same unit.
+     * genuinely disconnected gateway as merely deaf — that one is gateway-silent's.
+     *
+     * The two do not both fire for the same unit because gateway-silent reads the same
+     * registry (when configured) and leaves any gateway online within its own
+     * `onlineWithinMinutes` to this check. Keep the two values equal so the line between
+     * "offline" and "deaf" is drawn in one place.
      */
     onlineWithinMinutes: 15,
     /** Window over which the gateway must have forwarded nothing. */

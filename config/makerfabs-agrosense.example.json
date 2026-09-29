@@ -421,7 +421,7 @@
       }
     },
     {
-      "//": "Sustained high humidity is the primary driver of fungal infection periods. Leadsman cannot compute a dew point (it has no derived-value support), so this plus th01-temperature-crash is the practical approximation.",
+      "//": "Sustained high humidity is the primary driver of fungal infection periods. This is the direct signal; for dew point or VPD, add a measurement-derived entry on the same device (air.temperature + air.relativeHumidity).",
       "rule": "measurement-threshold",
       "as": "th01-humidity-high",
       "enabled": true,

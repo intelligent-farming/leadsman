@@ -937,3 +937,337 @@ test('signal: group ids are sent through in the recipients array', async () => {
   api.close();
   assert.deepEqual(JSON.parse(api.seen[0].body).recipients, ['group.dGVzdA==']);
 });
+
+// ── Weatherbit forecast client ───────────────────────────────────────────────
+// Same reasoning as the messaging providers above: the client is only useful if it
+// matches what the vendor actually sends, and the response shape below is copied from
+// a real /v2.0/forecast/hourly call rather than invented. The field names and units
+// are the contract — Weatherbit returns metric under units=M, which is what lets these
+// land on the same vocabulary paths the codecs use with no arithmetic in between.
+
+const { forecastSource, resolveApiKey, ForecastError } = require('../dist/forecast.js');
+
+/** One hour, in Weatherbit's exact shape. */
+const wbHour = (over = {}) => ({
+  timestamp_utc: '2026-09-23T04:00:00',
+  temp: -1.5, rh: 92, wind_spd: 1.4, wind_dir: 200, precip: 0, pres: 1012,
+  solar_rad: 0, dewpt: -2.6, uv: 0, snow: 0, pop: 5, clouds: 9,
+  app_temp: -2.1, wind_gust_spd: 3.4,
+  ...over,
+});
+
+const wbBody = (hours) => JSON.stringify({ city_name: 'Dunnigan', data: hours });
+
+const fcConfig = (port, over = {}) => ({
+  provider: 'weatherbit',
+  latitude: 38.7954, longitude: -121.9932,
+  hours: 48, timeoutMs: 2000,
+  baseUrl: `http://127.0.0.1:${port}`,
+  ...over,
+});
+
+const quiet = { debug() {}, warn() {} };
+
+test('forecast: maps Weatherbit fields onto vocabulary paths, units unchanged', async () => {
+  const srv = await capture((req, res) =>
+    res.writeHead(200, { 'content-type': 'application/json' }).end(wbBody([wbHour()])));
+  try {
+    const fc = await forecastSource(fcConfig(srv.port), 'k', quiet).forecast();
+
+    // The whole point: a forecast temperature and a sensor temperature are the same
+    // path in the same unit, so one threshold means one thing.
+    assert.equal(fc.hours[0].values['air.temperature'], -1.5);
+    assert.equal(fc.hours[0].values['air.relativeHumidity'], 92);
+    assert.equal(fc.hours[0].values['wind.speed'], 1.4);
+    assert.equal(fc.hours[0].values['rain.intensity'], 0);
+    assert.equal(fc.hours[0].values['air.pressure'], 1012);
+    // Concepts with no sensor equivalent get forecast-only paths.
+    assert.equal(fc.hours[0].values['forecast.precipitationProbability'], 5);
+    assert.equal(fc.hours[0].values['forecast.windGust'], 3.4);
+    assert.equal(fc.locationName, 'Dunnigan');
+  } finally { srv.close(); }
+});
+
+test('forecast: requests metric units and the configured point and horizon', async () => {
+  const srv = await capture((req, res) =>
+    res.writeHead(200, { 'content-type': 'application/json' }).end(wbBody([wbHour()])));
+  try {
+    await forecastSource(fcConfig(srv.port, { hours: 12 }), 'secret-key', quiet).forecast();
+    const url = srv.seen[0].url;
+    assert.match(url, /\/v2\.0\/forecast\/hourly\?/);
+    assert.match(url, /lat=38\.7954/);
+    assert.match(url, /lon=-121\.9932/);
+    assert.match(url, /hours=12/);
+    // units=M is load-bearing: without it Weatherbit returns Fahrenheit and mph, and
+    // every threshold in the config silently means something else.
+    assert.match(url, /units=M/);
+  } finally { srv.close(); }
+});
+
+test('forecast: one HTTP call is shared by every caller at the same point', async () => {
+  let hits = 0;
+  const srv = await capture((req, res) => {
+    hits += 1;
+    res.writeHead(200, { 'content-type': 'application/json' }).end(wbBody([wbHour()]));
+  });
+  try {
+    const src = forecastSource(fcConfig(srv.port), 'k', quiet);
+    // Concurrent, to prove the in-flight promise is shared rather than only the
+    // settled value — two checks in the same tick must not race into two requests.
+    await Promise.all([src.forecast(), src.forecast(), src.forecast()]);
+    await src.forecast();
+    assert.equal(hits, 1, 'four calls at the centroid must cost one request');
+
+    await src.forecast({ latitude: 36.7378, longitude: -119.7871 });
+    assert.equal(hits, 2, 'a distinct point costs exactly one more');
+  } finally { srv.close(); }
+});
+
+test('forecast: a missing field is absent, never zero', async () => {
+  // 0 °C and 0 m/s are both real values. A provider that omits a field must not be
+  // read as forecasting freezing — this is the difference between no data and frost.
+  const srv = await capture((req, res) => {
+    const h = wbHour();
+    delete h.temp;
+    delete h.wind_spd;
+    res.writeHead(200, { 'content-type': 'application/json' }).end(wbBody([h]));
+  });
+  try {
+    const fc = await forecastSource(fcConfig(srv.port), 'k', quiet).forecast();
+    assert.equal('air.temperature' in fc.hours[0].values, false);
+    assert.equal('wind.speed' in fc.hours[0].values, false);
+    assert.equal(fc.hours[0].values['air.relativeHumidity'], 92);
+  } finally { srv.close(); }
+});
+
+test('forecast: Weatherbit timestamps are UTC despite carrying no zone suffix', async () => {
+  const srv = await capture((req, res) =>
+    res.writeHead(200, { 'content-type': 'application/json' })
+      .end(wbBody([wbHour({ timestamp_utc: '2026-09-23T04:00:00' })])));
+  try {
+    const fc = await forecastSource(fcConfig(srv.port), 'k', quiet).forecast();
+    // Read as local time this would be wrong by the host's offset, which for a frost
+    // check is the difference between alerting at dusk and alerting after sunrise.
+    assert.equal(fc.hours[0].at, '2026-09-23T04:00:00.000Z');
+  } finally { srv.close(); }
+});
+
+test('forecast: hours are sorted and carry lead time from now', async () => {
+  const now = Date.now();
+  const iso = (h) => new Date(now + h * 3_600_000).toISOString().slice(0, 19);
+  const srv = await capture((req, res) =>
+    res.writeHead(200, { 'content-type': 'application/json' }).end(wbBody([
+      wbHour({ timestamp_utc: iso(5), temp: 5 }),
+      wbHour({ timestamp_utc: iso(1), temp: 1 }),
+      wbHour({ timestamp_utc: iso(3), temp: 3 }),
+    ])));
+  try {
+    const fc = await forecastSource(fcConfig(srv.port), 'k', quiet).forecast();
+    assert.deepEqual(fc.hours.map((h) => h.values['air.temperature']), [1, 3, 5]);
+    assert.ok(Math.abs(fc.hours[0].leadHours - 1) < 0.05);
+  } finally { srv.close(); }
+});
+
+test('forecast: an HTTP error never echoes the URL, which carries the key', async () => {
+  const srv = await capture((req, res) => res.writeHead(403).end('forbidden'));
+  try {
+    const src = forecastSource(fcConfig(srv.port), 'super-secret-key', quiet);
+    await assert.rejects(
+      () => src.forecast(),
+      (err) => {
+        assert.ok(err instanceof ForecastError);
+        assert.match(err.message, /403/);
+        // The key is a query parameter, so an error string that included the URL
+        // would put it into every log line and every alert about the failure.
+        assert.doesNotMatch(err.message, /super-secret-key/);
+        return true;
+      },
+    );
+  } finally { srv.close(); }
+});
+
+test('forecast: a failure is shared by every check in the sounding, not retried by each', async () => {
+  // Regression: the rejected promise used to be evicted, so every forecast check in the
+  // pass refetched in turn — ten checks against a provider returning 500 cost ten
+  // requests, and against one that hangs, ten back-to-back timeouts stalling the
+  // sounding. One sounding, one call, whether it succeeds or not.
+  let hits = 0;
+  const srv = await capture((req, res) => {
+    hits += 1;
+    res.writeHead(500).end();
+  });
+  const warned = [];
+  try {
+    const src = forecastSource(fcConfig(srv.port), 'k', {
+      debug() {}, warn: (m, meta) => warned.push([m, meta]),
+    });
+    for (let i = 0; i < 10; i += 1) {
+      // Sequential on purpose: concurrent callers already shared the in-flight promise.
+      // The bug was the NEXT caller after the rejection settled.
+      await assert.rejects(() => src.forecast(), /HTTP 500/);
+    }
+    assert.equal(hits, 1, 'ten checks against a failing provider must cost one request');
+    assert.equal(warned.length, 1, 'and the outage is logged once, not once per check');
+
+    // A distinct point is a distinct request, as it is on success.
+    await assert.rejects(() => src.forecast({ latitude: 36.7378, longitude: -119.7871 }));
+    assert.equal(hits, 2);
+  } finally { srv.close(); }
+});
+
+test('forecast: the next sounding gets a fresh attempt after a failure', async () => {
+  // The memo lives exactly as long as one source, and the runner builds one per
+  // sounding — so an outage costs this pass, never the next one.
+  let hits = 0;
+  const srv = await capture((req, res) => {
+    hits += 1;
+    if (hits === 1) return res.writeHead(500).end();
+    res.writeHead(200, { 'content-type': 'application/json' }).end(wbBody([wbHour()]));
+  });
+  try {
+    await assert.rejects(() => forecastSource(fcConfig(srv.port), 'k', quiet).forecast());
+    const fc = await forecastSource(fcConfig(srv.port), 'k', quiet).forecast();
+    assert.equal(fc.hours.length, 1);
+  } finally { srv.close(); }
+});
+
+test('forecast: an empty data array is an error, not an empty forecast', async () => {
+  // Silently returning no hours would make every forecast check read "clear" forever.
+  const srv = await capture((req, res) =>
+    res.writeHead(200, { 'content-type': 'application/json' }).end(wbBody([])));
+  try {
+    const src = forecastSource(fcConfig(srv.port), 'k', quiet);
+    await assert.rejects(() => src.forecast(), /no usable hours/);
+  } finally { srv.close(); }
+});
+
+test('forecast: the environment key wins over the config file, and says which', () => {
+  const prev = process.env.LEADSMAN_WEATHERBIT_API_KEY;
+  try {
+    delete process.env.LEADSMAN_WEATHERBIT_API_KEY;
+    assert.deepEqual(resolveApiKey({ apiKey: 'from-file' }), {
+      apiKey: 'from-file', source: 'config',
+    });
+
+    process.env.LEADSMAN_WEATHERBIT_API_KEY = 'from-env';
+    assert.deepEqual(resolveApiKey({ apiKey: 'from-file' }), {
+      apiKey: 'from-env', source: 'env',
+    });
+
+    delete process.env.LEADSMAN_WEATHERBIT_API_KEY;
+    const none = resolveApiKey({});
+    assert.ok('missing' in none);
+    assert.match(none.missing, /LEADSMAN_WEATHERBIT_API_KEY/);
+  } finally {
+    if (prev === undefined) delete process.env.LEADSMAN_WEATHERBIT_API_KEY;
+    else process.env.LEADSMAN_WEATHERBIT_API_KEY = prev;
+  }
+});
+
+// ── forecast-threshold evaluation ────────────────────────────────────────────
+// Against a fake source, never a real API: the rule's job is what it concludes from a
+// list of hours, and every case below is a list of hours.
+
+const { loadRules } = require('../dist/registry.js');
+
+/** Run forecast-threshold over hourly values starting `firstLead` hours out. */
+async function forecastRun(values, params, firstLead = 1) {
+  const rule = loadRules().get('forecast-threshold');
+  const base = Date.parse('2026-07-15T00:00:00.000Z');
+  const hours = values.map((v, i) => ({
+    at: new Date(base + (firstLead + i) * 3_600_000).toISOString(),
+    leadHours: firstLead + i,
+    values: v === null ? {} : { 'air.temperature': v },
+  }));
+  const lines = [];
+  return rule.run({
+    query: async () => [],
+    params: { ...rule.defaultParams, withinHours: 24, ...params },
+    openDevEuis: new Set(),
+    openSubjects: new Set(),
+    kind: 'test',
+    now: new Date(base),
+    log: { debug() {}, info() {}, warn: (m) => lines.push(m), error() {} },
+    forecast: {
+      centroid: { latitude: 0, longitude: 0 },
+      forecast: async () => ({
+        at: { latitude: 0, longitude: 0 }, locationName: 'Test block',
+        retrievedAt: new Date(base).toISOString(), hours,
+      }),
+    },
+  });
+}
+
+test('forecast-threshold: minHours counts CONSECUTIVE breaching hours, not scattered ones', async () => {
+  // Regression: [1,10,1,10,...]-style scatter used to add up to "sustained". Two
+  // single-hour dips separated by a recovery are two excursions, not a 2-hour event.
+  assert.deepEqual(
+    await forecastRun([1, 10, 1, 10, 10], { min: 1.5, max: null, minHours: 2 }),
+    [],
+    'two isolated sub-1.5 hours must not satisfy minHours 2',
+  );
+  // An hour that does not carry the path ends the run too — nothing is known about it.
+  assert.deepEqual(
+    await forecastRun([1, null, 1], { min: 1.5, max: null, minHours: 2 }),
+    [],
+  );
+  const found = await forecastRun([10, 1, 1, 10], { min: 1.5, max: null, minHours: 2 });
+  assert.equal(found.length, 1, 'two adjacent breaching hours are the sustained event');
+  assert.equal(found[0].detail.runHours, 2);
+  assert.equal(found[0].detail.runStartAt, '2026-07-15T02:00:00.000Z');
+  assert.equal(found[0].detail.runEndAt, '2026-07-15T03:00:00.000Z');
+});
+
+test('forecast-threshold: [1,10,10,10,1] is two single-hour dips, not a sustained frost', async () => {
+  // The fact-pass case, as stated: [1,10,10,10,1] against min 1.5 breaches in hours 1
+  // and 5 only — two separate single hours — so minHours 2 must not fire.
+  assert.deepEqual(
+    await forecastRun([1, 10, 10, 10, 1], { min: 1.5, max: null, minHours: 2 }),
+    [],
+  );
+  // Two adjacent breaching hours do satisfy it.
+  const run = await forecastRun([1, 1, 10], { min: 1.5, max: null, minHours: 2 });
+  assert.equal(run.length, 1);
+  assert.equal(run[0].detail.runHours, 2);
+  // And a single breaching hour satisfies the default minHours 1.
+  const tail = await forecastRun([10, 10, 1], { min: 1.5, max: null, minHours: 1 });
+  assert.equal(tail.length, 1);
+  assert.equal(tail[0].detail.worstValue, 1);
+});
+
+test('forecast-threshold: with min and max both set, the summary quotes the worst of the side that breached', async () => {
+  // Regression: whenever min was set the reducer picked the LOWEST crossing, so a heat
+  // breach was reported by its mildest hour — "31C (above 30C)" when 35 was forecast.
+  const heat = await forecastRun([20, 32, 35, 31], { min: 0, max: 30, minHours: 1, unit: 'C' });
+  assert.equal(heat.length, 1);
+  assert.equal(heat[0].detail.worstValue, 35);
+  assert.equal(heat[0].detail.breached, 'max');
+  assert.match(heat[0].summary, /35C \(above 30C\)/);
+  assert.doesNotMatch(heat[0].summary, /31C/);
+});
+
+test('forecast-threshold: a forecast breaching both bounds reports both', async () => {
+  // A frost at dawn and a heat spike in the afternoon are two problems; quoting one
+  // would hide the other.
+  const found = await forecastRun([-2, -3, 10, 36, 38], { min: 0, max: 35, minHours: 1, unit: 'C' });
+  assert.equal(found.length, 1, 'still one site alert');
+  const d = found[0].detail;
+  assert.equal(d.breached, 'both');
+  assert.match(found[0].summary, /-3C \(below 0C\) and 38C \(above 35C\)/);
+  assert.equal(d.worstValue, -3, 'the soonest breach leads');
+  assert.deepEqual(d.breaches.map((b) => [b.bound, b.worstValue]), [['min', -3], ['max', 38]]);
+  assert.equal(d.hoursAffected, 4);
+});
+
+test('forecast-threshold: the hour in progress is excluded at afterHours 0', async () => {
+  // Pins the afterHours doc: the in-progress hour's timestamp is in the past, so its
+  // lead is negative and it never reaches the window — afterHours is not needed for it.
+  const found = await forecastRun([-5, 10, 10], { min: 1.5, max: null, afterHours: 0 }, -0.5);
+  assert.deepEqual(found, []);
+  // afterHours skips hours that START sooner than N hours out.
+  const later = await forecastRun([10, -1, -2], { min: 1.5, max: null, afterHours: 2 }, 1);
+  assert.equal(later.length, 1);
+  assert.equal(later[0].detail.firstBreachAt, '2026-07-15T02:00:00.000Z');
+  const skipped = await forecastRun([-1, 10, 10], { min: 1.5, max: null, afterHours: 2 }, 1);
+  assert.deepEqual(skipped, []);
+});

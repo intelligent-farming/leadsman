@@ -66,6 +66,8 @@ const rule: Rule = {
     lookbackHours: 336,
     /** Need at least this many status readings before averaging means anything. */
     minReadings: 3,
+    /** Narrow this check to part of the fleet — see src/scope.ts. */
+    ...SCOPE_PARAMS,
   },
   requires: [
     { table: 'event_status', columns: ['dev_eui', 'device_name', 'time', 'margin'] },
@@ -99,7 +101,7 @@ const rule: Rule = {
               count(*)                                      AS readings,
               max(time)                                     AS latest_at
          FROM event_status
-        WHERE time > now() - make_interval(hours => $1::int)
+        WHERE time > now() - make_interval(secs => $1::float8 * 3600)
           AND margin IS NOT NULL
           ${sc.sql}
         GROUP BY dev_eui
