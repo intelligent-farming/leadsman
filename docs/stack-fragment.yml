@@ -3,8 +3,13 @@
 #
 # Service definition to add to intelligent-farming-stack/docker-compose.yml.
 #
-# Paste the `leadsman` service into that file's `services:` block and add the two
-# LEADSMAN_* variables to its .env. Leadsman reads the ChirpStack event_* tables in
+# Paste the `leadsman` service into that file's `services:` block and add
+# POSTGRES_LEADSMAN_USER and POSTGRES_LEADSMAN_PASSWORD to its .env (step 1 below) —
+# those two are required. The service also passes through five optional LEADSMAN_*
+# variables from .env, all empty by default: LEADSMAN_INSTANCE_NAME, LEADSMAN_LOG_LEVEL,
+# LEADSMAN_WEBHOOK_TOKEN, LEADSMAN_HEARTBEAT_URL and LEADSMAN_WEATHERBIT_API_KEY (the
+# last is what forecast-threshold checks need; without it they report `skipped`).
+# Leadsman reads the ChirpStack event_* tables in
 # events-postgres and writes its alerts to the leadsman schema in the same database
 # — no new Postgres instance, no new port, nothing published to the host.
 #
@@ -113,6 +118,10 @@
       # Liveness ping. Unset means no heartbeat — see the note above for why an
       # outage-proof receiver has to live off this box.
       LEADSMAN_HEARTBEAT_URL: ${LEADSMAN_HEARTBEAT_URL:-}
+      # Weatherbit key for forecast-threshold checks (the crop packs' frost-tonight
+      # entries). They also need the config's top-level `forecast` block. Unset, every
+      # forecast check reports `skipped`.
+      LEADSMAN_WEATHERBIT_API_KEY: ${LEADSMAN_WEATHERBIT_API_KEY:-}
     volumes:
       - ./config:/etc/leadsman:ro
       # Read-only: chirpStackUrl + apiKey + tenantId + gatewayBridgeHost, written by

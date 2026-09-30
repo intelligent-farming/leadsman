@@ -1,4 +1,7 @@
 /**
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ * Copyright (C) 2026 Intelligent Farming Foundation
+ *
  * Scheduled rule engine over ChirpStack telemetry.
  *
  * Leadsman takes periodic soundings of the ChirpStack event store, evaluates a
@@ -20,6 +23,7 @@
  *   id: 'my-check',
  *   description: 'Flags devices whose reading looks wrong.',
  *   defaultSeverity: 'warning',
+ *   defaultRouting: 'fact',
  *   defaultParams: { threshold: 10 },
  *   requires: [{ table: 'event_up', columns: ['dev_eui', 'time', 'object'] }],
  *   async run(ctx) {
@@ -31,9 +35,6 @@
  * };
  * export default rule;
  * ```
- *
- * SPDX-License-Identifier: AGPL-3.0-or-later
- * Copyright (C) 2026 Intelligent Farming Foundation
  *
  * @packageDocumentation
  */
@@ -74,7 +75,7 @@ export {
 } from './measurement';
 export type { Reading, WindowStat } from './measurement';
 
-export { int, num, str, optNum, jsonPath, pathLabel, round, ParamError } from './params';
+export { int, num, str, optNum, optStr, jsonPath, pathLabel, round, ParamError } from './params';
 
 // Optional device scoping. Most checks are scoped implicitly by their candidate paths
 // (only a pressure sensor emits pressure.gauge); these are for the fields every device
@@ -82,13 +83,18 @@ export { int, num, str, optNum, jsonPath, pathLabel, round, ParamError } from '.
 export { resolveScope, scopeClause, scopeLabel, ANY_DEVICE, SCOPE_PARAMS } from './scope';
 export type { DeviceScope } from './scope';
 
+// Subjects for findings that are not about a device — set `subject` instead of `devEui`.
+export { siteSubject, engineSubject, gatewaySubject, subjectOf, SITE_SUBJECT_ID, ENGINE_SUBJECT_ID } from './subject';
+
 export type {
+  AlertSubject,
   CheckConfig,
   CheckResult,
   Finding,
   LeadsmanConfig,
   Logger,
   NotifyConfig,
+  Routing,
   Rule,
   SchemaRequirement,
   Severity,

@@ -1,3 +1,6 @@
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
+<!-- Copyright (C) 2026 Intelligent Farming Foundation -->
+
 # Normalized measurement vocabulary
 
 Every path a Leadsman check can be pointed at, and which check to use for it.
@@ -42,7 +45,7 @@ candidate — and ignores devices carrying none of them. So a single entry cover
               "min": 1.5, "unit": "C" } }
 ```
 
-`measurement-implausible` enforces the **Range** column above. It is not configured per
+`measurement-implausible` enforces the **Range** column in the tables below. It is not configured per
 path: one config entry covers all 73 paths that carry a declared bound, reading them
 straight from the vocabulary schema. It is named in the Checks column wherever that
 column lists other checks, but its coverage is the Range column itself rather than that
@@ -111,7 +114,7 @@ Groupings worth knowing, since these are the ones that bite if you only list one
 | `air.location` | string | — | `indoor`, `outdoor` | — |
 | `air.temperature` | number | °C | ≥ -273.15 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `mold-risk` (as the gate), `measurement-implausible`, `measurement-derived` |
 | `air.relativeHumidity` | number | % | ≥ 0, ≤ 100 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `mold-risk`, `measurement-implausible`, `measurement-derived` |
-| `air.pressure` | number | hPa | ≥ 900, ≤ 1100 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
+| `air.pressure` | number | hPa | ≥ 300, ≤ 1100 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
 | `air.co2` | number | ppm | ≥ 0, ≤ 1000000 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
 | `air.lightIntensity` | number | lux | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
 | `air.pm1_0` | number | µg/m³ | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
@@ -121,7 +124,7 @@ Groupings worth knowing, since these are the ones that bite if you only list one
 | `air.iaqIndex` | number | 0-500 | ≥ 0, ≤ 500 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
 | `air.solarIrradiance` | number | W/m² | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
 | `air.par` | number | µmol/m²/s | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
-| `air.gasAlarm` | boolean | true = gas detected / abnormal | — | `boolean-alarm` |
+| `air.gasAlarm` | boolean | — | — | `boolean-alarm` |
 
 ### `wind`
 
@@ -135,7 +138,7 @@ Groupings worth knowing, since these are the ones that bite if you only list one
 | Path | Type | Unit | Range | Checks |
 |---|---|---|---|---|
 | `rain.intensity` | number | mm/hour | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
-| `rain.cumulative` | number | mm | ≥ 0 | `counter-spike`, `measurement-missing` |
+| `rain.cumulative` | number | mm | ≥ 0 | `counter-spike`, `measurement-missing`, `measurement-implausible` |
 
 ### `water`
 
@@ -147,7 +150,7 @@ Groupings worth knowing, since these are the ones that bite if you only list one
 | `water.temperature.avg` | number | °C | ≥ -273.15 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
 | `water.temperature.current` | number | °C | ≥ -273.15 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
 | `water.level` | number | m | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
-| `water.pressure` | number | liquid | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
+| `water.pressure` | number | kPa | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
 | `water.ec` | number | µS/cm | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
 | `water.ph` | number | — | ≥ 0, ≤ 14 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
 | `water.turbidity` | number | NTU | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
@@ -159,8 +162,8 @@ Groupings worth knowing, since these are the ones that bite if you only list one
 
 | Path | Type | Unit | Range | Checks |
 |---|---|---|---|---|
-| `metering.water.total` | number | L | ≥ 0 | `counter-stalled`, `counter-spike` |
-| `metering.energy.total` | number | Wh | ≥ 0 | `counter-stalled`, `counter-spike` |
+| `metering.water.total` | number | L | ≥ 0 | `counter-stalled`, `counter-spike`, `measurement-implausible` |
+| `metering.energy.total` | number | Wh | ≥ 0 | `counter-stalled`, `counter-spike`, `measurement-implausible` |
 
 ### `action`
 
@@ -169,13 +172,13 @@ Groupings worth knowing, since these are the ones that bite if you only list one
 | `action.motion.detected` | boolean | — | — | `boolean-alarm` |
 | `action.motion.count` | number | count | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
 | `action.contactState` | string | — | `open`, `closed` | `boolean-alarm` |
-| `action.occupancy.occupied` | boolean | true | — | `boolean-alarm` |
+| `action.occupancy.occupied` | boolean | — | — | `boolean-alarm` |
 | `action.occupancy.duration` | number | s | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
-| `action.button.pressed` | boolean | true | — | `boolean-alarm` |
+| `action.button.pressed` | boolean | — | — | `boolean-alarm` |
 | `action.button.event` | string | — | `single`, `double`, `triple`, `long`, `hold`, `release` | — |
 | `action.button.count` | number | count | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
-| `action.smoke.detected` | boolean | true | — | `boolean-alarm` |
-| `action.switch.state` | boolean | true | — | `boolean-alarm` |
+| `action.smoke.detected` | boolean | — | — | `boolean-alarm` |
+| `action.switch.state` | boolean | — | — | `boolean-alarm` |
 
 ### `pressure`
 
@@ -231,14 +234,14 @@ Groupings worth knowing, since these are the ones that bite if you only list one
 
 | Path | Type | Unit | Range | Checks |
 |---|---|---|---|---|
-| `device.runtime` | number | s | ≥ 0 | `counter-stalled`, `counter-spike` |
+| `device.runtime` | number | s | ≥ 0 | `counter-stalled`, `counter-spike`, `measurement-implausible` |
 
 ### `position`
 
 | Path | Type | Unit | Range | Checks |
 |---|---|---|---|---|
-| `position.latitude` | number | ° | ≥ -90, ≤ 90 | `geofence-breach` |
-| `position.longitude` | number | ° | ≥ -180, ≤ 180 | `geofence-breach` |
+| `position.latitude` | number | ° | ≥ -90, ≤ 90 | `geofence-breach`, `measurement-implausible` |
+| `position.longitude` | number | ° | ≥ -180, ≤ 180 | `geofence-breach`, `measurement-implausible` |
 
 ### `analog`
 
@@ -254,7 +257,7 @@ Groupings worth knowing, since these are the ones that bite if you only list one
 | Path | Type | Unit | Range | Checks |
 |---|---|---|---|---|
 | `pulse.count` | number | count | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
-| `pulse.total` | number | count | ≥ 0 | `counter-stalled`, `counter-spike` |
+| `pulse.total` | number | count | ≥ 0 | `counter-stalled`, `counter-spike`, `measurement-implausible` |
 
 ### `people`
 
@@ -262,7 +265,7 @@ Groupings worth knowing, since these are the ones that bite if you only list one
 |---|---|---|---|---|
 | `people.in` | number | count | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
 | `people.out` | number | count | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
-| `people.total` | number | in - out | — | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
+| `people.total` | number | — | — | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck` |
 | `people.present` | number | count | ≥ 0 | `measurement-threshold`, `measurement-peak`, `measurement-rate`, `measurement-stuck`, `measurement-implausible` |
 
 ### `hvac`
@@ -315,7 +318,7 @@ whole category.
 | leaf-wetness | `leaf.wetness` | `leaf.temperature`, `air.temperature`, `battery` |
 | light | `air.lightIntensity` | `battery` |
 | linear-position | — | `air.temperature`, `battery` |
-| motion | `action.motion` | `action.motion.detected`, `action.motion.count`, `battery` |
+| motion | `action.motion.*` | `action.motion.detected`, `action.motion.count`, `battery` |
 | occupancy | `action.occupancy.occupied` | `action.occupancy.duration`, `air.temperature`, `battery` |
 | particulate | — | `air.temperature`, `air.relativeHumidity`, `battery` |
 | people-counter | — | `air.temperature`, `battery` |

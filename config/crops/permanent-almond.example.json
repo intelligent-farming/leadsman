@@ -1,0 +1,360 @@
+{
+  "//license": "SPDX-License-Identifier: AGPL-3.0-or-later; Copyright (C) 2026 Intelligent Farming Foundation",
+  "//": "Almond. Agronomic entries are scoped by deviceNamePattern to placeholders (%almond%) — rename devices to match or replace the pattern with deviceProfiles before trusting an alert. Thresholds are the published extension figures cited in each entry; they are starting points, not calibrations.",
+  "//months": "activeMonths are Sacramento / San Joaquin Valley timing: bloom February–March, hull split late June–July for Nonpareil and later for later varieties.",
+  "//enabled": "Enabled: checks whose threshold is a published figure the sensor measures directly — air, leaf and soil temperature, humidity, durations, rates, pH. Disabled: checks whose threshold depends on this soil or this probe (volumetric moisture, EC, N, the 'wet' cut-off of a leaf-wetness sensor) or that need the forecast block — each says what to set before enabling it.",
+  "schedule": "*/15 * * * *",
+  "timezone": "America/Los_Angeles",
+  "statementTimeoutMs": 15000,
+  "maxChecksPerRun": 64,
+  "checks": [
+    {
+      "//": "═══ FLEET HEALTH — every pack carries these, so the pack runs on its own. None needs crop tuning. ═══"
+    },
+    {
+      "rule": "device-silent",
+      "params": {
+        "silentMinutes": 180
+      }
+    },
+    {
+      "rule": "decode-failure"
+    },
+    {
+      "rule": "measurement-implausible"
+    },
+    {
+      "rule": "status-battery-low"
+    },
+    {
+      "//": "═══ BLOOM FREEZE ═══ UC: hardiness ranks pink bud > full bloom > small nut. Pink bud tolerates −3.9 to −6.1 °C (25–21 °F); full bloom is damaged at −2.2 °C (28 °F) and 30 minutes at −2.8 °C (27 °F) costs half the crop or more; small nuts suffer significant loss at −2.2 °C. Peerless and Carmel are the most sensitive varieties. activeMonths approximate stage by month and overlap on purpose. Sources: Sacramento Valley Orchards, \"Frost Protection\" (from the UC Almond Production Manual, ch. 23), https://www.sacvalleyorchards.com/almonds/horticulture/frost-protection-2/ ; The Almond Doctor, https://www.thealmonddoctor.com/blog/almond-frost-sensitivity"
+    },
+    {
+      "rule": "measurement-peak",
+      "as": "almond-freeze-pink-bud",
+      "severity": "critical",
+      "activeMonths": [2],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.temperature", "temperature"],
+        "direction": "min",
+        "threshold": -3.9,
+        "unit": "C",
+        "lookbackHours": 12,
+        "minSamples": 3,
+        "deviceNamePattern": "%almond%"
+      }
+    },
+    {
+      "rule": "measurement-peak",
+      "as": "almond-freeze-full-bloom",
+      "severity": "critical",
+      "activeMonths": [2, 3],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.temperature", "temperature"],
+        "direction": "min",
+        "threshold": -2.2,
+        "unit": "C",
+        "lookbackHours": 12,
+        "minSamples": 3,
+        "deviceNamePattern": "%almond%"
+      }
+    },
+    {
+      "//": "−2.8 °C held 30 minutes at full bloom: the published figure for ≥ 50 % crop loss.",
+      "rule": "measurement-dwell",
+      "as": "almond-freeze-full-bloom-crop-loss",
+      "severity": "critical",
+      "activeMonths": [2, 3],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.temperature", "temperature"],
+        "min": null,
+        "max": -2.8,
+        "mode": "longest",
+        "comparison": "atLeast",
+        "dwellHours": 0.5,
+        "lookbackHours": 24,
+        "maxGapHours": 2,
+        "minSamples": 2,
+        "clearDwellHours": 0.25,
+        "unit": "C",
+        "deviceNamePattern": "%almond%"
+      }
+    },
+    {
+      "rule": "measurement-peak",
+      "as": "almond-freeze-small-nut",
+      "severity": "critical",
+      "activeMonths": [3, 4],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.temperature", "temperature"],
+        "direction": "min",
+        "threshold": -2.2,
+        "unit": "C",
+        "lookbackHours": 12,
+        "minSamples": 3,
+        "deviceNamePattern": "%almond%"
+      }
+    },
+    {
+      "//": "FROST TONIGHT. FAO Frost Protection (Snyder, UC Davis): start wind machines at about 0 °C, and in any case before the crop's critical temperature. Raised up to 14 h ahead so the decision is made the evening before. DISABLED: needs the top-level forecast block and a Weatherbit key (see README, Forecast).",
+      "rule": "forecast-threshold",
+      "as": "almond-frost-forecast",
+      "enabled": false,
+      "severity": "critical",
+      "activeMonths": [2, 3],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.temperature"],
+        "min": 0,
+        "max": null,
+        "withinHours": 14,
+        "minHours": 1,
+        "unit": "C"
+      }
+    },
+    {
+      "//": "═══ WET BLOOM ═══"
+    },
+    {
+      "//": "BROWN ROT BLOSSOM BLIGHT (Monilinia laxa — UC IPM names it the main blossom-blight species in California; M. fructicola is rare here). How long flowers must stay wet to be infected depends on temperature, so the curve is tiled into five bands, and each band's dwellHours is the LONGEST requirement anywhere in it — no band alerts on less wetness than the model needs. The hours are the 40 %-incidence contour of the Tamm et al. 1995 model (M. laxa on sweet-cherry blossoms, controlled wetness at 5–20 °C): 10.2 h at 5 °C, 5.8 h at 8 °C, 3.4 h at 12 °C, 2.3–2.8 h across 15–22 °C, 4.9 h at 25 °C (above 20 °C is the paper's own extrapolation). Wilcox 1989 (M. fructicola, sour cherry) agrees at 16–20 °C (28–72 % blight after 5 h) and needs far longer below 12 °C. Caveats for the agronomist: the data are free-water hours at a high spore load (the authors call it a worst case, and say wetness was under-measured by up to 4 h); they are cherry data — no almond, apricot or peach blossom curve was found; RH ≥ 90 % stands in for surface wetness; and mold-risk needs one unbroken run inside one band, so a wet period whose temperature drifts across a band edge can go unreported. Flowers are susceptible from pink bud to petal fall. Where a leaf.wetness sensor is installed, copy the entries with paths [\"leaf.wetness\"] and that sensor's wet cut-off as humidityMin. Sources: Tamm, Minder & Flückiger 1995, Phytopathology 85:401, https://www.apsnet.org/publications/phytopathology/backissues/documents/1995articles/phyto85n04_401.pdf ; Wilcox 1989, Phytopathology 79:530, https://www.apsnet.org/publications/phytopathology/backissues/documents/1989articles/phyto79n05_530.pdf ; UC IPM almond (species, timing), https://ipm.ucanr.edu/agriculture/almond/brown-rot-blossom-blight/",
+      "rule": "mold-risk",
+      "as": "almond-brown-rot-cold",
+      "activeMonths": [2, 3],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.relativeHumidity"],
+        "humidityMin": 90,
+        "humidityMax": null,
+        "temperaturePaths": ["leaf.temperature", "air.temperature", "temperature"],
+        "temperatureMin": 5,
+        "temperatureMax": 8,
+        "dwellHours": 10.5,
+        "lookbackHours": 24,
+        "maxGapHours": 2,
+        "minSamples": 4,
+        "clearDwellHours": 2.62,
+        "unit": "%",
+        "deviceNamePattern": "%almond%"
+      }
+    },
+    {
+      "rule": "mold-risk",
+      "as": "almond-brown-rot-cool",
+      "activeMonths": [2, 3],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.relativeHumidity"],
+        "humidityMin": 90,
+        "humidityMax": null,
+        "temperaturePaths": ["leaf.temperature", "air.temperature", "temperature"],
+        "temperatureMin": 8,
+        "temperatureMax": 12,
+        "dwellHours": 6,
+        "lookbackHours": 24,
+        "maxGapHours": 2,
+        "minSamples": 4,
+        "clearDwellHours": 1.5,
+        "unit": "%",
+        "deviceNamePattern": "%almond%"
+      }
+    },
+    {
+      "rule": "mold-risk",
+      "as": "almond-brown-rot-mild",
+      "activeMonths": [2, 3],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.relativeHumidity"],
+        "humidityMin": 90,
+        "humidityMax": null,
+        "temperaturePaths": ["leaf.temperature", "air.temperature", "temperature"],
+        "temperatureMin": 12,
+        "temperatureMax": 16,
+        "dwellHours": 3.5,
+        "lookbackHours": 24,
+        "maxGapHours": 2,
+        "minSamples": 4,
+        "clearDwellHours": 0.88,
+        "unit": "%",
+        "deviceNamePattern": "%almond%"
+      }
+    },
+    {
+      "rule": "mold-risk",
+      "as": "almond-brown-rot-warm",
+      "activeMonths": [2, 3],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.relativeHumidity"],
+        "humidityMin": 90,
+        "humidityMax": null,
+        "temperaturePaths": ["leaf.temperature", "air.temperature", "temperature"],
+        "temperatureMin": 16,
+        "temperatureMax": 22,
+        "dwellHours": 3,
+        "lookbackHours": 24,
+        "maxGapHours": 2,
+        "minSamples": 4,
+        "clearDwellHours": 0.75,
+        "unit": "%",
+        "deviceNamePattern": "%almond%"
+      }
+    },
+    {
+      "rule": "mold-risk",
+      "as": "almond-brown-rot-hot",
+      "activeMonths": [2, 3],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.relativeHumidity"],
+        "humidityMin": 90,
+        "humidityMax": null,
+        "temperaturePaths": ["leaf.temperature", "air.temperature", "temperature"],
+        "temperatureMin": 22,
+        "temperatureMax": 25,
+        "dwellHours": 5,
+        "lookbackHours": 24,
+        "maxGapHours": 2,
+        "minSamples": 4,
+        "clearDwellHours": 1.25,
+        "unit": "%",
+        "deviceNamePattern": "%almond%"
+      }
+    },
+    {
+      "//": "SHOT HOLE (Wilsonomyces). The Almond Doctor: infection after 18 h wet at 10 °C, or 8 h at 20 °C — the warm end is already covered by almond-brown-rot-mild. Jacket rot has no published threshold beyond \"cool and wet during late bloom\" and is not in this pack. Sources: https://www.thealmonddoctor.com/blog/shot-hole-fungus-on-almond ; UC IPM, \"Green fruit rot (jacket rot)\", https://ipm.ucanr.edu/agriculture/almond/green-fruit-rot-jacket-rot/",
+      "rule": "mold-risk",
+      "as": "almond-shot-hole-cool",
+      "activeMonths": [2, 3, 4],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.relativeHumidity"],
+        "humidityMin": 90,
+        "humidityMax": null,
+        "temperaturePaths": ["leaf.temperature", "air.temperature", "temperature"],
+        "temperatureMin": 10,
+        "temperatureMax": 20,
+        "dwellHours": 18,
+        "lookbackHours": 36,
+        "maxGapHours": 2,
+        "minSamples": 4,
+        "clearDwellHours": 3,
+        "unit": "%",
+        "deviceNamePattern": "%almond%"
+      }
+    },
+    {
+      "//": "═══ HULL SPLIT ═══"
+    },
+    {
+      "//": "REGULATED DEFICIT AT HULL SPLIT. UC ANR 8515: from kernel fill to 90 % hull split, irrigate only when stem water potential reaches −14 to −18 bar; that cuts hull rot 60–90 % and saves 10–15 % of seasonal water, at a 2–3 % kernel-weight cost and no yield loss. Wetter than about −14 bar during hull split is what feeds hull rot, so \"above\" the band is the alert that matters here. DISABLED: the targets are stem water potential, which no codec emits; floor and ceiling are the soil moisture this probe reads when the pressure chamber shows −18 and −14 bar — pair a few pressure-chamber readings with the probe to set them. Sources: UC ANR Publication 8515, https://ucanr.edu/media/310055 ; Sacramento Valley Orchards, hull rot, https://www.sacvalleyorchards.com/almonds/foliar-diseases/almond-hull-rot-cultural-and-chemical-management/",
+      "rule": "soil-deficit-band",
+      "as": "almond-hull-split-deficit",
+      "enabled": false,
+      "activeMonths": [6, 7],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["soil.moisture"],
+        "floor": 18,
+        "ceiling": 28,
+        "lookbackHours": 72,
+        "maxOutOfBandFraction": 0.25,
+        "minCoverage": 0.6,
+        "maxGapHours": 6,
+        "minSamples": 12,
+        "clearMarginFraction": 0.05,
+        "unit": "%",
+        "deviceNamePattern": "%almond%"
+      }
+    },
+    {
+      "//": "ROOT-ZONE SALINITY — almond: Maas–Hoffman threshold ECe 1.5 dS/m, above which yield declines. DISABLED until converted to what the probe reads. Maas–Hoffman thresholds are saturated-paste ECe. A soil probe reports bulk EC (or pore EC), which is not ECe: FAO 29 gives soil-water EC ≈ 2 × ECe at field capacity, and bulk EC is lower than pore EC and moves with water content. Convert before enabling — take a saturated-paste lab sample beside the probe and scale this threshold by the probe/ECe ratio. Source: FAO Irrigation and Drainage Paper 29, ch. 2 and Annex 1 (Maas & Grattan 1999), https://www.fao.org/4/t0234e/t0234e02.htm , https://www.fao.org/4/y4263e/y4263e0e.htm",
+      "rule": "measurement-threshold",
+      "as": "almond-salinity-high",
+      "enabled": false,
+      "params": {
+        "paths": ["soil.ec"],
+        "min": null,
+        "max": 1.5,
+        "unit": " dS/m",
+        "clearMargin": 0.15,
+        "sustainMinutes": 1440,
+        "lookbackHours": 48,
+        "deviceNamePattern": "%almond%"
+      }
+    },
+    {
+      "//": "═══ PESTS AND CHILL ═══"
+    },
+    {
+      "//": "NAVEL ORANGEWORM. UC IPM model: 55/94 °F lower/upper thresholds, single sine, horizontal cutoff, counted from the biofix — the first of two consecutive dates on which egg laying increases in 75 % of egg traps. Each following generation's egg laying begins about 1056 °F-days after the previous one. DISABLED: since is a placeholder — set it to this year's observed biofix date (YYYY-MM-DD) each spring. Source: UC IPM, https://ipm.ucanr.edu/weather/pest-and-plant-models/?modelKey=2780 ; UC IPM DD table, https://ipm.ucanr.edu/WEATHER/DDTABLE/navel_orangeworm.html",
+      "rule": "degree-day-milestone",
+      "as": "almond-navel-orangeworm-flight",
+      "enabled": false,
+      "activeMonths": [4, 5, 6, 7, 8, 9, 10],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.temperature", "temperature"],
+        "method": "sine",
+        "lower": 55,
+        "upper": 94,
+        "cutoff": "horizontal",
+        "units": "F",
+        "since": "04-15",
+        "milestones": [
+          {
+            "at": 1056,
+            "label": "2nd flight egg laying"
+          },
+          {
+            "at": 2112,
+            "label": "3rd flight egg laying"
+          },
+          {
+            "at": 3168,
+            "label": "4th flight egg laying"
+          }
+        ],
+        "holdHours": 72,
+        "deviceNamePattern": "%almond%"
+      }
+    },
+    {
+      "//": "CHILL SHORTFALL in chill portions (Dynamic model). UC: Nonpareil needs 22–23 portions, Desmayo Largueta 28, Ferragnès 32 — set requirement to the block's most demanding variety. Raised from February 1 while the season is still short. No extension source gives almond chill HOURS, so none is offered. Source: UC Fruit & Nut Research and Information Center, crop chill requirements, https://fruitsandnuts.ucanr.edu/Weather_Services/chilling_accumulation_models/CropChillReq/",
+      "rule": "chill-accumulation",
+      "as": "almond-chill-short",
+      "severity": "info",
+      "activeMonths": [2, 3],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.temperature", "temperature"],
+        "model": "dynamic",
+        "since": "11-01",
+        "requirement": 23,
+        "comparison": "short",
+        "byDate": "02-01",
+        "deviceNamePattern": "%almond%"
+      }
+    },
+    {
+      "//": "Info when the requirement is met.",
+      "rule": "chill-accumulation",
+      "as": "almond-chill-met",
+      "severity": "info",
+      "activeMonths": [12, 1, 2, 3],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.temperature", "temperature"],
+        "model": "dynamic",
+        "since": "11-01",
+        "requirement": 23,
+        "comparison": "reached",
+        "deviceNamePattern": "%almond%"
+      }
+    }
+  ]
+}

@@ -135,6 +135,13 @@ export interface SoundingContext {
   now: Date;
 
   /**
+   * The config's IANA timezone. Checks that count local days — degree-days from a
+   * biofix, chill since dormancy, streaks of qualifying days — read it so that "a day"
+   * is a local day. Absent in hand-built contexts; treat that as UTC.
+   */
+  timezone?: string;
+
+  /**
    * ChirpStack's own view of the gateways, when a connection is configured.
    *
    * `rx_info` shows which gateways *forwarded* an uplink, which is enough to notice one
@@ -412,6 +419,26 @@ export interface CheckConfig {
    * one continuous night.
    */
   activeHours?: number[];
+  /**
+   * Read `activeHours` on the zone's standard time all year, instead of the wall clock.
+   *
+   * For published rules stated in standard time — UC's lettuce downy mildew model treats
+   * wetness still present at "10:00 a.m. (11:00 a.m. during Daylight Savings Time)". With
+   * this set, `activeHours: [10]` is 10:00 standard (11:00 on the clock) through daylight
+   * saving, exactly on the change dates, and needs no second entry per season.
+   */
+  activeHoursStandardTime?: boolean;
+  /**
+   * Resolve this check's open alerts while `activeMonths` gates it out.
+   *
+   * By default a gated-out check is not run at all, so its open alerts are neither
+   * refreshed nor resolved: a bloom-frost alert raised on the last night of March stays
+   * open until the check next runs, eleven months later. That is right for a check whose
+   * alert describes a lasting state and wrong for one whose alert describes a stage —
+   * set this on stage-window checks. Only the month gate resolves; `activeHours` never
+   * does, or a morning-only check would resolve and re-notify every afternoon.
+   */
+  resolveOutOfSeason?: boolean;
   params?: Record<string, unknown>;
 }
 

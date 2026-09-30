@@ -922,6 +922,53 @@ if (!h.available) {
     assert.equal(summary.raised, 1);
   });
 
+  test('resolveOutOfSeason closes a stage alert when its months end — and only then', async () => {
+    const rule = fakeRule('stage', async () => [finding('aa')]);
+    const month = new Date().getUTCMonth() + 1;
+    const otherMonth = month === 1 ? 2 : 1;
+    const hour = new Date().getUTCHours();
+    const run = (check) => runSounding({
+      config: {
+        schedule: '* * * * *', statementTimeoutMs: 15_000, timezone: 'UTC',
+        checks: [{ rule: 'stage', as: 'stage', enabled: true, ...check }],
+      },
+      rules: new Map([['stage', rule]]),
+      store: env.store, log: h.quietLogger(),
+    });
+
+    await run({ activeMonths: [month] });
+    assert.equal((await openAlerts()).length, 1);
+
+    // Out of hours only: the flag must not resolve, or a morning-only check would close
+    // and re-notify every afternoon.
+    await run({ activeMonths: [month], activeHours: [(hour + 12) % 24], resolveOutOfSeason: true });
+    assert.equal((await openAlerts()).length, 1, 'an hour gate must not resolve');
+
+    // Out of season without the flag: left open, as before.
+    await run({ activeMonths: [otherMonth] });
+    assert.equal((await openAlerts()).length, 1, 'default behaviour is unchanged');
+
+    // Out of season with it: resolved, and the skip records how many.
+    const summary = await run({ activeMonths: [otherMonth], resolveOutOfSeason: true });
+    assert.equal(summary.results[0].status, 'skipped');
+    assert.equal(summary.results[0].resolved, 1);
+    assert.deepEqual(await openAlerts(), []);
+  });
+
+  test('the runner hands checks the config timezone', async () => {
+    let seen = null;
+    const rule = fakeRule('tz', async (ctx) => { seen = ctx.timezone; return []; });
+    await runSounding({
+      config: {
+        schedule: '* * * * *', statementTimeoutMs: 15_000, timezone: 'America/Los_Angeles',
+        checks: [{ rule: 'tz', as: 'tz', enabled: true }],
+      },
+      rules: new Map([['tz', rule]]),
+      store: env.store, log: h.quietLogger(),
+    });
+    assert.equal(seen, 'America/Los_Angeles');
+  });
+
   test('a forecast rule is skipped when no forecast block is configured', async () => {
     // Skipped rather than run blind, which is the whole point of `needs`: a forecast
     // check returning nothing looks exactly like good weather forever.
@@ -1080,6 +1127,9 @@ if (!h.available) {
       // blind. Called directly here with no source, so it refuses — which is the
       // behaviour a direct caller should get.
       'forecast-threshold',
+      // Agronomic models that are meaningless without the crop's own numbers: a
+      // milestone table, a variety's chill requirement, a daily condition.
+      'degree-day-milestone', 'chill-accumulation', 'daily-streak',
     ]);
 
     const failures = [];

@@ -63,7 +63,7 @@ export const VOCABULARY_RANGES: ReadonlyMap<string, VocabularyRange> = new Map<
   ['air.pm10', [0, null]],
   ['air.pm1_0', [0, null]],
   ['air.pm2_5', [0, null]],
-  ['air.pressure', [900, 1100]],
+  ['air.pressure', [300, 1100]],
   ['air.relativeHumidity', [0, 100]],
   ['air.solarIrradiance', [0, null]],
   ['air.temperature', [-273.15, null]],

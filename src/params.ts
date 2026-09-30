@@ -44,6 +44,12 @@ export function optNum(params: Record<string, unknown>, key: string): number | n
   return num(params, key);
 }
 
+export function optStr(params: Record<string, unknown>, key: string): string | null {
+  const v = params[key];
+  if (v === null || v === undefined) return null;
+  return str(params, key);
+}
+
 /**
  * A JSONB path for the `#>>` operator.
  *

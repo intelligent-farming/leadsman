@@ -1,0 +1,538 @@
+{
+  "//license": "SPDX-License-Identifier: AGPL-3.0-or-later; Copyright (C) 2026 Intelligent Farming Foundation",
+  "//": "Stone fruit — peach, nectarine, sweet cherry, apricot. Agronomic entries are scoped by deviceNamePattern to placeholders (%peach% (also nectarines), %cherry%, %apricot%) — rename devices to match or replace the pattern with deviceProfiles before trusting an alert. Thresholds are the published extension figures cited in each entry; they are starting points, not calibrations.",
+  "//months": "activeMonths are Central Valley timing: bloom February–March.",
+  "//enabled": "Enabled: checks whose threshold is a published figure the sensor measures directly — air, leaf and soil temperature, humidity, durations, rates, pH. Disabled: checks whose threshold depends on this soil or this probe (volumetric moisture, EC, N, the 'wet' cut-off of a leaf-wetness sensor) or that need the forecast block — each says what to set before enabling it.",
+  "schedule": "*/15 * * * *",
+  "timezone": "America/Los_Angeles",
+  "statementTimeoutMs": 15000,
+  "maxChecksPerRun": 64,
+  "checks": [
+    {
+      "//": "═══ FLEET HEALTH — every pack carries these, so the pack runs on its own. None needs crop tuning. ═══"
+    },
+    {
+      "rule": "device-silent",
+      "params": {
+        "silentMinutes": 180
+      }
+    },
+    {
+      "rule": "decode-failure"
+    },
+    {
+      "rule": "measurement-implausible"
+    },
+    {
+      "rule": "status-battery-low"
+    },
+    {
+      "//": "═══ BLOOM FREEZE ═══ WSU critical temperatures, 30-minute exposure, as 10 % kill / 90 % kill. Peach and nectarine: full bloom −2.8 / −4.4 °C, post-bloom −2.2 / −3.9 °C. Sweet cherry: full bloom and post-bloom −2.2 / −3.9 °C. Apricot: full bloom −2.8 / −5.6 °C. The 10 % figure is the warning; the 90 % figure is the loss. Source: WSU critical temperatures for frost damage on fruit trees (30-minute exposure), as reprinted in USU IPM-012-11, https://extension.usu.edu/productionhort/files/CriticalTemperaturesFrostDamageFruitTrees.pdf ; https://cpg.treefruit.wsu.edu/critical-temperatures/"
+    },
+    {
+      "rule": "measurement-peak",
+      "as": "peach-freeze-bloom-10pct",
+      "severity": "critical",
+      "activeMonths": [2, 3],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.temperature", "temperature"],
+        "direction": "min",
+        "threshold": -2.8,
+        "unit": "C",
+        "lookbackHours": 12,
+        "minSamples": 3,
+        "deviceNamePattern": "%peach%"
+      }
+    },
+    {
+      "rule": "measurement-peak",
+      "as": "peach-freeze-bloom-90pct",
+      "severity": "critical",
+      "activeMonths": [2, 3],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.temperature", "temperature"],
+        "direction": "min",
+        "threshold": -4.4,
+        "unit": "C",
+        "lookbackHours": 12,
+        "minSamples": 3,
+        "deviceNamePattern": "%peach%"
+      }
+    },
+    {
+      "rule": "measurement-peak",
+      "as": "peach-freeze-post-bloom-10pct",
+      "severity": "critical",
+      "activeMonths": [3, 4],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.temperature", "temperature"],
+        "direction": "min",
+        "threshold": -2.2,
+        "unit": "C",
+        "lookbackHours": 12,
+        "minSamples": 3,
+        "deviceNamePattern": "%peach%"
+      }
+    },
+    {
+      "rule": "measurement-peak",
+      "as": "cherry-freeze-bloom-10pct",
+      "severity": "critical",
+      "activeMonths": [3, 4],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.temperature", "temperature"],
+        "direction": "min",
+        "threshold": -2.2,
+        "unit": "C",
+        "lookbackHours": 12,
+        "minSamples": 3,
+        "deviceNamePattern": "%cherry%"
+      }
+    },
+    {
+      "rule": "measurement-peak",
+      "as": "cherry-freeze-bloom-90pct",
+      "severity": "critical",
+      "activeMonths": [3, 4],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.temperature", "temperature"],
+        "direction": "min",
+        "threshold": -3.9,
+        "unit": "C",
+        "lookbackHours": 12,
+        "minSamples": 3,
+        "deviceNamePattern": "%cherry%"
+      }
+    },
+    {
+      "rule": "measurement-peak",
+      "as": "apricot-freeze-bloom-10pct",
+      "severity": "critical",
+      "activeMonths": [2, 3],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.temperature", "temperature"],
+        "direction": "min",
+        "threshold": -2.8,
+        "unit": "C",
+        "lookbackHours": 12,
+        "minSamples": 3,
+        "deviceNamePattern": "%apricot%"
+      }
+    },
+    {
+      "rule": "measurement-peak",
+      "as": "apricot-freeze-bloom-90pct",
+      "severity": "critical",
+      "activeMonths": [2, 3],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.temperature", "temperature"],
+        "direction": "min",
+        "threshold": -5.6,
+        "unit": "C",
+        "lookbackHours": 12,
+        "minSamples": 3,
+        "deviceNamePattern": "%apricot%"
+      }
+    },
+    {
+      "//": "FROST TONIGHT. FAO Frost Protection (Snyder, UC Davis): start wind machines at about 0 °C, and in any case before the crop's critical temperature. Raised up to 14 h ahead so the decision is made the evening before. DISABLED: needs the top-level forecast block and a Weatherbit key (see README, Forecast).",
+      "rule": "forecast-threshold",
+      "as": "stone-fruit-frost-forecast",
+      "enabled": false,
+      "severity": "critical",
+      "activeMonths": [2, 3, 4],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.temperature"],
+        "min": 0,
+        "max": null,
+        "withinHours": 14,
+        "minHours": 1,
+        "unit": "C"
+      }
+    },
+    {
+      "//": "═══ WET BLOOM ═══ Each crop gets both brown-rot entries; the warm one catches a short wet spell near 24 °C, the mild one a long one near 15 °C."
+    },
+    {
+      "//": "BROWN ROT BLOSSOM BLIGHT (Monilinia laxa — UC IPM names it the main blossom-blight species in California; M. fructicola is rare here). How long flowers must stay wet to be infected depends on temperature, so the curve is tiled into five bands, and each band's dwellHours is the LONGEST requirement anywhere in it — no band alerts on less wetness than the model needs. The hours are the 40 %-incidence contour of the Tamm et al. 1995 model (M. laxa on sweet-cherry blossoms, controlled wetness at 5–20 °C): 10.2 h at 5 °C, 5.8 h at 8 °C, 3.4 h at 12 °C, 2.3–2.8 h across 15–22 °C, 4.9 h at 25 °C (above 20 °C is the paper's own extrapolation). Wilcox 1989 (M. fructicola, sour cherry) agrees at 16–20 °C (28–72 % blight after 5 h) and needs far longer below 12 °C. Caveats for the agronomist: the data are free-water hours at a high spore load (the authors call it a worst case, and say wetness was under-measured by up to 4 h); they are cherry data — no almond, apricot or peach blossom curve was found; RH ≥ 90 % stands in for surface wetness; and mold-risk needs one unbroken run inside one band, so a wet period whose temperature drifts across a band edge can go unreported. Flowers are susceptible from pink bud to petal fall. Where a leaf.wetness sensor is installed, copy the entries with paths [\"leaf.wetness\"] and that sensor's wet cut-off as humidityMin. Sources: Tamm, Minder & Flückiger 1995, Phytopathology 85:401, https://www.apsnet.org/publications/phytopathology/backissues/documents/1995articles/phyto85n04_401.pdf ; Wilcox 1989, Phytopathology 79:530, https://www.apsnet.org/publications/phytopathology/backissues/documents/1989articles/phyto79n05_530.pdf ; UC IPM almond (species, timing), https://ipm.ucanr.edu/agriculture/almond/brown-rot-blossom-blight/",
+      "rule": "mold-risk",
+      "as": "peach-brown-rot-cold",
+      "activeMonths": [2, 3],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.relativeHumidity"],
+        "humidityMin": 90,
+        "humidityMax": null,
+        "temperaturePaths": ["leaf.temperature", "air.temperature", "temperature"],
+        "temperatureMin": 5,
+        "temperatureMax": 8,
+        "dwellHours": 10.5,
+        "lookbackHours": 24,
+        "maxGapHours": 2,
+        "minSamples": 4,
+        "clearDwellHours": 2.62,
+        "unit": "%",
+        "deviceNamePattern": "%peach%"
+      }
+    },
+    {
+      "rule": "mold-risk",
+      "as": "peach-brown-rot-cool",
+      "activeMonths": [2, 3],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.relativeHumidity"],
+        "humidityMin": 90,
+        "humidityMax": null,
+        "temperaturePaths": ["leaf.temperature", "air.temperature", "temperature"],
+        "temperatureMin": 8,
+        "temperatureMax": 12,
+        "dwellHours": 6,
+        "lookbackHours": 24,
+        "maxGapHours": 2,
+        "minSamples": 4,
+        "clearDwellHours": 1.5,
+        "unit": "%",
+        "deviceNamePattern": "%peach%"
+      }
+    },
+    {
+      "rule": "mold-risk",
+      "as": "peach-brown-rot-mild",
+      "activeMonths": [2, 3],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.relativeHumidity"],
+        "humidityMin": 90,
+        "humidityMax": null,
+        "temperaturePaths": ["leaf.temperature", "air.temperature", "temperature"],
+        "temperatureMin": 12,
+        "temperatureMax": 16,
+        "dwellHours": 3.5,
+        "lookbackHours": 24,
+        "maxGapHours": 2,
+        "minSamples": 4,
+        "clearDwellHours": 0.88,
+        "unit": "%",
+        "deviceNamePattern": "%peach%"
+      }
+    },
+    {
+      "rule": "mold-risk",
+      "as": "peach-brown-rot-warm",
+      "activeMonths": [2, 3],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.relativeHumidity"],
+        "humidityMin": 90,
+        "humidityMax": null,
+        "temperaturePaths": ["leaf.temperature", "air.temperature", "temperature"],
+        "temperatureMin": 16,
+        "temperatureMax": 22,
+        "dwellHours": 3,
+        "lookbackHours": 24,
+        "maxGapHours": 2,
+        "minSamples": 4,
+        "clearDwellHours": 0.75,
+        "unit": "%",
+        "deviceNamePattern": "%peach%"
+      }
+    },
+    {
+      "rule": "mold-risk",
+      "as": "peach-brown-rot-hot",
+      "activeMonths": [2, 3],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.relativeHumidity"],
+        "humidityMin": 90,
+        "humidityMax": null,
+        "temperaturePaths": ["leaf.temperature", "air.temperature", "temperature"],
+        "temperatureMin": 22,
+        "temperatureMax": 25,
+        "dwellHours": 5,
+        "lookbackHours": 24,
+        "maxGapHours": 2,
+        "minSamples": 4,
+        "clearDwellHours": 1.25,
+        "unit": "%",
+        "deviceNamePattern": "%peach%"
+      }
+    },
+    {
+      "//": "Same five brown-rot bands and sources as peach, above.",
+      "rule": "mold-risk",
+      "as": "cherry-brown-rot-cold",
+      "activeMonths": [3, 4],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.relativeHumidity"],
+        "humidityMin": 90,
+        "humidityMax": null,
+        "temperaturePaths": ["leaf.temperature", "air.temperature", "temperature"],
+        "temperatureMin": 5,
+        "temperatureMax": 8,
+        "dwellHours": 10.5,
+        "lookbackHours": 24,
+        "maxGapHours": 2,
+        "minSamples": 4,
+        "clearDwellHours": 2.62,
+        "unit": "%",
+        "deviceNamePattern": "%cherry%"
+      }
+    },
+    {
+      "rule": "mold-risk",
+      "as": "cherry-brown-rot-cool",
+      "activeMonths": [3, 4],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.relativeHumidity"],
+        "humidityMin": 90,
+        "humidityMax": null,
+        "temperaturePaths": ["leaf.temperature", "air.temperature", "temperature"],
+        "temperatureMin": 8,
+        "temperatureMax": 12,
+        "dwellHours": 6,
+        "lookbackHours": 24,
+        "maxGapHours": 2,
+        "minSamples": 4,
+        "clearDwellHours": 1.5,
+        "unit": "%",
+        "deviceNamePattern": "%cherry%"
+      }
+    },
+    {
+      "rule": "mold-risk",
+      "as": "cherry-brown-rot-mild",
+      "activeMonths": [3, 4],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.relativeHumidity"],
+        "humidityMin": 90,
+        "humidityMax": null,
+        "temperaturePaths": ["leaf.temperature", "air.temperature", "temperature"],
+        "temperatureMin": 12,
+        "temperatureMax": 16,
+        "dwellHours": 3.5,
+        "lookbackHours": 24,
+        "maxGapHours": 2,
+        "minSamples": 4,
+        "clearDwellHours": 0.88,
+        "unit": "%",
+        "deviceNamePattern": "%cherry%"
+      }
+    },
+    {
+      "rule": "mold-risk",
+      "as": "cherry-brown-rot-warm",
+      "activeMonths": [3, 4],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.relativeHumidity"],
+        "humidityMin": 90,
+        "humidityMax": null,
+        "temperaturePaths": ["leaf.temperature", "air.temperature", "temperature"],
+        "temperatureMin": 16,
+        "temperatureMax": 22,
+        "dwellHours": 3,
+        "lookbackHours": 24,
+        "maxGapHours": 2,
+        "minSamples": 4,
+        "clearDwellHours": 0.75,
+        "unit": "%",
+        "deviceNamePattern": "%cherry%"
+      }
+    },
+    {
+      "rule": "mold-risk",
+      "as": "cherry-brown-rot-hot",
+      "activeMonths": [3, 4],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.relativeHumidity"],
+        "humidityMin": 90,
+        "humidityMax": null,
+        "temperaturePaths": ["leaf.temperature", "air.temperature", "temperature"],
+        "temperatureMin": 22,
+        "temperatureMax": 25,
+        "dwellHours": 5,
+        "lookbackHours": 24,
+        "maxGapHours": 2,
+        "minSamples": 4,
+        "clearDwellHours": 1.25,
+        "unit": "%",
+        "deviceNamePattern": "%cherry%"
+      }
+    },
+    {
+      "//": "Same five brown-rot bands and sources as peach, above.",
+      "rule": "mold-risk",
+      "as": "apricot-brown-rot-cold",
+      "activeMonths": [2, 3],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.relativeHumidity"],
+        "humidityMin": 90,
+        "humidityMax": null,
+        "temperaturePaths": ["leaf.temperature", "air.temperature", "temperature"],
+        "temperatureMin": 5,
+        "temperatureMax": 8,
+        "dwellHours": 10.5,
+        "lookbackHours": 24,
+        "maxGapHours": 2,
+        "minSamples": 4,
+        "clearDwellHours": 2.62,
+        "unit": "%",
+        "deviceNamePattern": "%apricot%"
+      }
+    },
+    {
+      "rule": "mold-risk",
+      "as": "apricot-brown-rot-cool",
+      "activeMonths": [2, 3],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.relativeHumidity"],
+        "humidityMin": 90,
+        "humidityMax": null,
+        "temperaturePaths": ["leaf.temperature", "air.temperature", "temperature"],
+        "temperatureMin": 8,
+        "temperatureMax": 12,
+        "dwellHours": 6,
+        "lookbackHours": 24,
+        "maxGapHours": 2,
+        "minSamples": 4,
+        "clearDwellHours": 1.5,
+        "unit": "%",
+        "deviceNamePattern": "%apricot%"
+      }
+    },
+    {
+      "rule": "mold-risk",
+      "as": "apricot-brown-rot-mild",
+      "activeMonths": [2, 3],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.relativeHumidity"],
+        "humidityMin": 90,
+        "humidityMax": null,
+        "temperaturePaths": ["leaf.temperature", "air.temperature", "temperature"],
+        "temperatureMin": 12,
+        "temperatureMax": 16,
+        "dwellHours": 3.5,
+        "lookbackHours": 24,
+        "maxGapHours": 2,
+        "minSamples": 4,
+        "clearDwellHours": 0.88,
+        "unit": "%",
+        "deviceNamePattern": "%apricot%"
+      }
+    },
+    {
+      "rule": "mold-risk",
+      "as": "apricot-brown-rot-warm",
+      "activeMonths": [2, 3],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.relativeHumidity"],
+        "humidityMin": 90,
+        "humidityMax": null,
+        "temperaturePaths": ["leaf.temperature", "air.temperature", "temperature"],
+        "temperatureMin": 16,
+        "temperatureMax": 22,
+        "dwellHours": 3,
+        "lookbackHours": 24,
+        "maxGapHours": 2,
+        "minSamples": 4,
+        "clearDwellHours": 0.75,
+        "unit": "%",
+        "deviceNamePattern": "%apricot%"
+      }
+    },
+    {
+      "rule": "mold-risk",
+      "as": "apricot-brown-rot-hot",
+      "activeMonths": [2, 3],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.relativeHumidity"],
+        "humidityMin": 90,
+        "humidityMax": null,
+        "temperaturePaths": ["leaf.temperature", "air.temperature", "temperature"],
+        "temperatureMin": 22,
+        "temperatureMax": 25,
+        "dwellHours": 5,
+        "lookbackHours": 24,
+        "maxGapHours": 2,
+        "minSamples": 4,
+        "clearDwellHours": 1.25,
+        "unit": "%",
+        "deviceNamePattern": "%apricot%"
+      }
+    },
+    {
+      "//": "ROOT-ZONE SALINITY — peach: Maas–Hoffman threshold ECe 1.7 dS/m, above which yield declines. DISABLED until converted to what the probe reads. Maas–Hoffman thresholds are saturated-paste ECe. A soil probe reports bulk EC (or pore EC), which is not ECe: FAO 29 gives soil-water EC ≈ 2 × ECe at field capacity, and bulk EC is lower than pore EC and moves with water content. Convert before enabling — take a saturated-paste lab sample beside the probe and scale this threshold by the probe/ECe ratio. Source: FAO Irrigation and Drainage Paper 29, ch. 2 and Annex 1 (Maas & Grattan 1999), https://www.fao.org/4/t0234e/t0234e02.htm , https://www.fao.org/4/y4263e/y4263e0e.htm",
+      "rule": "measurement-threshold",
+      "as": "peach-salinity-high",
+      "enabled": false,
+      "params": {
+        "paths": ["soil.ec"],
+        "min": null,
+        "max": 1.7,
+        "unit": " dS/m",
+        "clearMargin": 0.17,
+        "sustainMinutes": 1440,
+        "lookbackHours": 48,
+        "deviceNamePattern": "%peach%"
+      }
+    },
+    {
+      "//": "═══ CHILL ═══ Requirements vary by variety more than by crop — peach 8–75 chill portions (O'Henry and Andross 63, Redhaven 75), nectarine 12–42, sweet cherry 30–70 (Rainier 45, Lapins 35, Burlat 48–53). DISABLED: requirement is a placeholder for the named variety — set it to the block's own. Source: UC Fruit & Nut Research and Information Center, crop chill requirements, https://fruitsandnuts.ucanr.edu/Weather_Services/chilling_accumulation_models/CropChillReq/"
+    },
+    {
+      "//": "O'Henry / Andross: 63 chill portions.",
+      "rule": "chill-accumulation",
+      "as": "peach-chill-short",
+      "enabled": false,
+      "severity": "info",
+      "activeMonths": [2, 3],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.temperature", "temperature"],
+        "model": "dynamic",
+        "since": "11-01",
+        "requirement": 63,
+        "comparison": "short",
+        "byDate": "02-01",
+        "deviceNamePattern": "%peach%"
+      }
+    },
+    {
+      "//": "Rainier: 45 chill portions.",
+      "rule": "chill-accumulation",
+      "as": "cherry-chill-short",
+      "enabled": false,
+      "severity": "info",
+      "activeMonths": [2, 3],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.temperature", "temperature"],
+        "model": "dynamic",
+        "since": "11-01",
+        "requirement": 45,
+        "comparison": "short",
+        "byDate": "02-01",
+        "deviceNamePattern": "%cherry%"
+      }
+    }
+  ]
+}

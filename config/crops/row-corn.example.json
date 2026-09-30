@@ -1,0 +1,353 @@
+{
+  "//license": "SPDX-License-Identifier: AGPL-3.0-or-later; Copyright (C) 2026 Intelligent Farming Foundation",
+  "//": "Corn (field and popcorn) and on-farm grain storage. Every agronomic entry is scoped by deviceNamePattern to a placeholder (%corn% in the field, %bin% for storage) — rename your devices to match, or replace the pattern with deviceProfiles, before trusting any alert. Thresholds are the published extension figures cited in each entry; they are starting points, not calibrations. Popcorn: no popcorn-specific temperature or degree-day tables are published; the UW and Purdue popcorn guides describe growth requirements as similar to dent corn with slower germination and seedling growth, so the dent-corn figures are used throughout.",
+  "//months": "activeMonths are US Corn Belt timing (planting mid-April to May, silking July, maturity September). Shift them for your latitude and planting date.",
+  "//not-yet": "GDD staging is corn-gdd-stage below: set its planting date and the hybrid's rating before enabling it.",
+  "//enabled": "Enabled: checks whose threshold is a published figure the sensor measures directly — air, leaf and soil temperature, humidity, durations, rates, pH. Disabled: checks whose threshold depends on this soil or this probe (volumetric moisture, EC, N, the 'wet' cut-off of a leaf-wetness sensor) or that need the forecast block — each says what to set before enabling it.",
+  "schedule": "*/15 * * * *",
+  "timezone": "America/Chicago",
+  "statementTimeoutMs": 15000,
+  "maxChecksPerRun": 64,
+  "checks": [
+    {
+      "//": "═══ FLEET HEALTH — every pack carries these, so the pack runs on its own. None needs crop tuning. ═══"
+    },
+    {
+      "rule": "device-silent",
+      "params": {
+        "silentMinutes": 180
+      }
+    },
+    {
+      "rule": "decode-failure"
+    },
+    {
+      "rule": "measurement-implausible"
+    },
+    {
+      "rule": "status-battery-low"
+    },
+    {
+      "//": "═══ PLANTING ═══"
+    },
+    {
+      "//": "SOIL WARM ENOUGH TO PLANT. Iowa State: plant into soil at or above 10 °C (50 °F) with a forecast that keeps it warming; the first 24–48 h after planting are when imbibitional chilling injures the seed. ISU gives no sustained-days rule, so this raises (info) once soil.temperature has held ≥10 °C unbroken for 24 h — read it together with corn-cold-after-planting-forecast. Source: ISU Integrated Crop Management, \"Imbibitional chilling or cold injury\", https://crops.extension.iastate.edu/post/imbibitional-chilling-or-cold-injury",
+      "rule": "measurement-dwell",
+      "as": "corn-soil-warm-for-planting",
+      "severity": "info",
+      "activeMonths": [4, 5],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["soil.temperature"],
+        "min": 10,
+        "max": null,
+        "mode": "longest",
+        "comparison": "atLeast",
+        "dwellHours": 24,
+        "lookbackHours": 48,
+        "maxGapHours": 3,
+        "minSamples": 6,
+        "clearDwellHours": 6,
+        "unit": "C",
+        "deviceNamePattern": "%corn%"
+      }
+    },
+    {
+      "//": "COLD SNAP IN THE 48 HOURS AFTER PLANTING. ISU: seed imbibing water in soil in the low 40s °F (~4–7 °C) is injured, and planting 12–36 h ahead of cold, wet weather should be avoided. The forecast carries air, not soil, temperature, so a 4 °C air minimum is a proxy for the soil falling into the injury range. DISABLED: needs the top-level forecast block and a Weatherbit key. Source: ISU, \"Imbibitional chilling and frost damage in corn and soybean seedlings\" (2014), https://crops.extension.iastate.edu/cropnews/2014/05/imbibitional-chilling-and-frost-damage-corn-and-soybean-seedlings",
+      "rule": "forecast-threshold",
+      "as": "corn-cold-after-planting-forecast",
+      "enabled": false,
+      "activeMonths": [4, 5],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.temperature"],
+        "min": 4,
+        "max": null,
+        "withinHours": 48,
+        "minHours": 3,
+        "unit": "C"
+      }
+    },
+    {
+      "//": "GDD STAGING by the corn method: 86/50 °F — the day's maximum capped at 86 °F and minimum floored at 50 °F, then (max + min) / 2 − 50 — counted from planting. For a 2700-GDD hybrid Purdue gives silking (R1) near 1400 and black layer (R6) at the hybrid's rating, 2700–3100 across common hybrids; late planting needs fewer ('GDD compression'). DISABLED: set since to this field's planting date (YYYY-MM-DD) and the R6 milestone to the hybrid's rated GDD to black layer. Popcorn has no published GDD table; use the hybrid's rating. Sources: Purdue, \"Heat Unit Concepts Related to Corn Development\", https://www.agry.purdue.edu/ext/corn/news/timeless/heatunits.html ; UK AGR-202, https://publications.mgcafe.uky.edu/sites/publications.ca.uky.edu/files/agr202.pdf",
+      "rule": "degree-day-milestone",
+      "as": "corn-gdd-stage",
+      "enabled": false,
+      "activeMonths": [5, 6, 7, 8, 9, 10],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.temperature", "temperature"],
+        "method": "modified",
+        "lower": 50,
+        "upper": 86,
+        "cutoff": "horizontal",
+        "units": "F",
+        "since": "05-01",
+        "milestones": [
+          {
+            "at": 1400,
+            "label": "silking (R1)"
+          },
+          {
+            "at": 2700,
+            "label": "black layer (R6) for a 2700-GDD hybrid"
+          }
+        ],
+        "holdHours": 72,
+        "deviceNamePattern": "%corn%"
+      }
+    },
+    {
+      "//": "═══ FROST ═══ Purdue: before about V5 the growing point is below ground, so leaf frost on a seedling is usually survivable; it takes ≤ −2.2 °C (28 °F) for several hours to reach the growing point. In the fall ~0 °C for a few hours kills leaves and −2.2 °C for minutes kills the plant — which is why the spring check is a duration and the fall check is a peak. Sources: Purdue, \"Corny Growing Points\", https://www.agry.purdue.edu/ext/corn/news/timeless/growingpoints.html ; Purdue, \"Frost/freeze injury\", https://www.agry.purdue.edu/ext/corn/news/articles.02/frost_freeze-0520.html"
+    },
+    {
+      "//": "Spring: −2.2 °C (28 °F) held for 2 h. Purdue: \"Most agronomists agree that 'lethally cold' temperatures for young corn are those that dip to 28°F or lower for 1 to 2 hours\"; SDSU: \"28° F or colder for 2 hours\" is likely damaging if not lethal. The growing point stays below ground until about V5–V6, and cold reaches it more easily in dry, bare soil. A node in air measures the canopy, not the soil; assess stands 3–5 days after. Sources: Purdue (Nielsen), https://extension.entm.purdue.edu/newsletters/pestandcrop/article/assessing-frost-cold-temperature-injury-to-young-corn ; SDSU, https://extension.sdstate.edu/late-spring-frost-damage-corn-and-soybeans",
+      "rule": "measurement-dwell",
+      "as": "corn-seedling-freeze",
+      "severity": "critical",
+      "activeMonths": [5, 6],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.temperature", "temperature"],
+        "min": null,
+        "max": -2.2,
+        "mode": "longest",
+        "comparison": "atLeast",
+        "dwellHours": 2,
+        "lookbackHours": 24,
+        "maxGapHours": 2,
+        "minSamples": 2,
+        "clearDwellHours": 1,
+        "unit": "C",
+        "deviceNamePattern": "%corn%"
+      }
+    },
+    {
+      "//": "Spring: leaf frost. Survivable before V5; raised so that the stand can be checked 3–5 days later for regrowth from the whorl.",
+      "rule": "measurement-peak",
+      "as": "corn-leaf-frost",
+      "activeMonths": [5, 6],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.temperature", "temperature"],
+        "direction": "min",
+        "threshold": 0,
+        "unit": "C",
+        "lookbackHours": 12,
+        "minSamples": 3,
+        "deviceNamePattern": "%corn%"
+      }
+    },
+    {
+      "//": "Fall: killing freeze before black layer. −2.2 °C for minutes kills the whole plant; the yield hit depends on how far short of R6 the crop is.",
+      "rule": "measurement-peak",
+      "as": "corn-fall-killing-freeze",
+      "severity": "critical",
+      "activeMonths": [9, 10],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.temperature", "temperature"],
+        "direction": "min",
+        "threshold": -2.2,
+        "unit": "C",
+        "lookbackHours": 12,
+        "minSamples": 3,
+        "deviceNamePattern": "%corn%"
+      }
+    },
+    {
+      "//": "═══ POLLINATION ═══ Iowa State: above 35 °C (95 °F) with low humidity, exposed silks desiccate and pollen viability falls; above 38 °C (100 °F) pollen can be killed outright. ISU is explicit that heat alone does little harm when soil moisture is adequate, so read these with corn-root-zone-dry. No numeric VPD threshold for silking is published, so none is set. Source: ISU, \"Corn pollination: effect of high temperature and stress\", https://crops.extension.iastate.edu/encyclopedia/corn-pollination-effect-high-temperature-and-stress"
+    },
+    {
+      "rule": "measurement-peak",
+      "as": "corn-silking-heat",
+      "activeMonths": [7],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.temperature", "temperature"],
+        "direction": "max",
+        "threshold": 35,
+        "unit": "C",
+        "lookbackHours": 12,
+        "minSamples": 3,
+        "deviceNamePattern": "%corn%"
+      }
+    },
+    {
+      "rule": "measurement-peak",
+      "as": "corn-silking-pollen-kill",
+      "severity": "critical",
+      "activeMonths": [7],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.temperature", "temperature"],
+        "direction": "max",
+        "threshold": 38,
+        "unit": "C",
+        "lookbackHours": 12,
+        "minSamples": 3,
+        "deviceNamePattern": "%corn%"
+      }
+    },
+    {
+      "//": "ROOT ZONE DRY during the drought-sensitive window (V12 through R2). The 15 % floor is the example config's generic volumetric figure — replace it with the value your soil reaches at ~55 % depletion of available water (FAO-56 depletion fraction p for maize is 0.55). Source: FAO Irrigation and Drainage Paper 56, Table 22, https://www.fao.org/4/x0490e/x0490e0e.htm",
+      "rule": "measurement-threshold",
+      "as": "corn-root-zone-dry",
+      "enabled": false,
+      "activeMonths": [7, 8],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["soil.moisture"],
+        "min": 15,
+        "max": null,
+        "unit": "%",
+        "clearMargin": 2,
+        "sustainMinutes": 360,
+        "deviceNamePattern": "%corn%"
+      }
+    },
+    {
+      "//": "═══ WATERLOGGING ═══ Purdue and ISU: soil oxygen is exhausted about 48 h after saturation. Young corn survives up to ~4 days ponded when it is cool (≤ mid-70s °F), but less than 24 h when it is above 25 °C (77 °F) — hence two entries, the warm one gated on temperature. The 45 % saturation value is a placeholder: set it to the volumetric moisture your probe reads at saturation in this soil. Sources: Purdue, \"Effects of ponding on young corn\", https://www.agry.purdue.edu/ext/corn/news/timeless/pondingyoungcorn.html ; ISU, \"Ponding impacts on corn growth and development\", https://crops.extension.iastate.edu/encyclopedia/ponding-impacts-corn-growth-development"
+    },
+    {
+      "rule": "measurement-dwell",
+      "as": "corn-saturated-48h",
+      "enabled": false,
+      "activeMonths": [4, 5, 6],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["soil.moisture"],
+        "min": 45,
+        "max": null,
+        "mode": "longest",
+        "comparison": "atLeast",
+        "dwellHours": 48,
+        "lookbackHours": 96,
+        "maxGapHours": 3,
+        "minSamples": 12,
+        "clearDwellHours": 12,
+        "unit": "%",
+        "deviceNamePattern": "%corn%"
+      }
+    },
+    {
+      "//": "Warm version: 24 h saturated while the soil is above 25 °C. The gate reads soil.temperature from the same uplink, which the multi-parameter probes carry; ISU's figure is air or water temperature, and soil at seed depth tracks it closely in ponded ground.",
+      "rule": "measurement-dwell",
+      "as": "corn-saturated-warm-24h",
+      "enabled": false,
+      "severity": "critical",
+      "activeMonths": [5, 6],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["soil.moisture"],
+        "min": 45,
+        "max": null,
+        "mode": "longest",
+        "comparison": "atLeast",
+        "dwellHours": 24,
+        "lookbackHours": 72,
+        "maxGapHours": 3,
+        "minSamples": 8,
+        "clearDwellHours": 6,
+        "gatePaths": ["soil.temperature"],
+        "gateMin": 25,
+        "gateMax": null,
+        "unit": "%",
+        "deviceNamePattern": "%corn%"
+      }
+    },
+    {
+      "//": "═══ SOIL CHEMISTRY ═══"
+    },
+    {
+      "//": "NITROGEN — INDICATIVE ONLY. The Iowa State late-spring soil nitrate test (LSNT) threshold is 25 ppm NO3-N in a 0–12 in core taken when corn is 6–12 in tall. An in-situ NPK probe (dragino/lsnpk01, netvox/r72632a01) does not measure the same thing as a lab LSNT on a dried core, so this is DISABLED until the probe has been checked against lab tests on this field. Source: ISU, \"Late-spring soil nitrate test (LSNT) use\" (2019), https://crops.extension.iastate.edu/cropnews/2019/05/late-spring-soil-nitrate-test-lsnt-use-2019",
+      "rule": "measurement-threshold",
+      "as": "corn-nitrogen-low-indicative",
+      "enabled": false,
+      "activeMonths": [5, 6],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["soil.n"],
+        "min": 25,
+        "max": null,
+        "unit": " ppm",
+        "clearMargin": 2,
+        "deviceNamePattern": "%corn%"
+      }
+    },
+    {
+      "//": "═══ GRAIN STORAGE ═══ Purdue AED-20: normal grain temperature change is 1–2 °F a week, and any continual rise is the warning sign of insects or mold; keep grain within 15–20 °F of the monthly average air temperature, cool to 1.7–4.4 °C (35–40 °F) for winter, and warm no higher than 10–16 °C (50–60 °F) if storing into summer. K-State: a hot spot can climb from 20 °C to 65 °C and fall again within about two weeks, so it has to be caught while rising. No source gives a numeric \"hotter than its neighbours\" delta, so none is used. Sources: Purdue AED-20, \"Managing Dry Grain in Storage\", https://www.extension.purdue.edu/extmedia/aed/aed-20.html ; K-State, \"Temperature Monitoring\" (Stored Product Protection ch. 23), https://entomology.k-state.edu/doc/finished-chapters/s156-ch-23-temperature-monitoring.pdf",
+      "//paths": "smartrural/grain-probe-01 reports each cable position as an entry of channels[]. The path channels.0.temperature reads position 0 (Postgres #>> indexes the array), so each position gets its own entry. Single-point probes emit top-level temperature and are the second candidate."
+    },
+    {
+      "//": "Sustained warming: a least-squares slope over two weeks above 1 °C/week (0.006 °C/h). leastSquares with minR2 keeps a one-off aeration swing from counting as a trend.",
+      "rule": "measurement-rate",
+      "as": "grain-warming-position-0",
+      "params": {
+        "paths": ["channels.0.temperature", "temperature"],
+        "direction": "rising",
+        "method": "leastSquares",
+        "minR2": 0.6,
+        "maxRatePerHour": 0.006,
+        "unit": "C",
+        "lookbackHours": 336,
+        "minSamples": 24,
+        "minSpanHours": 168,
+        "deviceNamePattern": "%bin%"
+      }
+    },
+    {
+      "rule": "measurement-rate",
+      "as": "grain-warming-position-1",
+      "params": {
+        "paths": ["channels.1.temperature"],
+        "direction": "rising",
+        "method": "leastSquares",
+        "minR2": 0.6,
+        "maxRatePerHour": 0.006,
+        "unit": "C",
+        "lookbackHours": 336,
+        "minSamples": 24,
+        "minSpanHours": 168,
+        "deviceNamePattern": "%bin%"
+      }
+    },
+    {
+      "//": "Summer ceiling: Purdue's 10–16 °C (50–60 °F) is the most grain should be warmed to when held into summer. Raised above 16 °C sustained for a day.",
+      "rule": "measurement-threshold",
+      "as": "grain-too-warm-summer",
+      "activeMonths": [6, 7, 8, 9],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["channels.0.temperature", "channels.1.temperature", "temperature"],
+        "min": null,
+        "max": 16,
+        "unit": "C",
+        "clearMargin": 1,
+        "sustainMinutes": 1440,
+        "lookbackHours": 48,
+        "maxGapMinutes": 180,
+        "deviceNamePattern": "%bin%"
+      }
+    },
+    {
+      "//": "Winter target not reached: Purdue says cool to 1.7–4.4 °C (35–40 °F) for winter storage. Raised (info) if grain is still above 5 °C for a sustained two days in mid-winter — aeration has not caught up.",
+      "rule": "measurement-threshold",
+      "as": "grain-not-cooled-winter",
+      "severity": "info",
+      "activeMonths": [12, 1, 2],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["channels.0.temperature", "channels.1.temperature", "temperature"],
+        "min": null,
+        "max": 5,
+        "unit": "C",
+        "clearMargin": 0.5,
+        "sustainMinutes": 2880,
+        "lookbackHours": 72,
+        "maxGapMinutes": 180,
+        "deviceNamePattern": "%bin%"
+      }
+    }
+  ]
+}

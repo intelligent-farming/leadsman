@@ -63,6 +63,7 @@
  */
 
 import { int, num, optNum, round, str } from '../params';
+import { parseSince, seasonStart, zonedMidnight } from '../season';
 import { pathsLabel, resolvePaths, windowAccumulation } from '../measurement';
 import { resolveScope, SCOPE_PARAMS } from '../scope';
 import type { Finding, Rule } from '../types';
@@ -88,6 +89,15 @@ const rule: Rule = {
      */
     base: 10,
     /**
+     * Upper threshold, as a horizontal cutoff: a reading above it counts as `cap`.
+     * Degree-day models for crops and insects stop accruing development above an
+     * upper temperature — corn at 30 °C, navel orangeworm at 34.4 °C — and without the
+     * cap a heat wave reads as a burst of progress. Must be above `base`. null: none.
+     * For daily-extremes methods (single sine, the corn modified method) use
+     * degree-day-milestone instead; this integrates the hourly curve.
+     */
+    cap: null,
+    /**
      * Multiplies the integral. The integral is in unit·hours, and most indices want
      * something else:
      *
@@ -104,6 +114,14 @@ const rule: Rule = {
     unit: ' GDD',
     /** The accumulation window. 24 for a daily index, 720 for a season to date. */
     lookbackHours: 24,
+    /**
+     * Count from a date instead of a rolling window: `MM-DD` for a season start that
+     * repeats every year (the most recent occurrence at or before today, in the config
+     * timezone), or `YYYY-MM-DD` for a fixed one such as a planting date. Replaces
+     * lookbackHours; coverage is judged against the hours since local midnight of that
+     * date. null: use lookbackHours.
+     */
+    since: null,
     /** A reporting gap longer than this contributes nothing to the total. */
     maxGapHours: 3,
     /**
@@ -131,7 +149,11 @@ const rule: Rule = {
     const scale = num(ctx.params, 'scale');
     const min = optNum(ctx.params, 'min');
     const max = optNum(ctx.params, 'max');
-    const lookbackHours = int(ctx.params, 'lookbackHours');
+    const cap = optNum(ctx.params, 'cap');
+    const since = ctx.params.since === null || ctx.params.since === undefined
+      ? null
+      : parseSince(ctx.params.since);
+    let lookbackHours = int(ctx.params, 'lookbackHours');
     const maxGapHours = num(ctx.params, 'maxGapHours');
     const minCoverage = num(ctx.params, 'minCoverage');
     const minSamples = int(ctx.params, 'minSamples');
@@ -160,10 +182,27 @@ const rule: Rule = {
       );
     }
     if (clearMargin < 0) throw new Error('clearMargin must not be negative');
+    if (cap !== null && base !== null && cap <= base) {
+      throw new Error(`cap (${cap}) must be above base (${base}) — nothing could accumulate`);
+    }
+
+    // A season start replaces the rolling window with the hours since its local midnight.
+    let windowLabel = `${lookbackHours}h`;
+    let startDate: string | null = null;
+    if (since !== null) {
+      startDate = seasonStart(since, ctx.now, ctx.timezone);
+      const hours = (ctx.now.getTime() - zonedMidnight(startDate, ctx.timezone).getTime()) / 3_600_000;
+      if (hours <= 0) {
+        ctx.log.debug('season has not started yet', { since: startDate });
+        return [];
+      }
+      lookbackHours = hours;
+      windowLabel = `since ${startDate}`;
+    }
 
     const scope = resolveScope(ctx.params);
     const rows = await windowAccumulation(
-      ctx, paths, lookbackHours, method, base, maxGapHours, scope,
+      ctx, paths, lookbackHours, method, base, maxGapHours, scope, cap,
     );
     if (rows.length === 0) {
       ctx.log.debug('no device reports any candidate path', { paths: pathsLabel(paths) });
@@ -222,8 +261,9 @@ const rule: Rule = {
         devEui: r.devEui,
         deviceName: r.deviceName,
         summary:
-          `${name} accumulated ${round(total, 1)}${unit} from ${r.matchedPath} over ` +
-          `${lookbackHours}h${projection} — ${belowMin ? 'short of' : 'over'} ${bound}`,
+          `${name} accumulated ${round(total, 1)}${unit} from ${r.matchedPath} ` +
+          `${since === null ? 'over ' : ''}${windowLabel}${projection} — ` +
+          `${belowMin ? 'short of' : 'over'} ${bound}`,
         detail: {
           measurement: r.matchedPath,
           /** The projected total — the number compared with min and max. */
@@ -233,10 +273,12 @@ const rule: Rule = {
           unit: unit.trim() || null,
           method,
           base,
+          cap,
+          since: startDate,
           min,
           max,
           breached: belowMin ? 'min' : 'max',
-          lookbackHours,
+          lookbackHours: round(lookbackHours, 2),
           coverage: round(coverage, 3),
           gapHours: round(r.gapHours, 2),
           samples: r.samples,

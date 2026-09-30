@@ -1064,8 +1064,9 @@ export async function windowAccumulation(
   base: number | null,
   maxGapHours: number,
   scope: DeviceScope = ANY_DEVICE,
+  cap: number | null = null,
 ): Promise<Accumulation[]> {
-  const sc = scopeClause(scope, 6, 'e');
+  const sc = scopeClause(scope, 7, 'e');
   const rows = await ctx.query<{
     dev_eui: string;
     device_name: string | null;
@@ -1101,9 +1102,12 @@ export async function windowAccumulation(
      resolved AS (
        SELECT w.dev_eui, w.device_name, w.time, w.matched_path, w.raw,
               -- Degree-day semantics: below the base contributes nothing, rather than
-              -- cancelling out the hours above it.
-              CASE WHEN $4::numeric IS NULL THEN w.raw
-                   ELSE greatest(w.raw - $4::numeric, 0) END AS value
+              -- cancelling out the hours above it. A cap is the horizontal cutoff: a
+              -- reading above it counts as the cap, because development stops rising
+              -- there rather than falling.
+              CASE WHEN $4::numeric IS NULL THEN least(w.raw, COALESCE($6::numeric, w.raw))
+                   ELSE greatest(least(w.raw, COALESCE($6::numeric, w.raw)) - $4::numeric, 0)
+              END AS value
          FROM window_rows w
          JOIN winner ON winner.dev_eui = w.dev_eui AND winner.ord = w.ord
      ),
@@ -1155,6 +1159,7 @@ export async function windowAccumulation(
       method,
       base,
       maxGapHours,
+      cap,
       ...sc.values,
     ],
   );
@@ -2025,4 +2030,116 @@ export async function bandResidency(
       samples: Number(r.samples),
     };
   });
+}
+
+/** One local clock hour of a device's readings. */
+export interface HourAgg {
+  /** Local wall-clock hour, `YYYY-MM-DDTHH`. */
+  hour: string;
+  mean: number;
+  min: number;
+  max: number;
+  samples: number;
+}
+
+/** A device's readings since a date, bucketed into local hours. */
+export interface HourlySeries {
+  devEui: string;
+  deviceName: string | null;
+  matchedPath: string;
+  /** Ascending, and only the hours that have a reading — a silent hour is absent. */
+  hours: HourAgg[];
+}
+
+/**
+ * Each device's readings from local midnight of `fromDate` to now, bucketed into local
+ * clock hours.
+ *
+ * This is the input to every model that is defined over hours or days rather than
+ * over raw uplinks — degree-days from daily extremes, chill models, disease indices,
+ * streaks of qualifying days. Those models carry state from one hour to the next, which
+ * is arithmetic SQL is poor at and TypeScript is good at, so the database does the
+ * part it is good at (filtering and aggregating a season of uplinks down to one row an
+ * hour) and hands back something a few thousand rows long per device rather than tens
+ * of thousands.
+ *
+ * Buckets are LOCAL hours in `timezone`, so a "day" downstream is a local day. On the
+ * autumn DST change the repeated hour merges into one bucket; on the spring change the
+ * skipped hour is simply absent, which the models read as one missing hour.
+ *
+ * As in windowAccumulation, one path wins per device across the whole window — the
+ * highest-priority candidate it reported at all — so a device that switches frame types
+ * cannot splice two different measurements into one series.
+ */
+export async function hourlySeries(
+  ctx: SoundingContext,
+  paths: string[][],
+  fromDate: string,
+  timezone: string,
+  scope: DeviceScope = ANY_DEVICE,
+): Promise<HourlySeries[]> {
+  const sc = scopeClause(scope, 4, 'e');
+  const rows = await ctx.query<{
+    dev_eui: string;
+    device_name: string | null;
+    matched_path: string;
+    hour: string;
+    mean: string;
+    vmin: string;
+    vmax: string;
+    samples: string;
+  }>(
+    `WITH ${CANDIDATES},
+     window_rows AS (
+       SELECT e.dev_eui,
+              e.device_name,
+              e.time,
+              c.ord,
+              array_to_string(c.path, '.') AS matched_path,
+              (e.object #>> c.path)::numeric AS raw
+         FROM event_up e
+         CROSS JOIN candidates c
+        WHERE e.time >= ($2::date::timestamp AT TIME ZONE $3::text)
+          AND e.time <= now()
+          AND e.object IS NOT NULL
+          AND jsonb_typeof(e.object) = 'object'
+          AND e.object #>> c.path IS NOT NULL
+          AND e.object #>> c.path ${NUMERIC}
+          ${sc.sql}
+     ),
+     winner AS (
+       SELECT DISTINCT ON (dev_eui) dev_eui, ord FROM window_rows ORDER BY dev_eui, ord
+     )
+     SELECT w.dev_eui,
+            max(w.device_name)  AS device_name,
+            max(w.matched_path) AS matched_path,
+            to_char(date_trunc('hour', w.time AT TIME ZONE $3::text), 'YYYY-MM-DD"T"HH24') AS hour,
+            avg(w.raw)  AS mean,
+            min(w.raw)  AS vmin,
+            max(w.raw)  AS vmax,
+            count(*)    AS samples
+       FROM window_rows w
+       JOIN winner ON winner.dev_eui = w.dev_eui AND winner.ord = w.ord
+      GROUP BY w.dev_eui, 4
+      ORDER BY w.dev_eui, 4`,
+    [pathsJson(paths), fromDate, timezone, ...sc.values],
+  );
+
+  const out: HourlySeries[] = [];
+  let current: HourlySeries | null = null;
+  for (const r of rows) {
+    if (!current || current.devEui !== r.dev_eui) {
+      current = { devEui: r.dev_eui, deviceName: r.device_name, matchedPath: r.matched_path, hours: [] };
+      out.push(current);
+    }
+    if (r.device_name) current.deviceName = r.device_name;
+    current.hours.push({
+      hour: r.hour,
+      mean: Number(r.mean),
+      min: Number(r.vmin),
+      max: Number(r.vmax),
+      samples: Number(r.samples),
+    });
+  }
+  return out;
 }

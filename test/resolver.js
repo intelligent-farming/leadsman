@@ -19,7 +19,7 @@ const h = require('./helpers/db.js');
 const {
   latestReadings, latestBooleans, windowStats, pathPresence, latestCoordinates,
   bandDwell, windowTrend, windowAccumulation, groupDeviation, triggerResponse,
-  booleanDwell, latestPairs, bandResidency, resolvePaths,
+  booleanDwell, latestPairs, bandResidency, resolvePaths, hourlySeries,
 } = require('../dist/measurement.js');
 const { resolveScope, ANY_DEVICE } = require('../dist/scope.js');
 
@@ -648,8 +648,9 @@ if (!h.available) {
 
   test('groupDeviation: MAD does not let one bad sensor hide inside its own spread', async () => {
     // The property standard deviation lacks. With six probes, one far-out reading
-    // inflates sigma enough to fall within two of them; the median absolute deviation
-    // does not move at all.
+    // inflates sigma so much that it sits only about 2.2 of them from the mean (z =
+    // 2.235) — barely past the usual cut-off; the median absolute deviation does not
+    // move at all.
     const values = [30, 30, 31, 30, 29, 80];
     await probes(values);
     const rows = await groupDeviation(h.ctx(env.store), P('soil.moisture'), 24);
@@ -1394,5 +1395,80 @@ if (!h.available) {
     const wrap = findings.find((f) => f.devEui === 'wrap');
     assert.match(wrap.summary, /max 360, exclusive/);
     assert.equal(wrap.detail.paths[0].maxExclusive, true);
+  });
+
+  // ── windowAccumulation cap ──────────────────────────────────────────────────
+
+  test('windowAccumulation: a cap is a horizontal cutoff above the base', async () => {
+    // 6 hourly readings at 40 °C, base 10, cap 30 → 20 degree-hours per hour, 5 spans.
+    for (let i = 0; i < 6; i += 1) {
+      await h.uplink(env.db, {
+        devEui: 'aa', minutesAgo: (5 - i) * 60, object: { air: { temperature: 40 } },
+      });
+    }
+    const [a] = await windowAccumulation(
+      h.ctx(env.store), P('air.temperature'), 24, 'integral', 10, 3, ANY_DEVICE, 30,
+    );
+    assert.ok(Math.abs(a.total - 100) < 0.1, `100 capped degree-hours expected, got ${a.total}`);
+  });
+
+  // ── hourlySeries ────────────────────────────────────────────────────────────
+
+  /** Insert a reading at an offset from the start of the UTC hour three hours ago. */
+  const at = async (devEui, minutes, object) => env.db.query(
+    `INSERT INTO event_up (time, dev_eui, device_name, device_profile_name, object)
+     VALUES (date_trunc('hour', now()) - interval '3 hours' + make_interval(mins => $1::int),
+             $2, $2, 'p', $3::jsonb)`,
+    [minutes, devEui, JSON.stringify(object)],
+  );
+  const today = (tz) => new Intl.DateTimeFormat('en-CA', { timeZone: tz }).format(new Date());
+  const yesterday = (tz) => {
+    const d = new Date(`${today(tz)}T00:00:00Z`);
+    d.setUTCDate(d.getUTCDate() - 1);
+    return d.toISOString().slice(0, 10);
+  };
+
+  test('hourlySeries: one row per local hour, with its mean, extremes and count', async () => {
+    await at('aa', 5, { air: { temperature: 10 } });
+    await at('aa', 35, { air: { temperature: 20 } });
+    await at('aa', 65, { air: { temperature: 7 } });
+    const [s] = await hourlySeries(h.ctx(env.store), P('air.temperature'), yesterday('UTC'), 'UTC');
+    assert.equal(s.hours.length, 2);
+    assert.deepEqual(
+      { mean: s.hours[0].mean, min: s.hours[0].min, max: s.hours[0].max, n: s.hours[0].samples },
+      { mean: 15, min: 10, max: 20, n: 2 },
+    );
+    assert.match(s.hours[0].hour, /^\d{4}-\d{2}-\d{2}T\d{2}$/);
+  });
+
+  test('hourlySeries buckets by LOCAL hour — a half-hour zone splits a UTC hour', async () => {
+    // Asia/Kolkata is UTC+5:30, so :05 and :35 past a UTC hour are different local hours.
+    await at('aa', 5, { air: { temperature: 10 } });
+    await at('aa', 35, { air: { temperature: 20 } });
+    const utc = await hourlySeries(h.ctx(env.store), P('air.temperature'), yesterday('UTC'), 'UTC');
+    const ist = await hourlySeries(h.ctx(env.store), P('air.temperature'), yesterday('Asia/Kolkata'), 'Asia/Kolkata');
+    assert.equal(utc[0].hours.length, 1);
+    assert.equal(ist[0].hours.length, 2);
+  });
+
+  test('hourlySeries starts at local midnight of fromDate', async () => {
+    await at('aa', 5, { air: { temperature: 10 } });
+    const tomorrow = new Date(Date.now() + 2 * 86_400_000).toISOString().slice(0, 10);
+    assert.deepEqual(await hourlySeries(h.ctx(env.store), P('air.temperature'), tomorrow, 'UTC'), []);
+  });
+
+  test('hourlySeries: one path wins per device, by priority, across the whole window', async () => {
+    await at('aa', 5, { air: { temperature: 10 }, temperature: 99 });
+    await at('aa', 65, { temperature: 50 });
+    const [s] = await hourlySeries(h.ctx(env.store), P('air.temperature', 'temperature'), yesterday('UTC'), 'UTC');
+    // The temperature-only frame is not spliced into the air.temperature series.
+    assert.equal(s.matchedPath, 'air.temperature');
+    assert.deepEqual(s.hours.map((x) => x.mean), [10]);
+  });
+
+  test('hourlySeries reads channels[] positionally', async () => {
+    await at('aa', 5, { channels: [{ channel: 'c0', temperature: 12 }, { channel: 'c1', temperature: 30 }] });
+    const [s] = await hourlySeries(h.ctx(env.store), P('channels.1.temperature'), yesterday('UTC'), 'UTC');
+    assert.equal(s.hours[0].mean, 30);
   });
 }

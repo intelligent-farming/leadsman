@@ -238,6 +238,13 @@ export function parseConfig(raw: unknown): LeadsmanConfig {
       throw new ConfigError(`${at}.notifyTo must be a destination name string`);
     }
 
+    if (entry.resolveOutOfSeason !== undefined && typeof entry.resolveOutOfSeason !== 'boolean') {
+      throw new ConfigError(`${at}.resolveOutOfSeason must be a boolean`);
+    }
+    if (entry.activeHoursStandardTime !== undefined && typeof entry.activeHoursStandardTime !== 'boolean') {
+      throw new ConfigError(`${at}.activeHoursStandardTime must be a boolean`);
+    }
+
     const activeMonths = intList(entry.activeMonths, 1, 12, `${at}.activeMonths`);
     const activeHours = intList(entry.activeHours, 0, 23, `${at}.activeHours`);
 
@@ -249,6 +256,8 @@ export function parseConfig(raw: unknown): LeadsmanConfig {
       severity: entry.severity as Severity | undefined,
       activeMonths,
       activeHours,
+      resolveOutOfSeason: entry.resolveOutOfSeason === true,
+      activeHoursStandardTime: entry.activeHoursStandardTime === true,
       params: (entry.params as Record<string, unknown>) ?? {},
     });
   });

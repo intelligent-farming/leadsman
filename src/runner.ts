@@ -24,6 +24,7 @@ import { forecastSource, resolveApiKey } from './forecast';
 import { heartbeatSecretFromEnv, sendHeartbeat } from './heartbeat';
 import { resolveHostAddress } from './host';
 import { notifyRaised, type AlertRoute } from './notify';
+import { standardHour } from './season';
 import { subjectOf } from './subject';
 import { applySuppression } from './suppress';
 import { version } from './version';
@@ -139,17 +140,23 @@ export async function runSounding(options: RunSoundingOptions): Promise<Sounding
     // means the check is working.
     const dormant = outOfSeason(check, checkStart, config.timezone);
     if (dormant) {
+      // A stage-window check may ask for its alerts to close when its season does. Only
+      // the month gate qualifies — see CheckConfig.resolveOutOfSeason.
+      let resolved = 0;
+      if (check.resolveOutOfSeason && !dryRun && outOfSeason({ activeMonths: check.activeMonths }, checkStart, config.timezone)) {
+        resolved = (await store.reconcile(rule.id, kind, check.severity ?? rule.defaultSeverity, [])).resolved;
+      }
       const result: CheckResult = {
         ruleId: rule.id,
         kind,
         status: 'skipped',
         findings: 0,
         raised: 0,
-        resolved: 0,
+        resolved,
         durationMs: 0,
       };
       results.push(result);
-      checkLog.debug('check skipped — outside its active window', { reason: dormant });
+      checkLog.debug('check skipped — outside its active window', { reason: dormant, resolved });
       if (!dryRun) await store.recordRun(result, checkStart);
       continue;
     }
@@ -192,6 +199,7 @@ export async function runSounding(options: RunSoundingOptions): Promise<Sounding
         openSubjects: open,
         kind,
         now: checkStart,
+        timezone: config.timezone,
         gateways,
         forecast,
         engine,
@@ -493,7 +501,7 @@ function buildForecastSource(
  * for a frost window would be wrong by the whole UTC offset every single night.
  */
 export function outOfSeason(
-  check: Pick<CheckConfig, 'activeMonths' | 'activeHours'>,
+  check: Pick<CheckConfig, 'activeMonths' | 'activeHours' | 'activeHoursStandardTime'>,
   now: Date,
   timezone = 'UTC',
 ): string | null {
@@ -521,8 +529,14 @@ export function outOfSeason(
   if (check.activeMonths && !check.activeMonths.includes(month)) {
     return `month ${month} is not in activeMonths [${check.activeMonths.join(', ')}]`;
   }
-  if (check.activeHours && !check.activeHours.includes(hour)) {
-    return `hour ${hour} is not in activeHours [${check.activeHours.join(', ')}]`;
+  if (check.activeHours) {
+    // A rule written in standard time ("10:00 standard time") keeps its hour through
+    // daylight saving, instead of moving an hour with the wall clock twice a year.
+    const standard = check.activeHoursStandardTime === true;
+    const h = standard ? standardHour(now, timezone) : hour;
+    if (!check.activeHours.includes(h)) {
+      return `${standard ? 'standard-time ' : ''}hour ${h} is not in activeHours [${check.activeHours.join(', ')}]`;
+    }
   }
   return null;
 }

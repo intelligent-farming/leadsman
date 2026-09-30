@@ -1,4 +1,5 @@
 {
+  "//license": "SPDX-License-Identifier: AGPL-3.0-or-later; Copyright (C) 2026 Intelligent Farming Foundation",
   "//": "Complete check set for four Makerfabs AgroSense devices: AGLWSM02, AGLWTH01, AGLWPP01, AGLWL01. Derived from their normalized codec manifests in @intelligent-farming/lorawan-codec-normalization \u2014 every path below is verified against that codec's decoded output, not inferred from the model name.",
   "//devices": [
     "AGLWL01  \u2192 codec makerfabs/light-intensity   \u2192 battery(V), air.lightIntensity(lux), seqNo",

@@ -1,6 +1,7 @@
 {
+  "//license": "SPDX-License-Identifier: AGPL-3.0-or-later; Copyright (C) 2026 Intelligent Farming Foundation",
   "//": "The full menu. Copy to config/leadsman.json, then enable what applies to your deployment. Most entries ship disabled because a sensible threshold depends on your crop, region, and equipment — enabling everything at once produces noise, not signal. No credentials here: the database URL comes from LEADSMAN_DATABASE_URL and the webhook token from LEADSMAN_WEBHOOK_TOKEN, so this file is safe to commit.",
-  "//units": "Every threshold below is in the normalized codec vocabulary's units, which are guaranteed by @intelligent-farming/lorawan-codec-normalization: °C, %, m/s, mm, mm/h, hPa, ppm, ppb, µg/m³, lux, W/m², µmol/m²/s, dS/m, µS/cm, mg/L, mV, NTU, V, A, W, L, Wh, mm/s, g, Hz, dB, µm, g/h, degrees. See docs/vocabulary.md for every path.",
+  "//units": "Every threshold below is in the normalized codec vocabulary's units, which are guaranteed by @intelligent-farming/lorawan-codec-normalization: °C, %, m/s, mm, mm/hour, hPa, kPa, Pa, ppm, ppb, µg/m³, lux, W/m², µmol/m²/s, dS/m, µS/cm, mg/L, mV, mA, NTU, V, A, W, VA, L, Wh, mm/s, g, Hz, dB, µm, g/h, m, cm, s, count, degrees. See docs/vocabulary.md for every path.",
   "schedule": "*/15 * * * *",
   "timezone": "America/Chicago",
   "statementTimeoutMs": 15000,
@@ -988,6 +989,168 @@
         "minSamples": 100,
         "clearDwellHours": 10,
         "unit": "C"
+      }
+    },
+    {
+      "//": "═══ SEASONAL MODELS — counted from a date and computed day by day, the way the published tables were built. Degree-days from a biofix, chill since dormancy, disease indices that carry pressure from one day to the next, streaks of qualifying days. All judged on complete local days in the config timezone, so they report shortly after local midnight. The crop packs in config/crops/ use every one of them with cited numbers. ═══"
+    },
+    {
+      "//": "NAVEL ORANGEWORM flights in almonds. UC IPM model: 55/94 °F, single sine, horizontal cutoff, counted from the egg-trap biofix — the next generation's egg laying begins about 1056 °F-days later. units \"F\" lets the table be copied as published. Set since to the biofix date observed in your traps each spring. Source: https://ipm.ucanr.edu/weather/pest-and-plant-models/?modelKey=2780",
+      "rule": "degree-day-milestone",
+      "as": "now-flight",
+      "enabled": false,
+      "activeMonths": [
+        4,
+        5,
+        6,
+        7,
+        8,
+        9
+      ],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": [
+          "air.temperature",
+          "temperature"
+        ],
+        "method": "sine",
+        "lower": 55,
+        "upper": 94,
+        "cutoff": "horizontal",
+        "units": "F",
+        "since": "2026-04-15",
+        "milestones": [
+          {
+            "at": 1056,
+            "label": "2nd flight egg laying"
+          },
+          {
+            "at": 2112,
+            "label": "3rd flight egg laying"
+          },
+          {
+            "at": 3168,
+            "label": "4th flight egg laying"
+          }
+        ],
+        "holdHours": 72,
+        "deviceNamePattern": "%almond%"
+      }
+    },
+    {
+      "//": "WINTER CHILL in chill portions (Dynamic model), the unit UC now publishes requirements in. Nonpareil almond needs 22–23 portions. Raised as a shortfall from February 1 if the season is still short. Source: https://fruitsandnuts.ucanr.edu/Weather_Services/chilling_accumulation_models/CropChillReq/",
+      "rule": "chill-accumulation",
+      "as": "chill-portions-short",
+      "enabled": false,
+      "activeMonths": [
+        2,
+        3
+      ],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": [
+          "air.temperature",
+          "temperature"
+        ],
+        "model": "dynamic",
+        "since": "11-01",
+        "requirement": 23,
+        "comparison": "short",
+        "byDate": "02-01",
+        "deviceNamePattern": "%almond%"
+      }
+    },
+    {
+      "//": "LATE BLIGHT — the Smith Period: two consecutive days, each with a minimum of at least 10 °C and at least 11 hours at RH ≥ 90 %. Two conditions on two measurements of the same device; a day qualifies only when both hold. The UK's newer Hutton criteria are the same with 6 hours. Source: https://euroblight.net/fileadmin/euroblight/Workshops/AArhus/Proceedings/5._Siobhan_Dancy-p53-58.pdf",
+      "rule": "daily-streak",
+      "as": "late-blight-smith-period",
+      "enabled": false,
+      "activeMonths": [
+        4,
+        5,
+        6,
+        7,
+        8,
+        9
+      ],
+      "resolveOutOfSeason": true,
+      "params": {
+        "conditions": [
+          {
+            "paths": [
+              "air.temperature",
+              "temperature"
+            ],
+            "statistic": "min",
+            "min": 10
+          },
+          {
+            "paths": [
+              "air.relativeHumidity"
+            ],
+            "statistic": "hoursInBand",
+            "bandMin": 90,
+            "min": 11
+          }
+        ],
+        "days": 2,
+        "withinDays": 1,
+        "lookbackDays": 7,
+        "label": "Smith Period",
+        "deviceNamePattern": "%potato%"
+      }
+    },
+    {
+      "//": "GRAPE POWDERY MILDEW — the UC Davis (Gubler-Thomas) risk index, carried day to day from April 1. Raised at 60 (high pressure) with the UC spray intervals for that pressure in the alert. Source: https://ipm.ucanr.edu/DISEASE/DATABASE/grapepowderymildew.html",
+      "rule": "disease-index",
+      "as": "grape-powdery-mildew-index",
+      "enabled": false,
+      "activeMonths": [
+        4,
+        5,
+        6,
+        7,
+        8
+      ],
+      "resolveOutOfSeason": true,
+      "params": {
+        "model": "gubler-thomas",
+        "temperaturePaths": [
+          "air.temperature",
+          "temperature"
+        ],
+        "since": "04-01",
+        "threshold": 60,
+        "deviceNamePattern": "%vineyard%"
+      }
+    },
+    {
+      "//": "TOMATO — TOM-CAST disease severity values from leaf-wetness hours and the temperature during them; raised each time 15 DSV accumulates (spray, then the count resets to zero — surplus DSV on the crossing day is not carried over). wetMin is the wetness sensor's wet cut-off — a percentage means different things on different sensors. With no wetness sensor, point wetnessPaths at air.relativeHumidity and set wetMin 90. Source: https://ipm.ucanr.edu/DISEASE/DATABASE/tomatoblackmold.html",
+      "rule": "disease-index",
+      "as": "tomato-tomcast",
+      "enabled": false,
+      "activeMonths": [
+        6,
+        7,
+        8,
+        9,
+        10
+      ],
+      "resolveOutOfSeason": true,
+      "params": {
+        "model": "tomcast",
+        "temperaturePaths": [
+          "leaf.temperature",
+          "air.temperature"
+        ],
+        "wetnessPaths": [
+          "leaf.wetness"
+        ],
+        "wetMin": 50,
+        "since": "06-01",
+        "threshold": 15,
+        "holdHours": 48,
+        "deviceNamePattern": "%tomato%"
       }
     },
     {

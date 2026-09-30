@@ -16,9 +16,10 @@
 
 import { existsSync, readdirSync, statSync } from 'node:fs';
 import { join, resolve } from 'node:path';
-import type { Rule, Severity } from './types';
+import type { Routing, Rule, Severity } from './types';
 
 const SEVERITIES: readonly Severity[] = ['info', 'warning', 'critical'];
+const ROUTINGS: readonly Routing[] = ['fact', 'situation'];
 
 export class RuleLoadError extends Error {
   constructor(message: string) {
@@ -48,6 +49,16 @@ function validate(candidate: unknown, source: string): Rule {
   if (!SEVERITIES.includes(r.defaultSeverity as Severity)) {
     throw new RuleLoadError(
       `${source}: defaultSeverity must be one of ${SEVERITIES.join(', ')}`,
+    );
+  }
+  if (!ROUTINGS.includes(r.defaultRouting as Routing)) {
+    // Without it the check's alerts match neither notify.routing branch and fall
+    // through silently to defaultDestination (or to record-only), whatever the
+    // deployment routed facts and situations to.
+    throw new RuleLoadError(
+      `${source}: defaultRouting must be one of ${ROUTINGS.join(', ')} — "fact" for a ` +
+        `measured condition someone acts on directly, "situation" for one that needs ` +
+        `interpretation first (see notify.routing)`,
     );
   }
   if (typeof r.defaultParams !== 'object' || r.defaultParams === null) {

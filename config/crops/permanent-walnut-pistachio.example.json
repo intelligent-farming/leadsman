@@ -1,0 +1,216 @@
+{
+  "//license": "SPDX-License-Identifier: AGPL-3.0-or-later; Copyright (C) 2026 Intelligent Farming Foundation",
+  "//": "Walnut and pistachio. Agronomic entries are scoped by deviceNamePattern to placeholders (%walnut%, %pistachio%) — rename devices to match or replace the pattern with deviceProfiles before trusting an alert. Thresholds are the published extension figures cited in each entry; they are starting points, not calibrations.",
+  "//months": "activeMonths are Central Valley timing.",
+  "//enabled": "Enabled: checks whose threshold is a published figure the sensor measures directly — air, leaf and soil temperature, humidity, durations, rates, pH. Disabled: checks whose threshold depends on this soil or this probe (volumetric moisture, EC, N, the 'wet' cut-off of a leaf-wetness sensor) or that need the forecast block — each says what to set before enabling it.",
+  "schedule": "*/15 * * * *",
+  "timezone": "America/Los_Angeles",
+  "statementTimeoutMs": 15000,
+  "maxChecksPerRun": 64,
+  "checks": [
+    {
+      "//": "═══ FLEET HEALTH — every pack carries these, so the pack runs on its own. None needs crop tuning. ═══"
+    },
+    {
+      "rule": "device-silent",
+      "params": {
+        "silentMinutes": 180
+      }
+    },
+    {
+      "rule": "decode-failure"
+    },
+    {
+      "rule": "measurement-implausible"
+    },
+    {
+      "rule": "status-battery-low"
+    },
+    {
+      "//": "═══ WALNUT ═══"
+    },
+    {
+      "//": "WALNUT BLIGHT (Xanthomonas). Rain and wet surfaces carry the bacteria from buds to catkins, flowers and young nuts between budbreak and early nut set. There is no rainfall-amount threshold; infection is wetness × temperature — 6–9 h wet at 25 °C gives moderate severity, 12 h is needed at 15, 20 and 30 °C — so two entries. UC spray timing is 30–40 % prayer stage (30–40 % catkin emergence for Chandler); XanthoCast is the decision model. Sources: UC IPM, \"Walnut blight\", https://ipm.ucanr.edu/agriculture/walnut/walnut-blight/ ; PMC10421262, https://pmc.ncbi.nlm.nih.gov/articles/PMC10421262/",
+      "rule": "mold-risk",
+      "as": "walnut-blight-warm",
+      "activeMonths": [3, 4, 5],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.relativeHumidity"],
+        "humidityMin": 90,
+        "humidityMax": null,
+        "temperaturePaths": ["leaf.temperature", "air.temperature", "temperature"],
+        "temperatureMin": 22,
+        "temperatureMax": 28,
+        "dwellHours": 6,
+        "lookbackHours": 24,
+        "maxGapHours": 2,
+        "minSamples": 4,
+        "clearDwellHours": 1.5,
+        "unit": "%",
+        "deviceNamePattern": "%walnut%"
+      }
+    },
+    {
+      "rule": "mold-risk",
+      "as": "walnut-blight",
+      "activeMonths": [3, 4, 5],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.relativeHumidity"],
+        "humidityMin": 90,
+        "humidityMax": null,
+        "temperaturePaths": ["leaf.temperature", "air.temperature", "temperature"],
+        "temperatureMin": 15,
+        "temperatureMax": 30,
+        "dwellHours": 12,
+        "lookbackHours": 36,
+        "maxGapHours": 2,
+        "minSamples": 4,
+        "clearDwellHours": 3.0,
+        "unit": "%",
+        "deviceNamePattern": "%walnut%"
+      }
+    },
+    {
+      "//": "SUNBURN. UC Walnut Production Manual: occasional temperatures around 37.8 °C (100 °F) may cause sunburn; the kernel pellicle is damaged at a nut surface of 50 °C, and exposed nuts run up to 11 °C above air. Sources: https://ucanr.edu/sites/default/files/2010-06/19005.pdf",
+      "rule": "measurement-peak",
+      "as": "walnut-sunburn",
+      "activeMonths": [6, 7, 8],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.temperature", "temperature"],
+        "direction": "max",
+        "threshold": 37.8,
+        "unit": "C",
+        "lookbackHours": 12,
+        "minSamples": 3,
+        "deviceNamePattern": "%walnut%"
+      }
+    },
+    {
+      "//": "═══ PISTACHIO ═══"
+    },
+    {
+      "//": "ALTERNARIA LATE BLIGHT. UC IPM: favoured by prolonged dew and RH above 95 %; symptoms appear late July–August and can be epidemic by mid-September, and a single spray is best timed late June–early July. UC gives no temperature band, so there is no temperature gate; \"prolonged\" has no published hour count, and 8 h (a dew night) is this pack's choice. A DSV model on leaf wetness × mean temperature predicts it better. Sources: UC IPM, https://ipm.ucanr.edu/agriculture/pistachio/alternaria-late-blight/ ; https://ucanr.edu/sites/default/files/2010-06/19106.pdf",
+      "rule": "mold-risk",
+      "as": "pistachio-alternaria-late-blight",
+      "activeMonths": [6, 7, 8, 9],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.relativeHumidity"],
+        "humidityMin": 95,
+        "humidityMax": null,
+        "temperaturePaths": null,
+        "dwellHours": 8,
+        "lookbackHours": 24,
+        "maxGapHours": 2,
+        "minSamples": 4,
+        "clearDwellHours": 2,
+        "unit": "%",
+        "deviceNamePattern": "%pistachio%"
+      }
+    },
+    {
+      "//": "CHILL SHORTFALL, hours below 7.2 °C (45 °F), counted from November 1 — the window UC uses (Kallsen: \"< 45° F from 11/1 to 2/28\"; Ferguson: November 1 – February 28/29). Requirements: Kerman 700 h for 44 % bloom (Ferguson et al. 2002), 750 h (Crane, Ferguson and Beede), 850 h (Beede 2005); Peters 900 h or more; Kallsen uses 900 h as the pistachio figure. Judged from February 15, which leaves time for a dormant-oil decision, against Kerman's low end — raise requirement to 850–900 for a stricter alert or for Peters. Golden Hills and Lost Hills have no published requirement. Sources: Ferguson (UC Davis), https://louiseferguson.ucdavis.edu/sites/g/files/dgvnsk6001/files/inline-files/2-1.pdf ; Kallsen, UCCE Kern, https://ucanr.edu/sites/default/files/2020-03/321469.pdf ; Fichtner, https://wcngg.com/2022/01/27/winter-chilling-of-pistachio/",
+      "rule": "chill-accumulation",
+      "as": "pistachio-chill-short",
+      "severity": "info",
+      "activeMonths": [2, 3],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.temperature", "temperature"],
+        "model": "hours",
+        "hoursMin": null,
+        "hoursMax": 7.2,
+        "since": "11-01",
+        "requirement": 700,
+        "comparison": "short",
+        "byDate": "02-15",
+        "deviceNamePattern": "%pistachio%"
+      }
+    },
+    {
+      "//": "The same shortfall in chill portions (Dynamic model), judged from February 15 for the same reason. Kerman 54–58, Peters 58–65 (Pope 2014, via Ferguson — \"theoretical and not verified in California\"); Pope et al. 2015 found yields fell below average only under 57 portions, so 57 is the stricter choice. Sources: Ferguson (UC Davis), https://louiseferguson.ucdavis.edu/sites/g/files/dgvnsk6001/files/inline-files/2-1.pdf ; Fichtner, https://wcngg.com/2022/01/27/winter-chilling-of-pistachio/",
+      "rule": "chill-accumulation",
+      "as": "pistachio-chill-portions-short",
+      "severity": "info",
+      "activeMonths": [2, 3],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.temperature", "temperature"],
+        "model": "dynamic",
+        "since": "11-01",
+        "requirement": 54,
+        "comparison": "short",
+        "byDate": "02-15",
+        "deviceNamePattern": "%pistachio%"
+      }
+    },
+    {
+      "//": "ROOT-ZONE SALINITY — pistachio (UC small-plot figure, not yet proven commercially): Maas–Hoffman threshold ECe 9.4 dS/m, above which yield declines. DISABLED until converted to what the probe reads. Maas–Hoffman thresholds are saturated-paste ECe. A soil probe reports bulk EC (or pore EC), which is not ECe: FAO 29 gives soil-water EC ≈ 2 × ECe at field capacity, and bulk EC is lower than pore EC and moves with water content. Convert before enabling — take a saturated-paste lab sample beside the probe and scale this threshold by the probe/ECe ratio. Source: FAO Irrigation and Drainage Paper 29, ch. 2 and Annex 1 (Maas & Grattan 1999), https://www.fao.org/4/t0234e/t0234e02.htm , https://www.fao.org/4/y4263e/y4263e0e.htm",
+      "rule": "measurement-threshold",
+      "as": "pistachio-salinity-high",
+      "enabled": false,
+      "params": {
+        "paths": ["soil.ec"],
+        "min": null,
+        "max": 9.4,
+        "unit": " dS/m",
+        "clearMargin": 0.94,
+        "sustainMinutes": 1440,
+        "lookbackHours": 48,
+        "deviceNamePattern": "%pistachio%"
+      }
+    },
+    {
+      "//": "═══ WALNUT PESTS AND CHILL ═══ Walnut has no numeric Maas–Hoffman threshold, so no salinity entry."
+    },
+    {
+      "//": "CODLING MOTH. UC IPM: 50/88 °F, single sine, horizontal cutoff, from the biofix — the first consistent trap catch on an evening with sunset temperature ≥ 62 °F. Spray 1A near 300 °F-days, 1B at 600–700. DISABLED: set since to this year's biofix date (YYYY-MM-DD). Source: UC IPM, \"Codling moth\" (walnut), https://ipm.ucanr.edu/agriculture/walnut/codling-moth/",
+      "rule": "degree-day-milestone",
+      "as": "walnut-codling-moth",
+      "enabled": false,
+      "activeMonths": [3, 4, 5, 6, 7, 8],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.temperature", "temperature"],
+        "method": "sine",
+        "lower": 50,
+        "upper": 88,
+        "cutoff": "horizontal",
+        "units": "F",
+        "since": "03-25",
+        "milestones": [
+          {
+            "at": 300,
+            "label": "spray timing 1A"
+          },
+          {
+            "at": 600,
+            "label": "spray timing 1B window opens"
+          }
+        ],
+        "holdHours": 72,
+        "deviceNamePattern": "%walnut%"
+      }
+    },
+    {
+      "//": "CHILL SHORTFALL in chill portions. UC: Chandler 45–50, Hartley 54, Payne 38 — set requirement to the block's variety. Source: UC Fruit & Nut Research and Information Center, crop chill requirements, https://fruitsandnuts.ucanr.edu/Weather_Services/chilling_accumulation_models/CropChillReq/",
+      "rule": "chill-accumulation",
+      "as": "walnut-chill-short",
+      "severity": "info",
+      "activeMonths": [2, 3],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.temperature", "temperature"],
+        "model": "dynamic",
+        "since": "11-01",
+        "requirement": 45,
+        "comparison": "short",
+        "byDate": "02-01",
+        "deviceNamePattern": "%walnut%"
+      }
+    }
+  ]
+}

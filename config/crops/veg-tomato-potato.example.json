@@ -1,0 +1,389 @@
+{
+  "//license": "SPDX-License-Identifier: AGPL-3.0-or-later; Copyright (C) 2026 Intelligent Farming Foundation",
+  "//": "Tomato and potato. Agronomic entries are scoped by deviceNamePattern to placeholders (%tomato%, %potato%) — rename devices to match or replace the pattern with deviceProfiles before trusting an alert. Thresholds are the published extension figures cited in each entry; they are starting points, not calibrations.",
+  "//months": "activeMonths are Central Valley processing-tomato timing (transplant March–May, fruit set June–August) and California potato timing. Shift them for your planting dates.",
+  "//enabled": "Enabled: checks whose threshold is a published figure the sensor measures directly — air, leaf and soil temperature, humidity, durations, rates, pH. Disabled: checks whose threshold depends on this soil or this probe (volumetric moisture, EC, N, the 'wet' cut-off of a leaf-wetness sensor) or that need the forecast block — each says what to set before enabling it.",
+  "schedule": "*/15 * * * *",
+  "timezone": "America/Los_Angeles",
+  "statementTimeoutMs": 15000,
+  "maxChecksPerRun": 64,
+  "checks": [
+    {
+      "//": "═══ FLEET HEALTH — every pack carries these, so the pack runs on its own. None needs crop tuning. ═══"
+    },
+    {
+      "rule": "device-silent",
+      "params": {
+        "silentMinutes": 180
+      }
+    },
+    {
+      "rule": "decode-failure"
+    },
+    {
+      "rule": "measurement-implausible"
+    },
+    {
+      "rule": "status-battery-low"
+    },
+    {
+      "//": "═══ LATE BLIGHT ═══"
+    },
+    {
+      "//": "LATE BLIGHT (Phytophthora infestans) — the Smith Period: \"two consecutive days where the minimum temperature is not below 10°C and there are at least 11 hours each day with a relative humidity ≥90%\" (Dancey et al. 2017). The hours are a total per day, not one unbroken run. The UK now uses the Hutton criteria, the same with ≥ 6 h — the second, disabled entry per crop. Days here run 09:00 to 09:00 local (dayStartHour 9), so one humid night stays inside one day. The published definitions give no day boundary; UK practice uses the Met Office 09:00–09:00 GMT climatological day (Bayer UK states \"ending at 0900 hours\"), and 09:00 local keeps that intent — 09:00 GMT would be 01:00 in California. A midnight day (dayStartHour 0) splits each night across two days, so it is less sensitive and later, most at the start of a short spell. The criteria were built on Met Office screen stations; an in-canopy RH sensor usually reads wetter, so expect more alerts. UC IPM notes Smith \"may not be directly usable under California conditions\"; US programmes use Wallin severity values (BLITECAST) — the disabled -wallin entries below. Sources: Dancey et al. 2017, https://euroblight.net/fileadmin/euroblight/Workshops/AArhus/Proceedings/5._Siobhan_Dancy-p53-58.pdf ; Met Office MIDAS guide, https://artefacts.ceda.ac.uk/badc_datadocs/ukmo-midas/ukmo_guide.html ; UC IPM, https://ipm.ucanr.edu/DISEASE/DATABASE/potatolateblight.html",
+      "rule": "daily-streak",
+      "as": "tomato-late-blight-smith-period",
+      "activeMonths": [3, 4, 5, 6, 7, 8, 9, 10, 11],
+      "resolveOutOfSeason": true,
+      "params": {
+        "conditions": [
+          {
+            "paths": ["air.temperature", "temperature"],
+            "statistic": "min",
+            "min": 10
+          },
+          {
+            "paths": ["air.relativeHumidity"],
+            "statistic": "hoursInBand",
+            "bandMin": 90,
+            "min": 11
+          }
+        ],
+        "days": 2,
+        "withinDays": 1,
+        "lookbackDays": 7,
+        "label": "Smith Period",
+        "deviceNamePattern": "%tomato%",
+        "dayStartHour": 9
+      }
+    },
+    {
+      "rule": "daily-streak",
+      "as": "tomato-late-blight-hutton",
+      "enabled": false,
+      "activeMonths": [3, 4, 5, 6, 7, 8, 9, 10, 11],
+      "resolveOutOfSeason": true,
+      "params": {
+        "conditions": [
+          {
+            "paths": ["air.temperature", "temperature"],
+            "statistic": "min",
+            "min": 10
+          },
+          {
+            "paths": ["air.relativeHumidity"],
+            "statistic": "hoursInBand",
+            "bandMin": 90,
+            "min": 6
+          }
+        ],
+        "days": 2,
+        "withinDays": 1,
+        "lookbackDays": 7,
+        "label": "Hutton criteria period",
+        "deviceNamePattern": "%tomato%",
+        "dayStartHour": 9
+      }
+    },
+    {
+      "rule": "daily-streak",
+      "as": "potato-late-blight-smith-period",
+      "activeMonths": [3, 4, 5, 6, 7, 8, 9, 10, 11],
+      "resolveOutOfSeason": true,
+      "params": {
+        "conditions": [
+          {
+            "paths": ["air.temperature", "temperature"],
+            "statistic": "min",
+            "min": 10
+          },
+          {
+            "paths": ["air.relativeHumidity"],
+            "statistic": "hoursInBand",
+            "bandMin": 90,
+            "min": 11
+          }
+        ],
+        "days": 2,
+        "withinDays": 1,
+        "lookbackDays": 7,
+        "label": "Smith Period",
+        "deviceNamePattern": "%potato%",
+        "dayStartHour": 9
+      }
+    },
+    {
+      "rule": "daily-streak",
+      "as": "potato-late-blight-hutton",
+      "enabled": false,
+      "activeMonths": [3, 4, 5, 6, 7, 8, 9, 10, 11],
+      "resolveOutOfSeason": true,
+      "params": {
+        "conditions": [
+          {
+            "paths": ["air.temperature", "temperature"],
+            "statistic": "min",
+            "min": 10
+          },
+          {
+            "paths": ["air.relativeHumidity"],
+            "statistic": "hoursInBand",
+            "bandMin": 90,
+            "min": 6
+          }
+        ],
+        "days": 2,
+        "withinDays": 1,
+        "lookbackDays": 7,
+        "label": "Hutton criteria period",
+        "deviceNamePattern": "%potato%",
+        "dayStartHour": 9
+      }
+    },
+    {
+      "//": "LATE BLIGHT — Wallin severity values, the model BLITECAST builds on and the one most US late-blight programmes use. Each day earns 0–4 from its hours at RH ≥ 90 % and the mean temperature during them (UC IPM table, 7.2–26.6 °C); accumulation starts at plant emergence, and blight is predicted 7–14 days after 18–20 severity values, so the first spray is due at 18. After a spray point the count restarts from zero. BLITECAST times later sprays from a seven-day matrix of rain-favourable days and severity values, which needs rainfall and is not implemented — treat repeat alerts as an approximation of it. Validated in the eastern US; UC IPM lists no model validated for California. DISABLED: set since to the field's emergence date (YYYY-MM-DD) before enabling. Source: UC IPM, potato late blight models, https://ipm.ucanr.edu/DISEASE/DATABASE/potatolateblight.html",
+      "rule": "disease-index",
+      "as": "tomato-late-blight-wallin",
+      "enabled": false,
+      "activeMonths": [3, 4, 5, 6, 7, 8, 9, 10, 11],
+      "resolveOutOfSeason": true,
+      "params": {
+        "model": "wallin",
+        "temperaturePaths": ["air.temperature", "temperature"],
+        "wetnessPaths": ["air.relativeHumidity"],
+        "wetMin": 90,
+        "since": "04-01",
+        "threshold": 18,
+        "deviceNamePattern": "%tomato%"
+      }
+    },
+    {
+      "rule": "disease-index",
+      "as": "potato-late-blight-wallin",
+      "enabled": false,
+      "activeMonths": [3, 4, 5, 6, 7, 8, 9, 10, 11],
+      "resolveOutOfSeason": true,
+      "params": {
+        "model": "wallin",
+        "temperaturePaths": ["air.temperature", "temperature"],
+        "wetnessPaths": ["air.relativeHumidity"],
+        "wetMin": 90,
+        "since": "04-01",
+        "threshold": 18,
+        "deviceNamePattern": "%potato%"
+      }
+    },
+    {
+      "//": "═══ FRUIT SET ═══ Rutgers and UMD: days above 32 °C (90 °F) together with nights above 21 °C (70 °F) reduce tomato fruit set; nights below 13 °C (55 °F) cause blossom drop. The optimum night is 15–21 °C. Sources: Rutgers, https://plant-pest-advisory.rutgers.edu/high-temperatures-and-effect-on-tomato-pollination-and-fruit-set/ ; UMD, https://extension.umd.edu/resource/expect-poor-fruit-set-tomatoes-week"
+    },
+    {
+      "rule": "measurement-peak",
+      "as": "tomato-set-hot-day",
+      "activeMonths": [6, 7, 8, 9],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.temperature", "temperature"],
+        "direction": "max",
+        "threshold": 32,
+        "unit": "C",
+        "lookbackHours": 24,
+        "minSamples": 3,
+        "deviceNamePattern": "%tomato%"
+      }
+    },
+    {
+      "rule": "measurement-peak",
+      "as": "tomato-set-hot-night",
+      "activeMonths": [6, 7, 8, 9],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.temperature", "temperature"],
+        "direction": "min",
+        "comparison": "above",
+        "threshold": 21,
+        "unit": "C",
+        "lookbackHours": 24,
+        "minSamples": 6,
+        "deviceNamePattern": "%tomato%"
+      }
+    },
+    {
+      "rule": "measurement-peak",
+      "as": "tomato-set-cold-night",
+      "activeMonths": [3, 4, 5],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.temperature", "temperature"],
+        "direction": "min",
+        "threshold": 13,
+        "unit": "C",
+        "lookbackHours": 24,
+        "minSamples": 3,
+        "deviceNamePattern": "%tomato%"
+      }
+    },
+    {
+      "//": "BLOSSOM-END ROT RISK — root-zone moisture swinging instead of holding steady. UC IPM: keep root-zone moisture uniform and do not let the soil dry during fruit growth; salinity and sandy soils make it worse. No source gives a numeric swing, so the alert to watch is this rule's \"oscillating\" classification, not a threshold. DISABLED: floor and ceiling are placeholders — set them to this probe's readings at ~40 % depletion (FAO-56 p for tomato is 0.40) and at field capacity. Sources: UC IPM, \"Blossom-end rot\", https://ipm.ucanr.edu/PMG/GARDEN/VEGES/ENVIRON/blossomendrot.html ; FAO-56 Table 22, https://www.fao.org/4/x0490e/x0490e0e.htm",
+      "rule": "soil-deficit-band",
+      "as": "tomato-moisture-uneven",
+      "enabled": false,
+      "activeMonths": [6, 7, 8],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["soil.moisture"],
+        "floor": 20,
+        "ceiling": 30,
+        "lookbackHours": 168,
+        "maxOutOfBandFraction": 0.25,
+        "minCoverage": 0.6,
+        "maxGapHours": 6,
+        "minSamples": 24,
+        "clearMarginFraction": 0.05,
+        "unit": "%",
+        "deviceNamePattern": "%tomato%"
+      }
+    },
+    {
+      "//": "═══ POTATO ═══ NDSU: tuber optimum is 15–20 °C; tuberization falls when nights exceed 20 °C and stops above 25 °C; soil at 24 °C (75 °F) can start second growth, and 28 °C for a month or 32 °C for a week gives it consistently. Source: NDSU, \"Potato tuber second growth\", https://ag.ndsu.edu/publications/crops/potato-tuber-second-growth"
+    },
+    {
+      "rule": "measurement-threshold",
+      "as": "potato-soil-warm-second-growth",
+      "severity": "warning",
+      "activeMonths": [5, 6, 7, 8],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["soil.temperature"],
+        "min": null,
+        "max": 24,
+        "unit": "C",
+        "clearMargin": 1,
+        "sustainMinutes": 360,
+        "lookbackHours": 24,
+        "deviceNamePattern": "%potato%"
+      }
+    },
+    {
+      "//": "28 °C held half a day at tuber depth. NDSU's consistent-second-growth figure is 28 °C for a month; this raises at the start of such a spell rather than a month in.",
+      "rule": "measurement-threshold",
+      "as": "potato-soil-hot",
+      "severity": "critical",
+      "activeMonths": [5, 6, 7, 8],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["soil.temperature"],
+        "min": null,
+        "max": 28,
+        "unit": "C",
+        "clearMargin": 1,
+        "sustainMinutes": 720,
+        "lookbackHours": 36,
+        "deviceNamePattern": "%potato%"
+      }
+    },
+    {
+      "//": "COMMON SCAB. NDSU: scab is suppressed at pH ≤ 5.2; risk spans 5.2–8.0 and is worst when soil is dry during the first 3–6 weeks after tuber initiation. This is info — it says the field is in the risk range, which makes keeping the soil moist through tuber initiation the lever. Source: NDSU, \"Common scab\", https://www.ag.ndsu.edu/potatoextension/common-scab",
+      "rule": "measurement-threshold",
+      "as": "potato-scab-ph",
+      "severity": "info",
+      "activeMonths": [4, 5, 6],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["soil.pH"],
+        "min": null,
+        "max": 5.2,
+        "unit": "",
+        "clearMargin": 0.1,
+        "sustainMinutes": 1440,
+        "lookbackHours": 48,
+        "deviceNamePattern": "%potato%"
+      }
+    },
+    {
+      "//": "ROOT-ZONE SALINITY — tomato: Maas–Hoffman threshold ECe 2.5 dS/m, above which yield declines. DISABLED until converted to what the probe reads. Maas–Hoffman thresholds are saturated-paste ECe. A soil probe reports bulk EC (or pore EC), which is not ECe: FAO 29 gives soil-water EC ≈ 2 × ECe at field capacity, and bulk EC is lower than pore EC and moves with water content. Convert before enabling — take a saturated-paste lab sample beside the probe and scale this threshold by the probe/ECe ratio. Source: FAO Irrigation and Drainage Paper 29, ch. 2 and Annex 1 (Maas & Grattan 1999), https://www.fao.org/4/t0234e/t0234e02.htm , https://www.fao.org/4/y4263e/y4263e0e.htm",
+      "rule": "measurement-threshold",
+      "as": "tomato-salinity-high",
+      "enabled": false,
+      "params": {
+        "paths": ["soil.ec"],
+        "min": null,
+        "max": 2.5,
+        "unit": " dS/m",
+        "clearMargin": 0.25,
+        "sustainMinutes": 1440,
+        "lookbackHours": 48,
+        "deviceNamePattern": "%tomato%"
+      }
+    },
+    {
+      "//": "ROOT-ZONE SALINITY — potato: Maas–Hoffman threshold ECe 1.7 dS/m, above which yield declines. DISABLED until converted to what the probe reads. Maas–Hoffman thresholds are saturated-paste ECe. A soil probe reports bulk EC (or pore EC), which is not ECe: FAO 29 gives soil-water EC ≈ 2 × ECe at field capacity, and bulk EC is lower than pore EC and moves with water content. Convert before enabling — take a saturated-paste lab sample beside the probe and scale this threshold by the probe/ECe ratio. Source: FAO Irrigation and Drainage Paper 29, ch. 2 and Annex 1 (Maas & Grattan 1999), https://www.fao.org/4/t0234e/t0234e02.htm , https://www.fao.org/4/y4263e/y4263e0e.htm",
+      "rule": "measurement-threshold",
+      "as": "potato-salinity-high",
+      "enabled": false,
+      "params": {
+        "paths": ["soil.ec"],
+        "min": null,
+        "max": 1.7,
+        "unit": " dS/m",
+        "clearMargin": 0.17,
+        "sustainMinutes": 1440,
+        "lookbackHours": 48,
+        "deviceNamePattern": "%potato%"
+      }
+    },
+    {
+      "//": "SOIL pH — tomato: outside 6.0–6.8. pH moves over seasons, not hours, so this is info and needs a day sustained; it stays open until the field is limed or acidified. Source: Wisconsin A2809, https://cropsandsoils.extension.wisc.edu/nutrient-application-guidelines-for-field-vegetable-and-fruit-crops-in-wisconsin-a2809/soil-ph-and-lime-requirement/",
+      "rule": "measurement-threshold",
+      "as": "tomato-ph-out-of-band",
+      "severity": "info",
+      "params": {
+        "paths": ["soil.pH"],
+        "min": 6.0,
+        "max": 6.8,
+        "unit": "",
+        "clearMargin": 0.1,
+        "sustainMinutes": 1440,
+        "lookbackHours": 48,
+        "deviceNamePattern": "%tomato%"
+      }
+    },
+    {
+      "//": "═══ TOM-CAST ═══ Early blight, Septoria leaf spot and black mold. Each day earns a disease severity value (0–4) from its hours of leaf wetness and the mean temperature during them; spray when the total since the last spray reaches the threshold — UC IPM's black-mold program uses 12 DSV for susceptible varieties and 18 for resistant (15 is the Midwest default), from July 1 or first fruit color until 7–10 days before harvest. Each crossing raises an alert and resets the count to zero — DSV earned on the crossing day beyond the threshold is not carried into the next interval, matching UC IPM's \"each time 12 DSVs or 18 DSVs have accumulated\" after a spray. Source: UC IPM, tomato black mold models, https://ipm.ucanr.edu/DISEASE/DATABASE/tomatoblackmold.html"
+    },
+    {
+      "//": "On a leaf-wetness sensor, which is what the model was built on. DISABLED: wetMin 50 is a placeholder for this sensor's wet cut-off.",
+      "rule": "disease-index",
+      "as": "tomato-tomcast",
+      "enabled": false,
+      "activeMonths": [7, 8, 9, 10],
+      "resolveOutOfSeason": true,
+      "params": {
+        "model": "tomcast",
+        "temperaturePaths": ["leaf.temperature", "air.temperature", "temperature"],
+        "wetnessPaths": ["leaf.wetness"],
+        "wetMin": 50,
+        "since": "07-01",
+        "threshold": 12,
+        "holdHours": 48,
+        "deviceNamePattern": "%tomato%"
+      }
+    },
+    {
+      "//": "The same model with hours at RH ≥ 90 % standing in for leaf wetness, for blocks with only a climate sensor — the proxy the humidity-based disease entries in these packs all use. Prefer the wetness-sensor entry where one is installed, and disable this one.",
+      "rule": "disease-index",
+      "as": "tomato-tomcast-rh",
+      "activeMonths": [7, 8, 9, 10],
+      "resolveOutOfSeason": true,
+      "params": {
+        "model": "tomcast",
+        "temperaturePaths": ["air.temperature", "temperature"],
+        "wetnessPaths": ["air.relativeHumidity"],
+        "wetMin": 90,
+        "since": "07-01",
+        "threshold": 12,
+        "holdHours": 48,
+        "deviceNamePattern": "%tomato%"
+      }
+    }
+  ]
+}

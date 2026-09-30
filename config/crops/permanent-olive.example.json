@@ -1,0 +1,246 @@
+{
+  "//license": "SPDX-License-Identifier: AGPL-3.0-or-later; Copyright (C) 2026 Intelligent Farming Foundation",
+  "//": "Olive. Agronomic entries are scoped by deviceNamePattern to placeholders (%olive%) — rename devices to match or replace the pattern with deviceProfiles before trusting an alert. Thresholds are the published extension figures cited in each entry; they are starting points, not calibrations.",
+  "//months": "activeMonths are California timing: the wet season October–March, harvest October–January.",
+  "//enabled": "Enabled: checks whose threshold is a published figure the sensor measures directly — air, leaf and soil temperature, humidity, durations, rates, pH. Disabled: checks whose threshold depends on this soil or this probe (volumetric moisture, EC, N, the 'wet' cut-off of a leaf-wetness sensor) or that need the forecast block — each says what to set before enabling it.",
+  "schedule": "*/15 * * * *",
+  "timezone": "America/Los_Angeles",
+  "statementTimeoutMs": 15000,
+  "maxChecksPerRun": 64,
+  "checks": [
+    {
+      "//": "═══ FLEET HEALTH — every pack carries these, so the pack runs on its own. None needs crop tuning. ═══"
+    },
+    {
+      "rule": "device-silent",
+      "params": {
+        "silentMinutes": 180
+      }
+    },
+    {
+      "rule": "decode-failure"
+    },
+    {
+      "rule": "measurement-implausible"
+    },
+    {
+      "rule": "status-battery-low"
+    },
+    {
+      "//": "═══ DISEASE ═══"
+    },
+    {
+      "//": "PEACOCK SPOT (Venturia oleaginea). Minimum leaf-wetness periods for infection, Obanor et al. 2011 (Plant Pathology 60:190): 18, 12, 12, 12 and 24 h at 5, 10, 15, 20 and 25 °C — tested in 6-h steps, so each true minimum may be up to 6 h shorter. Viruega et al. 2011 (Plant Disease 95:1139) independently puts the optimum at 15.5 °C with an 11.9 h minimum. UC IPM gives infection across 1.7–26.7 °C (35–80 °F) and \"as little as 14 hours\" near 24 °C (75 °F), so the 20–24 °C band uses 14 h and 24–26.7 °C uses Obanor's 24 h (the two sources disagree there). Each band's dwellHours is the longest requirement in it. Below 5 °C no infection data were found; the prolonged entry (UC IPM's ~48 h for significant disease, across the whole range) covers it. Caveats: the data are free-water hours and RH ≥ 90 % is a proxy; Viruega found dry breaks of up to 78 h did not stop infection, but mold-risk needs one unbroken run, so interrupted wetness is under-reported. Sources: Obanor et al. 2011 figures as reproduced in https://pmc.ncbi.nlm.nih.gov/articles/PMC8231239/ ; UC IPM, https://ipm.ucanr.edu/agriculture/olive/peacock-spot/",
+      "rule": "mold-risk",
+      "as": "olive-peacock-spot-cool",
+      "activeMonths": [10, 11, 12, 1, 2, 3],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.relativeHumidity"],
+        "humidityMin": 90,
+        "humidityMax": null,
+        "temperaturePaths": ["leaf.temperature", "air.temperature", "temperature"],
+        "temperatureMin": 5,
+        "temperatureMax": 10,
+        "dwellHours": 18,
+        "lookbackHours": 36,
+        "maxGapHours": 2,
+        "minSamples": 4,
+        "clearDwellHours": 3,
+        "unit": "%",
+        "deviceNamePattern": "%olive%"
+      }
+    },
+    {
+      "rule": "mold-risk",
+      "as": "olive-peacock-spot-mild",
+      "activeMonths": [10, 11, 12, 1, 2, 3],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.relativeHumidity"],
+        "humidityMin": 90,
+        "humidityMax": null,
+        "temperaturePaths": ["leaf.temperature", "air.temperature", "temperature"],
+        "temperatureMin": 10,
+        "temperatureMax": 20,
+        "dwellHours": 12,
+        "lookbackHours": 36,
+        "maxGapHours": 2,
+        "minSamples": 4,
+        "clearDwellHours": 3,
+        "unit": "%",
+        "deviceNamePattern": "%olive%"
+      }
+    },
+    {
+      "rule": "mold-risk",
+      "as": "olive-peacock-spot-warm",
+      "activeMonths": [10, 11, 12, 1, 2, 3],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.relativeHumidity"],
+        "humidityMin": 90,
+        "humidityMax": null,
+        "temperaturePaths": ["leaf.temperature", "air.temperature", "temperature"],
+        "temperatureMin": 20,
+        "temperatureMax": 24,
+        "dwellHours": 14,
+        "lookbackHours": 36,
+        "maxGapHours": 2,
+        "minSamples": 4,
+        "clearDwellHours": 3,
+        "unit": "%",
+        "deviceNamePattern": "%olive%"
+      }
+    },
+    {
+      "rule": "mold-risk",
+      "as": "olive-peacock-spot-hot",
+      "activeMonths": [10, 11, 12, 1, 2, 3],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.relativeHumidity"],
+        "humidityMin": 90,
+        "humidityMax": null,
+        "temperaturePaths": ["leaf.temperature", "air.temperature", "temperature"],
+        "temperatureMin": 24,
+        "temperatureMax": 26.7,
+        "dwellHours": 24,
+        "lookbackHours": 36,
+        "maxGapHours": 2,
+        "minSamples": 4,
+        "clearDwellHours": 3,
+        "unit": "%",
+        "deviceNamePattern": "%olive%"
+      }
+    },
+    {
+      "rule": "mold-risk",
+      "as": "olive-peacock-spot-prolonged",
+      "activeMonths": [10, 11, 12, 1, 2, 3],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.relativeHumidity"],
+        "humidityMin": 90,
+        "humidityMax": null,
+        "temperaturePaths": ["leaf.temperature", "air.temperature", "temperature"],
+        "temperatureMin": 1.7,
+        "temperatureMax": 26.7,
+        "dwellHours": 48,
+        "lookbackHours": 72,
+        "maxGapHours": 2,
+        "minSamples": 4,
+        "clearDwellHours": 3,
+        "unit": "%",
+        "deviceNamePattern": "%olive%"
+      }
+    },
+    {
+      "//": "ANTHRACNOSE (Colletotrichum), the mild, rainy-autumn fruit rot. Moral et al. 2012: infects at 10–25 °C, most severe at 17–20 °C, with severity rising steadily across 0–48 h of wetness — there is no single threshold, and 24 h is this pack's choice. UC IPM has no olive anthracnose page. Source: Phytopathology, https://doi.org/10.1094/phyto-12-11-0343",
+      "rule": "mold-risk",
+      "as": "olive-anthracnose",
+      "activeMonths": [9, 10, 11, 12],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.relativeHumidity"],
+        "humidityMin": 90,
+        "humidityMax": null,
+        "temperaturePaths": ["leaf.temperature", "air.temperature", "temperature"],
+        "temperatureMin": 10,
+        "temperatureMax": 25,
+        "dwellHours": 24,
+        "lookbackHours": 48,
+        "maxGapHours": 2,
+        "minSamples": 4,
+        "clearDwellHours": 3,
+        "unit": "%",
+        "deviceNamePattern": "%olive%"
+      }
+    },
+    {
+      "//": "═══ FREEZE ═══ UC (Vossen, \"First Press\"): ice forms on the fruit at 0 °C and the interior freezes slightly lower; frozen fruit makes defective oil. Trees are broadly hardy to about −9.4 °C (15 °F). UC gives no fruit-freeze number; −1.7 °C (29 °F) is the commonly cited non-UC figure. Source: https://ucanr.edu/sites/default/files/2010-07/27259.pdf"
+    },
+    {
+      "//": "FRUIT AND WOOD FREEZE. Olive fruit can be damaged below 29 °F (−1.7 °C); small wood is injured below 25 °F (−4 °C); trees can die below 15 °F (−9.4 °C). No UC document gives a numeric fruit figure — the 29 °F value is from The Olive Oil Source (which cites the UC Olive Production Manual); the wood figures are UCCE (Vossen). No source gives a duration, so these are single-reading minima. Freeze damage taints oil, and oil olives are harvested November–January, so the fruit entry runs then. Sources: https://www.oliveoilsource.com/info/frost-prevention ; Vossen, UCCE, \"Olive Oil Production\", https://ucanr.edu/sites/default/files/2010-12/64463.pdf",
+      "rule": "measurement-peak",
+      "as": "olive-fruit-freeze",
+      "severity": "critical",
+      "activeMonths": [11, 12, 1],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.temperature", "temperature"],
+        "direction": "min",
+        "threshold": -1.7,
+        "unit": "C",
+        "lookbackHours": 12,
+        "minSamples": 3,
+        "deviceNamePattern": "%olive%"
+      }
+    },
+    {
+      "rule": "measurement-peak",
+      "as": "olive-small-wood-freeze",
+      "severity": "warning",
+      "activeMonths": [12, 1, 2],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.temperature", "temperature"],
+        "direction": "min",
+        "threshold": -4,
+        "unit": "C",
+        "lookbackHours": 12,
+        "minSamples": 3,
+        "deviceNamePattern": "%olive%"
+      }
+    },
+    {
+      "rule": "measurement-peak",
+      "as": "olive-tree-freeze",
+      "severity": "critical",
+      "activeMonths": [12, 1, 2],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.temperature", "temperature"],
+        "direction": "min",
+        "threshold": -9.4,
+        "unit": "C",
+        "lookbackHours": 12,
+        "minSamples": 3,
+        "deviceNamePattern": "%olive%"
+      }
+    },
+    {
+      "//": "FROST TONIGHT. FAO Frost Protection (Snyder, UC Davis): start wind machines at about 0 °C, and in any case before the crop's critical temperature. Raised up to 14 h ahead so the decision is made the evening before. DISABLED: needs the top-level forecast block and a Weatherbit key (see README, Forecast).",
+      "rule": "forecast-threshold",
+      "as": "olive-frost-forecast",
+      "enabled": false,
+      "severity": "critical",
+      "activeMonths": [11, 12, 1],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.temperature"],
+        "min": 0,
+        "max": null,
+        "withinHours": 14,
+        "minHours": 1,
+        "unit": "C"
+      }
+    },
+    {
+      "//": "SOIL pH — olive: outside 6.5–8.5. pH moves over seasons, not hours, so this is info and needs a day sustained; it stays open until the field is limed or acidified. Source: UC ANR, \"Soil Nutrient Management for Olives\", https://ucanr.edu/sites/default/files/2025-10/Soil%20Nutrient%20Management%20for%20Olives.pdf",
+      "rule": "measurement-threshold",
+      "as": "olive-ph-out-of-band",
+      "severity": "info",
+      "params": {
+        "paths": ["soil.pH"],
+        "min": 6.5,
+        "max": 8.5,
+        "unit": "",
+        "clearMargin": 0.1,
+        "sustainMinutes": 1440,
+        "lookbackHours": 48,
+        "deviceNamePattern": "%olive%"
+      }
+    }
+  ]
+}

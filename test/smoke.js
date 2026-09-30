@@ -107,6 +107,33 @@ test('every bundled check loads and satisfies the Rule contract', () => {
   }
 });
 
+test('a custom check without a valid defaultRouting is refused at load', () => {
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const { RuleLoadError } = require('../dist/registry.js');
+  // One directory per variant: require() caches by path.
+  const dirs = [];
+  const withRouting = (routing) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'leadsman-rules-'));
+    dirs.push(dir);
+    fs.writeFileSync(path.join(dir, 'tank-overflow.js'),
+      `module.exports = { id: 'tank-overflow', description: 'tank above its overflow line', ` +
+      `defaultSeverity: 'warning', ${routing} defaultParams: {}, requires: [], async run() { return []; } };`);
+    return dir;
+  };
+  try {
+    for (const bad of ['', `defaultRouting: 'alarm',`]) {
+      assert.throws(() => loadRules({ extraDir: withRouting(bad) }),
+        (e) => e instanceof RuleLoadError && /defaultRouting must be one of fact, situation/.test(e.message));
+    }
+    const good = loadRules({ extraDir: withRouting(`defaultRouting: 'fact',`) });
+    assert.equal(good.get('tank-overflow').defaultRouting, 'fact');
+  } finally {
+    for (const dir of dirs) fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('the example config only references checks that exist', () => {
   const rules = loadRules();
   const example = require('../config/leadsman.example.json');
@@ -575,6 +602,9 @@ test('rules either run on their own defaults or explain what configuration they 
     'geofence-breach': /requires north, south, east, and west/,
     'measurement-accumulation': /at least one of "min" or "max"/,
     'forecast-threshold': /needs: \[forecast\]/,
+    'degree-day-milestone': /milestones/,
+    'chill-accumulation': /requirement must be set/,
+    'daily-streak': /conditions/,
   };
 
   const rules = loadRules();
@@ -910,6 +940,66 @@ test('lint passes both shipped example configs', async () => {
   }
 });
 
+// ── crop packs ────────────────────────────────────────────────────────────────
+
+const cropPacks = () => {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const dir = path.join(__dirname, '../config/crops');
+  return fs.readdirSync(dir)
+    .filter((f) => f.endsWith('.example.json'))
+    .map((f) => ({ file: `config/crops/${f}`, raw: JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8')) }));
+};
+
+test('lint passes every crop pack', async () => {
+  const packs = cropPacks();
+  assert.ok(packs.length > 0, 'no crop packs found in config/crops/');
+  for (const { file, raw } of packs) {
+    const problems = await lint(raw);
+    const errors = problems.filter((p) => p.severity === 'error');
+    assert.deepEqual(errors, [], `${file}: ${messages(errors).join('; ')}`);
+  }
+});
+
+test('every shipped entry passes its rule\'s validation, including the disabled ones', async () => {
+  // lint judges enabled checks only, and most shipped entries are disabled until tuned —
+  // so a disabled entry with an impossible parameter set would lint clean and fail the
+  // day someone enables it. Enable everything and lint that instead.
+  const shipped = [
+    { file: 'config/leadsman.example.json', raw: require('../config/leadsman.example.json') },
+    { file: 'config/makerfabs-agrosense.example.json', raw: require('../config/makerfabs-agrosense.example.json') },
+    ...cropPacks(),
+  ];
+  for (const { file, raw } of shipped) {
+    const all = {
+      ...raw,
+      maxChecksPerRun: 10_000,
+      checks: raw.checks.map((c) => (c.rule ? { ...c, enabled: true } : c)),
+    };
+    const errors = (await lint(all)).filter((p) => p.severity === 'error');
+    assert.deepEqual(errors, [], `${file}: ${messages(errors).join('; ')}`);
+  }
+});
+
+test('every agronomic check in a crop pack is scoped to part of the fleet', () => {
+  // A crop threshold is only true of that crop. Unscoped, a bloom-frost bound for almonds
+  // would raise on every thermometer on the site, including the one in the shop.
+  const fleetWide = new Set([
+    'device-silent', 'decode-failure', 'measurement-implausible', 'status-battery-low',
+    'forecast-threshold',
+  ]);
+  for (const { file, raw } of cropPacks()) {
+    const cfg = parseConfig(raw);
+    for (const check of cfg.checks) {
+      if (fleetWide.has(check.rule)) continue;
+      const p = check.params ?? {};
+      const scoped = (Array.isArray(p.deviceProfiles) && p.deviceProfiles.length > 0) ||
+        (typeof p.deviceNamePattern === 'string' && p.deviceNamePattern.length > 0);
+      assert.ok(scoped, `${file}: "${check.as}" has no deviceNamePattern or deviceProfiles`);
+    }
+  }
+});
+
 test('lint does not run a rule that would need a database to validate', async () => {
   // The stub context returns no rows, so a rule that gets past its own parameter
   // validation finds nothing and reports nothing. A clean config must lint clean.
@@ -1176,9 +1266,11 @@ test('every rule declares a routing class, and situations stay a small set', () 
   // so growing this set should be a deliberate act that updates this test.
   // mold-risk is the one measurement-shaped rule in the set, and it is here because
   // acting on it needs the crop stage, the spray history and the forecast — none of
-  // which are in the event store. See the rule header.
+  // which are in the event store. See the rule header. disease-index is here for the
+  // same reason: the index says how much pressure has built, and what to do about it
+  // depends on what was last sprayed and when.
   assert.deepEqual(situations.sort(), [
-    'device-silent', 'geofence-breach', 'join-churn', 'measurement-outlier',
+    'device-silent', 'disease-index', 'geofence-breach', 'join-churn', 'measurement-outlier',
     'mold-risk', 'response-missing', 'soil-deficit-band',
   ]);
 });
@@ -2128,6 +2220,9 @@ test('measurement-derived computes the published formulas correctly', async () =
   assert.ok(Math.abs(saturated[0].detail.value - 20) < 0.2, `got ${saturated[0].detail.value}`);
   const dt = await rule.run(ctxFor(rule, { formula: 'deltaT', max: 0.5 }, row(20, 100)));
   assert.deepEqual(dt, [], 'delta-T at saturation is ~0, which is inside max 0.5');
+  // Exactly zero, not Stull's +0.13 at 0 °C: saturated air has no wet-bulb depression.
+  const coldSat = await rule.run(ctxFor(rule, { formula: 'deltaT', min: 0.01, max: null }, row(0, 100)));
+  assert.equal(coldSat[0].detail.value, 0, `got ${coldSat[0]?.detail.value}`);
 
   // THI 72 is the dairy action line. 25 °C at 50 % RH computes to 71.8 — just UNDER
   // it, which is the correct answer and worth pinning, since an off-by-a-little

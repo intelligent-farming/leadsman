@@ -76,7 +76,7 @@ export async function lintConfig(
 
     problems.push(...needProblems(config, rule, kind));
     problems.push(...paramNameProblems(rule, check, kind));
-    problems.push(...(await paramValueProblems(rule, check, kind)));
+    problems.push(...(await paramValueProblems(rule, check, kind, config.timezone)));
 
     // A window that can never contain "now" disables the check permanently while
     // looking configured. parseConfig rejects an empty list and an out-of-range
@@ -86,6 +86,20 @@ export async function lintConfig(
         severity: 'warning',
         where: `checks.${kind}.activeMonths`,
         message: 'lists all twelve months, which is the same as omitting it',
+      });
+    }
+    if (check.resolveOutOfSeason && !check.activeMonths) {
+      problems.push({
+        severity: 'warning',
+        where: `checks.${kind}.resolveOutOfSeason`,
+        message: 'has no effect without activeMonths — the check is never out of season',
+      });
+    }
+    if (check.activeHoursStandardTime && !check.activeHours) {
+      problems.push({
+        severity: 'warning',
+        where: `checks.${kind}.activeHoursStandardTime`,
+        message: 'has no effect without activeHours — the check already runs every hour',
       });
     }
     if (check.activeHours && check.activeHours.length === 24) {
@@ -189,6 +203,7 @@ async function paramValueProblems(
   rule: Rule,
   check: CheckConfig,
   kind: string,
+  timezone: string | undefined,
 ): Promise<VerifyProblem[]> {
   // A rule with unmet needs is already reported as skipped; running it here would
   // only produce a second, more confusing message about the same thing.
@@ -202,6 +217,7 @@ async function paramValueProblems(
     openSubjects: new Set(),
     kind,
     now: new Date(),
+    timezone,
     gateways: null,
     forecast: null,
     engine: { postmasterStartTime: null, previousRunAt: null, hostAddress: null },

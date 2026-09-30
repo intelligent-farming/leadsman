@@ -1,0 +1,273 @@
+{
+  "//license": "SPDX-License-Identifier: AGPL-3.0-or-later; Copyright (C) 2026 Intelligent Farming Foundation",
+  "//": "Wine grape. Agronomic entries are scoped by deviceNamePattern to placeholders (%vineyard%) — rename devices to match or replace the pattern with deviceProfiles before trusting an alert. Thresholds are the published extension figures cited in each entry; they are starting points, not calibrations.",
+  "//months": "activeMonths are California coastal and interior timing: budbreak March–April, bloom May, veraison July–August, harvest August–October.",
+  "//enabled": "Enabled: checks whose threshold is a published figure the sensor measures directly — air, leaf and soil temperature, humidity, durations, rates, pH. Disabled: checks whose threshold depends on this soil or this probe (volumetric moisture, EC, N, the 'wet' cut-off of a leaf-wetness sensor) or that need the forecast block — each says what to set before enabling it.",
+  "schedule": "*/15 * * * *",
+  "timezone": "America/Los_Angeles",
+  "statementTimeoutMs": 15000,
+  "maxChecksPerRun": 64,
+  "checks": [
+    {
+      "//": "═══ FLEET HEALTH — every pack carries these, so the pack runs on its own. None needs crop tuning. ═══"
+    },
+    {
+      "rule": "device-silent",
+      "params": {
+        "silentMinutes": 180
+      }
+    },
+    {
+      "rule": "decode-failure"
+    },
+    {
+      "rule": "measurement-implausible"
+    },
+    {
+      "rule": "status-battery-low"
+    },
+    {
+      "//": "═══ SPRING FREEZE by stage ═══ University of Maryland (Fiola): swollen bud −3.3 °C (26 °F), burst bud −2.2 °C (28 °F), one leaf −2.2 to −1.7 °C, two leaves −1.7 to 0 °C. Source: https://extension.umd.edu/resource/grapevine-frostfreeze-damage-i-background-and-prevention"
+    },
+    {
+      "rule": "measurement-peak",
+      "as": "grape-freeze-swollen-bud",
+      "severity": "critical",
+      "activeMonths": [3],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.temperature", "temperature"],
+        "direction": "min",
+        "threshold": -3.3,
+        "unit": "C",
+        "lookbackHours": 12,
+        "minSamples": 3,
+        "deviceNamePattern": "%vineyard%"
+      }
+    },
+    {
+      "rule": "measurement-peak",
+      "as": "grape-freeze-budburst",
+      "severity": "critical",
+      "activeMonths": [3, 4],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.temperature", "temperature"],
+        "direction": "min",
+        "threshold": -2.2,
+        "unit": "C",
+        "lookbackHours": 12,
+        "minSamples": 3,
+        "deviceNamePattern": "%vineyard%"
+      }
+    },
+    {
+      "//": "−1.7 °C is the one-leaf figure; shoots with two leaves can be injured anywhere up to 0 °C, so lower-lying blocks may want threshold 0.",
+      "rule": "measurement-peak",
+      "as": "grape-freeze-leaf-out",
+      "severity": "critical",
+      "activeMonths": [4, 5],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.temperature", "temperature"],
+        "direction": "min",
+        "threshold": -1.7,
+        "unit": "C",
+        "lookbackHours": 12,
+        "minSamples": 3,
+        "deviceNamePattern": "%vineyard%"
+      }
+    },
+    {
+      "//": "FROST TONIGHT. FAO Frost Protection (Snyder, UC Davis): start wind machines at about 0 °C, and in any case before the crop's critical temperature. Raised up to 14 h ahead so the decision is made the evening before. DISABLED: needs the top-level forecast block and a Weatherbit key (see README, Forecast).",
+      "rule": "forecast-threshold",
+      "as": "grape-frost-forecast",
+      "enabled": false,
+      "severity": "critical",
+      "activeMonths": [3, 4, 5],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.temperature"],
+        "min": 0,
+        "max": null,
+        "withinHours": 14,
+        "minHours": 1,
+        "unit": "C"
+      }
+    },
+    {
+      "//": "═══ DISEASE ═══"
+    },
+    {
+      "//": "POWDERY MILDEW — the UC Davis (Gubler-Thomas) risk index. UC IPM: the index starts at 60 after 3 consecutive days with ≥ 6 continuous hours at 21–29.4 °C (70–85 °F); each such day adds 20 (only 10 if the day also reaches ≥ 35 °C for 15 minutes), and a day with fewer subtracts 10 — heat on such a day adds no further decline, since UC IPM caps the daily decline at 10 and the daily rise at 20; bounded 0–100. 0–30 low, 40–50 moderate, 60–100 high pressure. Raised at 60 with the UC spray intervals (sulfur dust / micronized sulfur / DMI: 7/10/14 days) in the alert; lower threshold to 40 to hear about moderate pressure too. Heat is judged on the hourly maximum, which reads any reading at or above 35 °C in an hour as the 15 minutes. Source: UC IPM, grape powdery mildew risk assessment, https://ipm.ucanr.edu/DISEASE/DATABASE/grapepowderymildew.html",
+      "rule": "disease-index",
+      "as": "grape-powdery-mildew-index",
+      "activeMonths": [4, 5, 6, 7, 8],
+      "resolveOutOfSeason": true,
+      "params": {
+        "model": "gubler-thomas",
+        "temperaturePaths": ["air.temperature", "temperature"],
+        "since": "04-01",
+        "threshold": 60,
+        "deviceNamePattern": "%vineyard%"
+      }
+    },
+    {
+      "//": "DOWNY MILDEW primary infection — the 10:10:24 rule used in Ontario and Australia: at least 10 mm of rain with temperature above 10 °C through a 24 h period. This check totals rain only (integrating rain.intensity, mm/h); in California's growing season the temperature half is nearly always met, and a cold-spell exception is visible in the same alert window. UC IPM gives no rule of this kind: optimum 20–25 °C, range 10–29 °C, infection can take under 90 minutes. Sources: OMAFRA, https://onfruit.ca/2024/08/07/the-lowdown-on-downy-mildew-in-grapes/ ; UC IPM, https://ipm.ucanr.edu/agriculture/grape/downy-mildew/",
+      "rule": "measurement-accumulation",
+      "as": "grape-downy-mildew-rain",
+      "activeMonths": [4, 5, 6, 9, 10],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["rain.intensity"],
+        "method": "integral",
+        "base": 0,
+        "scale": 1,
+        "min": null,
+        "max": 10,
+        "unit": " mm",
+        "lookbackHours": 24,
+        "maxGapHours": 2,
+        "minCoverage": 0.8,
+        "minSamples": 6,
+        "clearMargin": 1,
+        "deviceNamePattern": "%vineyard%"
+      }
+    },
+    {
+      "//": "BOTRYTIS BUNCH ROT. UC IPM uses the Broome model, a wetness × temperature index fitted on 4–20 h of wetness with temperature clamped to 12–32 °C (optimum 15–20 °C when wet); index ≥ 0.5 is the spray trigger. The index is not computed here; this raises on 4 h of near-saturation inside the model's temperature range, the shortest wetness the model was fitted on, so it is deliberately sensitive. Source: UC IPM, https://ipm.ucanr.edu/DISEASE/DATABASE/grapebotrytis.html",
+      "rule": "mold-risk",
+      "as": "grape-botrytis-risk",
+      "activeMonths": [4, 5, 6, 8, 9, 10],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.relativeHumidity"],
+        "humidityMin": 90,
+        "humidityMax": null,
+        "temperaturePaths": ["leaf.temperature", "air.temperature", "temperature"],
+        "temperatureMin": 12,
+        "temperatureMax": 32,
+        "dwellHours": 4,
+        "lookbackHours": 24,
+        "maxGapHours": 2,
+        "minSamples": 4,
+        "clearDwellHours": 1.0,
+        "unit": "%",
+        "deviceNamePattern": "%vineyard%"
+      }
+    },
+    {
+      "//": "═══ HEAT ═══"
+    },
+    {
+      "//": "HEATWAVE, by consecutive days of daily maximum air temperature — the form every source uses. Enabled: three or more days above 40 °C, the South Australian Bureau of Meteorology heatwave definition quoted by Wine Australia and AGWA (the other half of it is five or more days above 35 °C). Disabled: three consecutive days at or above 35 °C, the grapevine heatwave used in Wine Australia project UA 1502 (\"photosynthesis becomes compromised beyond 37 °C\") — enable it for cooler regions; in the Central Valley it would fire most of the summer. Air temperature is only a proxy: exposed dark berries run 12–15 °C above air, and berry-surface temperature, exposure, wind and vine water status decide sunburn. Sources: Wine Australia UA 1502, https://www.wineaustralia.com/research/strategy-4-improving-resource-management/climate-adaptability/ua-1502 ; Wine Australia, https://www.wineaustralia.com/growing-making/environment-and-climate/managing-vines-through-heatwaves ; Gambetta et al. 2021, https://pmc.ncbi.nlm.nih.gov/articles/PMC7819898/",
+      "rule": "daily-streak",
+      "activeMonths": [6, 7, 8, 9],
+      "resolveOutOfSeason": true,
+      "as": "grape-heat-wave",
+      "params": {
+        "conditions": [
+          {
+            "paths": ["air.temperature", "temperature"],
+            "statistic": "max",
+            "min": 40
+          }
+        ],
+        "days": 3,
+        "withinDays": 1,
+        "lookbackDays": 7,
+        "label": "heatwave (3 days above 40 °C)",
+        "deviceNamePattern": "%vineyard%"
+      }
+    },
+    {
+      "rule": "daily-streak",
+      "as": "grape-heat-stress-35",
+      "enabled": false,
+      "activeMonths": [6, 7, 8, 9],
+      "resolveOutOfSeason": true,
+      "params": {
+        "conditions": [
+          {
+            "paths": ["air.temperature", "temperature"],
+            "statistic": "max",
+            "min": 35
+          }
+        ],
+        "days": 3,
+        "withinDays": 1,
+        "lookbackDays": 7,
+        "label": "heat stress (3 days at 35 °C or above)",
+        "deviceNamePattern": "%vineyard%"
+      }
+    },
+    {
+      "//": "ROOT-ZONE SALINITY — grape: Maas–Hoffman threshold ECe 1.5 dS/m, above which yield declines. DISABLED until converted to what the probe reads. Maas–Hoffman thresholds are saturated-paste ECe. A soil probe reports bulk EC (or pore EC), which is not ECe: FAO 29 gives soil-water EC ≈ 2 × ECe at field capacity, and bulk EC is lower than pore EC and moves with water content. Convert before enabling — take a saturated-paste lab sample beside the probe and scale this threshold by the probe/ECe ratio. Source: FAO Irrigation and Drainage Paper 29, ch. 2 and Annex 1 (Maas & Grattan 1999), https://www.fao.org/4/t0234e/t0234e02.htm , https://www.fao.org/4/y4263e/y4263e0e.htm",
+      "rule": "measurement-threshold",
+      "as": "grape-salinity-high",
+      "enabled": false,
+      "params": {
+        "paths": ["soil.ec"],
+        "min": null,
+        "max": 1.5,
+        "unit": " dS/m",
+        "clearMargin": 0.15,
+        "sustainMinutes": 1440,
+        "lookbackHours": 48,
+        "deviceNamePattern": "%vineyard%"
+      }
+    },
+    {
+      "//": "SOIL pH — grape (vinifera prefers 6.5–7.0): outside 5.5–7.0. pH moves over seasons, not hours, so this is info and needs a day sustained; it stays open until the field is limed or acidified. Source: eXtension, \"Soil pH in vineyards\", https://articles.extension.org/pages/65269/soil-ph-in-vineyards",
+      "rule": "measurement-threshold",
+      "as": "grape-ph-out-of-band",
+      "severity": "info",
+      "params": {
+        "paths": ["soil.pH"],
+        "min": 5.5,
+        "max": 7.0,
+        "unit": "",
+        "clearMargin": 0.1,
+        "sustainMinutes": 1440,
+        "lookbackHours": 48,
+        "deviceNamePattern": "%vineyard%"
+      }
+    },
+    {
+      "//": "WINKLER INDEX — season heat summation, base 50 °F (10 °C), April 1 to October 31, by the daily average. Region I ≤ 2500 °F-days, II 2501–3000, III 3001–3500, IV 3501–4000, V > 4000 (Amerine & Winkler, UC Davis). Each boundary passed is raised as info, which is how a vintage running hot or cool shows up against the block's usual region.",
+      "rule": "degree-day-milestone",
+      "as": "grape-winkler-region",
+      "activeMonths": [4, 5, 6, 7, 8, 9, 10],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.temperature", "temperature"],
+        "method": "average",
+        "lower": 50,
+        "upper": null,
+        "cutoff": "horizontal",
+        "units": "F",
+        "since": "04-01",
+        "milestones": [
+          {
+            "at": 2500,
+            "label": "Region I total passed (now Region II heat)"
+          },
+          {
+            "at": 3000,
+            "label": "Region II total passed (now Region III heat)"
+          },
+          {
+            "at": 3500,
+            "label": "Region III total passed (now Region IV heat)"
+          },
+          {
+            "at": 4000,
+            "label": "Region IV total passed (now Region V heat)"
+          }
+        ],
+        "holdHours": 72,
+        "deviceNamePattern": "%vineyard%"
+      }
+    }
+  ]
+}

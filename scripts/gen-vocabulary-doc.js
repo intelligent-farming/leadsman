@@ -46,6 +46,22 @@ const deref = (n) => {
   return n;
 };
 
+// The schema carries units only as parenthesised text in each description, and not every
+// parenthesis is a unit: "Hydrostatic (liquid) pressure (kPa)", "occupied (true) or
+// vacant (false)", "net count (in - out)". Take the first parenthesis that reads as a
+// unit — a symbol or a unit word, not prose, a boolean legend or an expression.
+const UNIT_WORDS = new Set(['count', 'lux', 'ppm', 'ppb']);
+function unitOf(description) {
+  for (const [, text] of description.matchAll(/\(([^)]+)\)/g)) {
+    const t = text.trim();
+    if (/=|\s-\s/.test(t) || /^(true|false)$/.test(t)) continue;
+    if (/^[a-z]{4,}$/.test(t) && !UNIT_WORDS.has(t)) continue;
+    if (t.split(/\s+/).length > 2) continue;
+    return t;
+  }
+  return '';
+}
+
 const leaves = [];
 (function walk(node, p) {
   node = deref(node);
@@ -56,11 +72,10 @@ const leaves = [];
   }
   if (node.items) return walk(node.items, `${p}[]`);
   const type = Array.isArray(node.type) ? node.type.join(' \\| ') : node.type || '?';
-  const m = /\(([^)]+)\)/.exec(node.description || '');
   leaves.push({
     path: p,
     type,
-    unit: m ? m[1] : '',
+    unit: unitOf(node.description || ''),
     min: node.minimum,
     max: node.maximum,
     exMax: node.exclusiveMaximum,
@@ -82,6 +97,31 @@ const COUNTERS = new Set([
 const POSITIONS = new Set(['position.latitude', 'position.longitude']);
 const NON_TELEMETRY = new Set(['time', 'air.location', 'hvac.mode', 'action.button.event']);
 
+// Checks that apply to a path beyond what its type implies. `pre` sits before
+// measurement-implausible in the column and `post` after it.
+const EXTRA_CHECKS = {
+  temperature: { pre: ['`mold-risk` (as the gate)'], post: ['`measurement-derived`'] },
+  'air.temperature': { pre: ['`mold-risk` (as the gate)'], post: ['`measurement-derived`'] },
+  'leaf.temperature': { pre: ['`mold-risk` (as the gate)'], post: ['`measurement-derived`'] },
+  'air.relativeHumidity': { pre: ['`mold-risk`'], post: ['`measurement-derived`'] },
+  'leaf.wetness': { pre: ['`mold-risk`'], post: [] },
+  'soil.moisture': { pre: [], post: ['`soil-deficit-band`'] },
+};
+const isRanged = (leaf) =>
+  leaf.min !== undefined || leaf.max !== undefined || leaf.exMax !== undefined;
+
+function checksColumn(leaf) {
+  const base = checksFor(leaf);
+  if (base[0] === '—') return '—';
+  const extra = EXTRA_CHECKS[leaf.path] ?? { pre: [], post: [] };
+  return [
+    ...base.map((c) => `\`${c}\``),
+    ...extra.pre,
+    ...(isRanged(leaf) ? ['`measurement-implausible`'] : []),
+    ...extra.post,
+  ].join(', ');
+}
+
 function checksFor(leaf) {
   if (NON_TELEMETRY.has(leaf.path)) return ['—'];
   if (POSITIONS.has(leaf.path)) return ['geofence-breach'];
@@ -101,6 +141,9 @@ function checksFor(leaf) {
 }
 
 const out = [];
+out.push('<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->');
+out.push('<!-- Copyright (C) 2026 Intelligent Farming Foundation -->');
+out.push('');
 out.push('# Normalized measurement vocabulary');
 out.push('');
 out.push('Every path a Leadsman check can be pointed at, and which check to use for it.');
@@ -115,18 +158,41 @@ out.push('have meaningful default thresholds. A device on an upstream (non-norma
 out.push('will not match these paths at all — it is ignored rather than misread, and');
 out.push('`measurement-missing` is what tells you it happened.');
 out.push('');
+out.push('## Beyond `event_up`');
+out.push('');
+out.push('Everything below describes the decoded `object` in `event_up`. Five checks read other');
+out.push('ChirpStack tables instead, where the fields are columns rather than vocabulary paths and');
+out.push('so take no `paths` parameter:');
+out.push('');
+out.push('| Check | Table | Columns it reads |');
+out.push('|---|---|---|');
+out.push('| `device-log-error` | `event_log` | `level`, `code`, `description` |');
+out.push('| `status-battery-low` | `event_status` | `battery_level`, `battery_level_unavailable`, `external_power_source` |');
+out.push('| `status-margin-low` | `event_status` | `margin` |');
+out.push('| `join-churn` | `event_join` | `dev_addr` (plus `event_up` for the uplink ratio) |');
+out.push('| `downlink-unacked` | `event_ack` | `acknowledged`, `f_cnt_down` |');
+out.push('');
+out.push('`event_status.battery_level` is worth singling out: it is a battery percentage from the');
+out.push('LoRaWAN MAC layer, so it works on a device whose payload codec emits nothing at all.');
+out.push('');
 out.push('## Multi-path resolution');
 out.push('');
 out.push('One concept often spans several paths, because which one a device emits depends on');
 out.push('what kind of sensor it is. Every check therefore takes a **priority-ordered list**,');
-out.push('resolves the first path present *per device*, and ignores devices carrying none of');
-out.push('them. So a single entry covers a mixed fleet:');
+out.push('resolves the first path present *per device* — in the newest uplink that carries any');
+out.push('candidate — and ignores devices carrying none of them. So a single entry covers a mixed fleet:');
 out.push('');
 out.push('```json');
 out.push('{ "rule": "measurement-threshold", "as": "frost-risk",');
 out.push('  "params": { "paths": ["air.temperature", "temperature", "leaf.temperature"],');
 out.push('              "min": 1.5, "unit": "C" } }');
 out.push('```');
+out.push('');
+out.push(`\`measurement-implausible\` enforces the **Range** column in the tables below. It is not configured per`);
+out.push(`path: one config entry covers all ${leaves.filter(isRanged).length} paths that carry a declared bound, reading them`);
+out.push('straight from the vocabulary schema. It is named in the Checks column wherever that');
+out.push('column lists other checks, but its coverage is the Range column itself rather than that');
+out.push('list — a path with a range is checked whether or not it is annotated here.');
 out.push('');
 out.push('Groupings worth knowing, since these are the ones that bite if you only list one:');
 out.push('');
@@ -136,6 +202,8 @@ out.push('| Temperature | `air.temperature`, `temperature`, `soil.temperature`, 
 out.push('| Level / fill | `tank.level`, `tank.volume`, `water.level`, `tank.distance`, `linear.position`, `analog.ratio` |');
 out.push('| Supply voltage | `battery`, `power.voltage`, `analog.voltage` |');
 out.push('| Moisture / wetness | `soil.moisture`, `leaf.wetness`, `air.relativeHumidity` |');
+out.push('| Canopy wetness, for a disease model | `leaf.wetness`, `air.relativeHumidity` — one band cannot serve both, so give each its own `mold-risk` entry |');
+out.push('| Accumulation inputs | `air.temperature` (degree days), `air.par` (light integral), `rain.intensity` (rainfall) — all via `measurement-accumulation`, and note `method` differs between a rate and a per-report quantity |');
 out.push('| Pressure | `pressure.gauge`, `pressure.absolute`, `water.pressure`, `air.pressure`, `pressure.differential` |');
 out.push('| Cumulative total | `metering.water.total`, `metering.energy.total`, `pulse.total`, `device.runtime` |');
 out.push('| Asserted flag | `water.leak`, `air.gasAlarm`, `action.smoke.detected`, `action.motion.detected`, `action.switch.state`, `action.contactState` |');
@@ -165,7 +233,7 @@ for (const [group, rows] of groups) {
     ].filter(Boolean).join(', ');
     out.push(
       `| \`${r.path}\` | ${r.type} | ${r.unit ? `${r.unit}` : '—'} | ${range || '—'} | ` +
-        `${checksFor(r).map((c) => (c === '—' ? '—' : `\`${c}\``)).join(', ')} |`,
+        `${checksColumn(r)} |`,
     );
   }
   out.push('');
@@ -184,7 +252,11 @@ if (fs.existsSync(categoriesDir)) {
   out.push('|---|---|---|');
   for (const f of cats) {
     const c = JSON.parse(fs.readFileSync(path.join(categoriesDir, f), 'utf8'));
-    const fmt = (a) => ((a || []).length ? a.map((p) => `\`${p}\``).join(', ') : '—');
+    // A manifest may name a parent object (`action.motion`) rather than a leaf; show it as
+    // the family of leaves it stands for.
+    const leafPaths = new Set(leaves.map((l) => l.path));
+    const asPath = (p) => (leafPaths.has(p) || !leaves.some((l) => l.path.startsWith(`${p}.`)) ? p : `${p}.*`);
+    const fmt = (a) => ((a || []).length ? a.map((p) => `\`${asPath(p)}\``).join(', ') : '—');
     out.push(`| ${c.id} | ${fmt(c.requires)} | ${fmt(c.provides)} |`);
   }
   out.push('');

@@ -5,7 +5,7 @@ select in a config file, and records deduplicated alerts in Postgres.
 
 Leadsman is the deterministic tier of a monitoring stack. It consumes no inference
 tokens: it decides *what is wrong*, records it, and routes each alert to one
-destination — a webhook, or an SMS/Telegram/Signal message. Alerts whose summary is
+destination — a webhook, or an SMS, Telegram, Signal or Slack message. Alerts whose summary is
 already actionable go straight to a person; the few that need interpreting can go to
 an LLM agent instead. See [Delivery](#delivery).
 
@@ -14,7 +14,7 @@ ChirpStack ──▶ events-postgres (event_up, event_join, …)
                      │  SELECT
                      ▼
                  leadsman  ──▶ leadsman.alert  ──▶ destinations
-                 (cron)          (deduplicated)     (SMS / Telegram / Signal / webhook)
+                 (cron)          (deduplicated)     (SMS / Telegram / Signal / Slack / webhook)
                      │                                    │
                      │  GET /api/gateways (optional)       └─▶ heartbeat receiver
                      ▼                                          (off-box liveness)
@@ -43,8 +43,10 @@ exists for the checks that a stream consumer structurally cannot perform:
   silences. Deciding that they share one cause needs a view of the whole fleet at one
   moment, which a per-message consumer does not have — see [Suppression](#suppression).
 
-Every check aggregates in SQL and returns only breaching subjects, so the work
-happens in Postgres rather than in the engine.
+Almost every check aggregates in SQL and returns only breaching subjects, so the work
+happens in Postgres rather than in the engine. The exceptions are the
+[seasonal model checks](#seasonal-model-checks), which fetch one hourly series per device
+(bucketed in Postgres) and run the published model arithmetic in TypeScript.
 
 ## Install
 
@@ -91,7 +93,8 @@ trusting a config, and they need progressively more of the stack:
 
 `config/leadsman.json` selects checks and sets their parameters. It holds no
 credentials — the database URL, webhook secrets and provider credentials all come from
-the environment — so it is safe to commit and review in a diff.
+the environment — so it is safe to commit and review in a diff, unless you put
+`forecast.apiKey` in it (see [Forecast](#the-api-key-and-the-one-exception-to-committable-config)).
 
 ```json
 {
@@ -116,26 +119,35 @@ the environment — so it is safe to commit and review in a diff.
 | Field | Meaning |
 |---|---|
 | `rule` | Which check script to run |
-| `as` | Instance name, and the alert `kind`. Defaults to `rule`. Required when enabling the same rule twice |
+| `as` | Instance name, and the alert `kind`. Defaults to `rule`. Required when the same rule is listed twice, enabled or not |
 | `enabled` | Defaults to `true`. Set `false` to keep an entry documented but inactive |
 | `severity` | Overrides the check's default. A check may still escalate an individual finding |
 | `params` | Merged over the check's `defaultParams`. Unknown keys are an error in `lint` and `verify` |
-| `statementTimeoutMs` | Per-query ceiling, applied as Postgres `statement_timeout` |
+| `notifyTo` | Destination name for this check's alerts, overriding routing — see [Routing](#routing) |
+| `activeMonths` / `activeHours` | Months (1–12) or local hours (0–23) the check runs in — see [Seasonal and diurnal gating](#seasonal-and-diurnal-gating) |
+| `activeHoursStandardTime` | Read `activeHours` on the zone's standard time all year, for rules stated in standard time |
+| `resolveOutOfSeason` | `true` resolves open alerts while `activeMonths` gates the check out |
+
+`schedule`, `timezone` and `statementTimeoutMs` (the per-query ceiling, applied as
+Postgres `statement_timeout`) are top-level, as is `maxChecksPerRun` (default 64): a
+config enabling more checks than that is refused rather than run.
 
 Generic checks like `measurement-threshold` are meant to be listed more than once
 under different `as` names. Each instance raises and resolves independently, because
 `kind` is part of the alert identity.
 
-Alongside `checks`, four optional top-level blocks:
+Alongside `checks`, six optional top-level blocks:
 
 | Block | Meaning |
 |---|---|
 | `notify` | Delivery destinations and routing. Absent means record-only — see [Delivery](#delivery) |
 | `suppress` | Which alerts to hold back while a higher-level alert explains them. **Absent means the built-in default, not "off"** — see [Suppression](#suppression) |
 | `heartbeat` | Where to POST a liveness ping after every sounding — see [Heartbeat](#heartbeat) |
-| `chirpstack` / `hostAddress` | Inputs the event store cannot supply — see [Gateway and host visibility](#gateway-and-host-visibility) |
+| `chirpstack` / `hostAddress` | Two blocks: inputs the event store cannot supply — see [Gateway and host visibility](#gateway-and-host-visibility) |
+| `forecast` | The forecast provider and site centroid. Absent means every forecast check is `skipped` — see [Forecast](#forecast) |
 
-Two configs ship in `config/`:
+Two top-level configs sit in `config/` in the repo (the npm package includes only
+`leadsman.example.json`):
 
 | File | Purpose |
 |---|---|
@@ -147,9 +159,18 @@ better *example* either way — it shows per-family battery scoping, the peak-vs
 distinction, and thresholds annotated with why they are set where they are. Both are
 exercised by CI against fixtures, so neither can drift from the code.
 
+`config/crops/` holds twelve per-crop packs — almond, walnut and pistachio, wine grape,
+citrus, olive, stone fruit, corn and stored grain, soybean and wheat, cotton and alfalfa,
+tomato and potato, lettuce, strawberry. Each is a complete config built from the checks
+below, with every threshold cited to its extension source in the entry's or its
+section's comment. CI
+lints every pack and rejects an agronomic entry without a device scope. See
+[docs/crops.md](docs/crops.md) for what each pack covers, the sensors it needs, and which
+entries ship disabled until calibrated.
+
 ## Available checks
 
-Thirty-six checks in four families, organized by *mechanism* rather than by measurement.
+Forty checks in five families, organized by *mechanism* rather than by measurement.
 Which sensor a check looks at is configuration; how it decides something is wrong is
 code. That is why so few checks cover all 104 paths of the normalized vocabulary — a
 wind threshold and a soil-moisture threshold are the same mechanism pointed at
@@ -297,12 +318,64 @@ Three things are worth understanding:
 - **One HTTP call per sounding, shared.** A forecast's resolution is kilometres and the
   distance between blocks is hundreds of metres, so the config names one centroid and
   every forecast check reads the same answer — or the same failure. Ten instances cost
-  one request. See
+  one request; a check that sets its own `latitude`/`longitude` costs one more. See
   [Forecast](#forecast).
 - **It is normalized onto the same vocabulary.** `air.temperature` is °C and
   `wind.speed` is m/s whether the number came from a sensor in the orchard or from an
   API, so a frost bound of 1.5 means the identical thing in both, and the candidate-path
   mechanism works unchanged.
+
+### Seasonal model checks
+
+Every check above looks back a fixed number of hours. Most of the numbers an agronomist
+plans against are not shaped like that: they are counted from a date — a biofix, a
+planting date, the start of dormancy — and computed day by day by the method the published
+table was built with. These four carry that arithmetic.
+
+| Check | Mechanism | Default severity |
+|---|---|---|
+| `degree-day-milestone` | Degree-days from daily min/max since a date — single sine, average, or the corn modified method, with an optional upper cutoff (refused with `average`) — raising as each milestone is reached | info |
+| `chill-accumulation` | Chill since dormancy by chill hours, Utah units or Dynamic-model chill portions, against a variety's requirement | info |
+| `daily-streak` | A daily condition — a daily min, max or mean, or hours in a band, on one or more measurements — held on N consecutive days | warning |
+| `disease-index` | A published disease model run day by day: the Gubler-Thomas grape powdery mildew index, TOM-CAST disease severity values, or Wallin late-blight severity values | warning |
+
+Four things to know about them — not every one applies to all four checks:
+
+- **A start date, not a window** — except `daily-streak`, which looks back
+  `lookbackDays` complete days instead. `since` is `MM-DD` for a season that starts on the
+  same date every year (its most recent occurrence at or before today) or `YYYY-MM-DD`
+  for a fixed one. On October 2 a chill count since November 1 of last year is eleven
+  months old; since this November 1 it has not started — the check knows which, but it
+  will keep judging that eleven-month-old season until November 1, so give a `"short"`
+  chill check `activeMonths`. The default starts are northern-hemisphere dates; set
+  `since` explicitly in the southern hemisphere.
+- **Complete local days.** A day's minimum is not known until the day is over, and a
+  degree-day or severity value from half a day is not the number the model was
+  calibrated on. Days are local days in the config `timezone`, so these alerts arrive
+  shortly after local midnight. `chill-accumulation` is the exception: it counts hours
+  through now, including today's. `daily-streak` can move the boundary with
+  `dayStartHour`: the Smith and Hutton late-blight criteria come from UK practice, where
+  the day runs 09:00 to 09:00, so one humid night stays inside one day — a midnight
+  boundary splits each night in two and can miss a two-night spell entirely.
+- **Gaps are refused, not filled.** A day with less than `minDayCoverage` of its hours
+  observed contributes nothing and is counted as missing. Degree-days refuse to report
+  beyond `maxMissingDays`, because a milestone reported a week late looks exactly like
+  the real thing; a disease index holds its value across an unknown day; a streak is
+  broken by one. `chill-accumulation` judges coverage season-wide instead: below
+  `minCoverage` of the season's hours observed, it refuses to judge.
+- **An event raises, then resolves.** A milestone reached, or a TOM-CAST or Wallin spray
+  point, is news for a while and then is not. `degree-day-milestone`, TOM-CAST and Wallin
+  raise a fresh alert held open for `holdHours`, so the next one notifies on its own
+  rather than being folded into an alert that is already open; the TOM-CAST and Wallin
+  counts restart from zero at each spray point. Wallin (`model: "wallin"`) counts hours
+  at RH ≥ 90 % from plant emergence and conventionally sprays first at 18 severity
+  values; BLITECAST's rainfall matrix for later sprays is not implemented. The other checks report a state and resolve when it ends.
+
+The published tables are built in. `disease-index` takes a model name rather than a
+table, because a hand-entered copy of the TOM-CAST or Wallin table is the most likely way to get it
+subtly wrong; `degree-day-milestone` accepts thresholds and milestones in `°F` with
+`"units": "F"`, so a UC IPM table can be copied as published. The pure model arithmetic
+is in `src/models.ts`, tested against hand-worked values in `test/agronomy.js`.
 
 ### The checks worth enabling first
 
@@ -325,7 +398,9 @@ producing no usable data:
   constant forever.
 - `counter-stalled` — a water meter reading the same total because the pump failed.
 - `join-churn` — a device rejoining more often than it reports data (critical, even with
-  no uplinks at all), or more than once per ten uplinks once it has reported a few times. `device-silent`
+  no uplinks at all), more than once per ten uplinks once it has reported a few times, or
+  more than `maxJoins` times in the window regardless. The two relative tests need at
+  least `minJoinsForRatio` joins, since one join is how every session starts. `device-silent`
   stays quiet because uplinks *are* arriving.
 - `downlink-unacked` — a command ChirpStack resolved as unacknowledged. ChirpStack only
   writes that verdict on the device's next uplink (Class A) or after the Class B/C
@@ -366,6 +441,15 @@ Resolution happens in SQL — candidate paths arrive as one JSONB parameter, unn
 `WITH ORDINALITY`, so priority is `ORDER BY ord` and no SQL is assembled by string
 concatenation.
 
+### Multi-position devices
+
+Grain cables and depth-profile soil probes report one object per position in the
+reserved `channels[]` array. A numeric path segment indexes it, so
+`channels.0.temperature` is the first position's temperature and each position can be a
+check of its own — `config/crops/row-corn.example.json` does this for a grain probe. The
+index is positional rather than the entry's `channel` label: if a codec ever omits an
+entry, later positions shift.
+
 ### Scoping a check to part of the fleet
 
 For most checks the candidate path *is* the scope: a `pressure.gauge` threshold only
@@ -374,11 +458,12 @@ needed.
 
 That breaks down for the fields every device reports — `battery` above all. Nearly every
 category in the vocabulary provides it, but the sensible threshold is per hardware
-family: a Makerfabs AgroSense light sensor operates normally at 2.85 V, while a
+family: a Makerfabs AgroSense light sensor operates normally at 2.9 V, while a
 pipe-pressure node runs 3.6–4.0 V. One fleet-wide threshold either cries wolf on the
 first or stays silent until the second is dead.
 
-Every check therefore accepts two optional filters:
+Every device-subject check therefore accepts two optional filters (the gateway checks
+take `gateways` and `ignoreGateways` instead):
 
 | Param | Effect |
 |---|---|
@@ -387,7 +472,7 @@ Every check therefore accepts two optional filters:
 
 ```json
 { "rule": "battery-low", "as": "battery-low-light",
-  "params": { "raiseAtVolts": 2.8, "clearAtVolts": 2.95,
+  "params": { "raiseAtVolts": 2.8, "clearAtVolts": 2.95, "criticalAtVolts": 2.6,
               "deviceProfiles": ["makerfabs-light-intensity"] } }
 ```
 
@@ -439,7 +524,7 @@ Three properties are worth knowing before you tune it:
 - **The duration is measured, not assumed.** It runs from the first in-band reading to
   the last, so an hourly reporter understates a six-hour event as five, and a single
   in-band reading is zero hours rather than one interval. Every rounding is toward not
-  raising, which is the right direction for the one check that spends tokens by default.
+  raising, which is the right direction for a check that spends tokens by default.
 
 Give each crop its own entry with its own numbers and its own scope — the gate for
 peacock spot on olives (10–20 °C, twelve hours) is not the gate for botrytis on grapes
@@ -487,6 +572,16 @@ interval from the latest reading to now. Above `minCoverage`, the total compared
 `min`/`max` is the observed total scaled to full coverage (`observed / coverage`), and
 the alert reports observed, projected and coverage.
 
+Two optional parameters make it a season-to-date index. `cap` is an upper threshold as
+a horizontal cutoff — a reading above it counts as the cap, the way corn stops
+accruing GDD above 30 °C — and must be above `base`; it applies to each reading, so to
+`sum` as well as `integral`. `since` counts from a date
+(`MM-DD` or `YYYY-MM-DD`, as in [Seasonal model checks](#seasonal-model-checks)) instead
+of `lookbackHours`, with coverage judged against the hours since that date's local
+midnight. Both work on the readings themselves — `integral` is a trapezoid from each
+reading to the next — so for a table built on daily minimum and maximum, use
+`degree-day-milestone`.
+
 ### Comparing a device against its neighbours
 
 Every check above is longitudinal: one device against its own past. `measurement-outlier`
@@ -521,7 +616,7 @@ meaningless. Five formulas, all from temperature and relative humidity:
 | `vpd` | kPa | Vapour pressure deficit — the governing number under glass. It, not humidity, drives transpiration and stomatal closure |
 | `deltaT` | °C | Wet-bulb depression. The spray window: below ~2 the droplets drift, above ~8 they evaporate before they land |
 | `dewPoint` | °C | Condensation, leaf-wetness onset, and the floor a radiative frost will actually reach |
-| `thi` | — | Temperature-humidity index. Dairy cattle: comfort below 68; milk-yield loss in high-producing cows from ~68 (Zimbelman et al. 2009; ~72 in the older Armstrong 1994 threshold); severe stress above ~80 |
+| `thi` | — | Temperature-humidity index. Dairy cattle: milk-yield loss in high-producing cows from ~68 (Zimbelman et al. 2009); Armstrong (1994) classes 72–79 mild, 80–89 moderate, 90+ severe. The check applies no bands of its own — set `min`/`max` for your herd |
 | `absoluteHumidity` | g/m³ | Ventilation and drying, where relative humidity is actively misleading because it moves with temperature |
 
 ### A band the block is meant to live in
@@ -612,7 +707,7 @@ any device, so an alert names one of four subject kinds:
 
 | `subject_kind` | `subject_id` | Raised by |
 |---|---|---|
-| `device` | DevEUI | every measurement and network-layer check |
+| `device` | DevEUI | every measurement, seasonal model and network-layer check |
 | `gateway` | gateway EUI | the gateway checks, except `gateway-redundancy-lost`, which is about the device that lost its redundancy |
 | `site` | `site` | `fleet-silent`, `forecast-threshold` |
 | `engine` | `engine` | `host-restarted`, `host-address-changed` |
@@ -711,8 +806,8 @@ No credentials appear here — they come from the environment, so this file stay
 
 | Provider | Transport | Needs |
 |---|---|---|
-| `webhook` (default) | POST of the alert JSON, signed | `webhookUrl` |
-| `twilio` | SMS, one request per recipient | `to` + the three `LEADSMAN_TWILIO_*` vars |
+| `webhook` (default) | POST of the alert JSON, with a bearer token by default; `"webhookAuth": "hmac"` signs it | `webhookUrl` |
+| `twilio` | SMS, one request per recipient | `to` + the four `LEADSMAN_TWILIO_*` vars |
 | `telegram` | Bot message | `chatId` + `LEADSMAN_TELEGRAM_BOT_TOKEN` |
 | `signal` | One request carrying all recipients | `to` + `LEADSMAN_SIGNAL_BASE_URL` / `_FROM` |
 | `slack` | Bot message via chat.postMessage | `channel` + `LEADSMAN_SLACK_BOT_TOKEN` |
@@ -740,9 +835,9 @@ token and not the signing secret. Prefer the channel **ID** (`C0123456789`, from
 details) over `#name`, because the ID survives a rename. A bot that is not a member of a
 private channel cannot post to it, and the error is `not_in_channel`.
 
-`chat.postMessage` is rate-limited to roughly one message per second per channel; a burst is
-throttled rather than dropped, and a `ratelimited` failure leaves `notified_at` unstamped, so
-the next sounding retries it.
+`chat.postMessage` is rate-limited to roughly one message per second per channel. Leadsman
+does no throttling of its own: a `ratelimited` reply is a failed delivery that leaves
+`notified_at` unstamped, so the next sounding retries it.
 
 Signal can address a **group** as well as numbers — put its `group.<base64>` id in `to`
 (`signal-cli … listGroups`). Twilio has no equivalent, so a group id is rejected there rather
@@ -776,7 +871,7 @@ A webhook receiver gets `leadsman.alert/2`:
   "kind": "gateway-silent",
   "subjectKind": "gateway",
   "subjectId": "0016c001f1e2d3c4",
-  "subjectName": "north-mast",
+  "subjectName": null,
   "devEui": null,
   "deviceName": null,
   "severity": "critical",
@@ -836,15 +931,19 @@ the chain stops there rather than falling through.
 reader has to work out what the alert means. `pipe-pressure-low` is critical but its summary
 already says what to do — that is a fact. `device-silent` is ambiguous alone, because one node
 is a dead node and six at once is the gateway; only combining it with other alerts answers
-that, which is what makes it worth an agent's tokens. Twenty-nine of the thirty-six rules
+that, which is what makes it worth an agent's tokens. Thirty-two of the forty rules
 are facts; the situations are `device-silent`, `join-churn`, `geofence-breach`,
-`mold-risk`, `measurement-outlier`, `response-missing` and `soil-deficit-band`.
+`mold-risk`, `disease-index`, `measurement-outlier`, `response-missing` and
+`soil-deficit-band`.
 
 `mold-risk` is there because its summary is true without being actionable — as are
-`soil-deficit-band` and `measurement-outlier`, the other two measurement-shaped rules in the set. Whether nine hours at 93 % and 18 °C warrants a
+`disease-index`, `soil-deficit-band` and `measurement-outlier`, the other measurement-shaped
+rules in the set. Whether nine hours at 93 % and 18 °C warrants a
 spray depends on the crop's phenological stage, what was last applied and how long ago, the
 pre-harvest interval, and what the forecast does next — four facts this engine does not
-hold. Waking someone who would only have to go and look all of them up is exactly the case
+hold. `disease-index` is the same case one step on: a Gubler-Thomas index at high
+pressure or a TOM-CAST spray point says the model's threshold was reached, not which
+product to use or whether the last application still covers the block. Waking someone who would only have to go and look all of them up is exactly the case
 the class exists to route elsewhere.
 
 `measurement-outlier` and `response-missing` are situations for the same reason, and it
@@ -855,7 +954,7 @@ emitter, a probe fault, or water moving somewhere the probe is not. In both case
 same alert text has several causes needing different crews, and choosing between them
 needs install history and block layout this engine does not hold.
 
-`forecast-threshold` is a **fact**, despite being the newest and least obvious. "Frost
+`forecast-threshold` is a **fact**, despite being the least obvious. "Frost
 forecast at 04:00, -2 °C, ten hours out" is the whole story, and the response is a
 decision the grower already knows how to make. Sending it to a model to be told it is
 cold would be paying tokens to restate the summary.
@@ -943,7 +1042,8 @@ thing regardless of where the number came from:
 
 The five `forecast.*` paths have no sensor equivalent and cannot get one — probability
 of precipitation is not a quantity anything can measure, and a gust forecast is a
-different statistic from an anemometer's window maximum.
+different statistic from an anemometer's window maximum. `air.dewPoint` and `air.uvIndex`
+are forecast-only too: they are not in the sensor vocabulary, so no codec emits them.
 
 A field the provider omits is **absent**, never zero: 0 °C and 0 m/s are both real
 values, and reading a missing temperature as freezing is precisely the failure a frost
@@ -984,9 +1084,12 @@ Any check can name the months or hours it runs in:
 { "rule": "forecast-threshold", "as": "frost-forecast",
   "activeMonths": [1, 2, 3, 4, 10, 11, 12],
   "params": { "min": 1.5, "withinHours": 14 } }
+```
 
+```json
 { "rule": "measurement-threshold", "as": "radiative-frost",
-  "activeHours": [22, 23, 0, 1, 2, 3, 4, 5, 6] }
+  "activeHours": [22, 23, 0, 1, 2, 3, 4, 5, 6],
+  "params": { "min": 1.5 } }
 ```
 
 A frost check has nothing to say in July and a mildew check has nothing to say in
@@ -1001,11 +1104,33 @@ Both are evaluated in the config's `timezone`, not UTC. That matters most for ho
 frost window expressed in local night hours would otherwise be wrong by the whole UTC
 offset every single night, which is the entire period it exists to cover.
 
+Some published rules are stated in **standard time** — UC's lettuce downy mildew model
+treats wetness still present at "10:00 a.m. (11:00 a.m. during Daylight Savings Time)".
+`"activeHoursStandardTime": true` reads `activeHours` on the zone's standard clock all
+year, so `"activeHours": [10]` is 10:00 standard — 11:00 on the wall clock through
+daylight saving — and switches exactly on the change dates, where two month-split
+entries would be an hour off for days either side. Lint warns when it is set without
+`activeHours`.
+
 A gated check is recorded as `skipped`, exactly like one whose prerequisites are
 unconfigured — a frost check that returned nothing in July is indistinguishable from
 one that ran and found no frost, and only one of those means the check is working.
 `"activeMonths": []` is refused rather than treated as "all", because it reads like a
 placeholder and would silently disable the check forever.
+
+A gated check is not run, so by default its open alerts are neither refreshed nor
+resolved. That is right when the alert describes a lasting state and wrong when it
+describes a stage: a bloom-frost alert raised on the last night of March would stay open
+until the check next ran, ten months later. `"resolveOutOfSeason": true` resolves the
+check's open alerts while `activeMonths` gates it out. `activeHours` never resolves —
+otherwise a morning-only check would close and re-notify every afternoon — and lint warns
+when the flag is set without `activeMonths`, where it can have no effect.
+
+```json
+{ "rule": "measurement-peak", "as": "almond-freeze-full-bloom",
+  "activeMonths": [2, 3], "resolveOutOfSeason": true,
+  "params": { "direction": "min", "threshold": -2.2 } }
+```
 
 ## Gateway and host visibility
 
@@ -1034,9 +1159,11 @@ read-only and point at it; see [`docs/stack-fragment.yml`](docs/stack-fragment.y
   The stack detects the host's LAN address in `setup.sh` and hands it to gateways, so this
   is literally the address the gateways were told.
 
-Either can be set directly instead — `LEADSMAN_CHIRPSTACK_URL`,
-`LEADSMAN_CHIRPSTACK_TENANT_ID`, `LEADSMAN_HOST_ADDRESS` — or through a `chirpstack` /
-`hostAddress` block in the config.
+The host address can be set directly instead, with `LEADSMAN_HOST_ADDRESS` or a
+`hostAddress` block. The gateway API cannot be enabled from the environment alone: it
+needs a `chirpstack` block in the config or `LEADSMAN_CHIRPSTACK_CONFIG`, and its API key
+always comes from the shared file. `LEADSMAN_CHIRPSTACK_URL` and
+`LEADSMAN_CHIRPSTACK_TENANT_ID` then override that file's values.
 
 A check whose prerequisites are missing is recorded as `skipped` in `leadsman.run` rather
 than run. That distinction matters: an unconfigured gateway check that ran would return no
@@ -1074,8 +1201,8 @@ checks run, checks errored, open-alert count, suppressed-alert count. Something 
 raises the alarm when the pings stop. That receiver has to be somewhere the outage cannot
 reach; a watchdog on this same edge device dies with it.
 
-`auth` takes the same modes as a webhook destination (`hmac`, `token`, `bearer`, `none`),
-with the secret from `LEADSMAN_WEBHOOK_TOKEN_HEARTBEAT` falling back to
+`auth` takes a webhook destination's modes (`hmac`, `token`, `bearer`, the default) plus
+`none`, which destinations do not accept, with the secret from `LEADSMAN_WEBHOOK_TOKEN_HEARTBEAT` falling back to
 `LEADSMAN_WEBHOOK_TOKEN`. Also settable as `LEADSMAN_HEARTBEAT_URL`. Test it without
 waiting for a sounding:
 
@@ -1087,7 +1214,8 @@ A failed ping never fails the sounding — the checks have already run and their
 already stored, and taking the engine down because a watchdog endpoint is unreachable
 would turn a monitoring outage into a monitoring failure. Pings are sent even when checks
 errored, since a degraded engine is still a running one; the payload's `checksErrored`
-lets the receiver tell the difference.
+lets the receiver tell the difference. Set `"onError": false` in the `heartbeat` block to
+withhold the ping from any sounding in which a check errored.
 
 `host-restarted` reports the same outage retrospectively, from the event store's
 postmaster start time against the last recorded sounding. The two are complements: one
@@ -1097,7 +1225,9 @@ tells you during, the other tells you how long.
 
 Drop a module into `src/rules/` (or any directory named by `LEADSMAN_RULES_DIR`,
 which lets deployment-specific checks live outside this repo). The filename must
-match the `id`.
+match the `id`. The loader reads compiled `.js` files only and silently ignores `.ts`,
+so compile an out-of-tree check before pointing `LEADSMAN_RULES_DIR` at it; in-tree ones
+are compiled by `npm run build`.
 
 ```ts
 import type { Rule } from '@intelligent-farming/leadsman';
@@ -1107,6 +1237,8 @@ const rule: Rule = {
   id: 'tank-overflow',
   description: 'Flags tanks above their safe fill level.',
   defaultSeverity: 'critical',
+  // 'fact' or 'situation' — the class `notify.routing` routes on. Required.
+  defaultRouting: 'fact',
   // Every parameter needs a default, and `paths` should list every vocabulary path
   // this concept can arrive on — see docs/vocabulary.md.
   defaultParams: { paths: ['tank.level', 'linear.position'], maxPercent: 95, lookbackHours: 6 },
@@ -1159,7 +1291,8 @@ If the check is not about a device:
   `siteSubject()` / `engineSubject()` / `gatewaySubject()` helpers. A finding with
   neither is discarded.
 - **Declare `needs`** for anything the event store cannot supply — `'chirpstack'` for
-  the gateway API, `'hostAddress'` for the forwarding address. The engine then records
+  the gateway API, `'hostAddress'` for the forwarding address, `'forecast'` for the
+  forecast provider. The engine then records
   the check as `skipped` when it is unconfigured, instead of running it blind. Without
   this, an unconfigured check returns no findings, which looks exactly like a healthy
   fleet.
@@ -1183,7 +1316,7 @@ Postgres with no ChirpStack writing to it, so `verify` will correctly report the
 `event_*` tables missing. Use it to work on the engine; use the real stack to work
 on check SQL.
 
-Two operational notes for constrained hardware:
+Three operational notes for constrained hardware:
 
 - **Leadsman reads five event tables**, not just `event_up`: also `event_log`,
   `event_status`, `event_join`, and `event_ack`. All are created by ChirpStack's
@@ -1191,7 +1324,8 @@ Two operational notes for constrained hardware:
   `leadsman verify` will report any that a given ChirpStack version does not create.
 - **Index the event tables.** ChirpStack creates `event_*` with a primary-key index
   only. Every check filters by `time` and groups by `dev_eui`, so without indexes
-  each sounding is a sequential scan. `migrations/002_event_indexes.sql` adds them,
+  each sounding is a sequential scan. `migrations/002_event_indexes.sql` adds them for
+  `event_up`, `event_join` and `event_status` (not `event_log` or `event_ack`),
   gated behind `LEADSMAN_APPLY_EVENT_INDEXES=true` because it alters
   ChirpStack-owned tables.
 - **Checks run sequentially, and overlapping soundings are skipped.** On a device
@@ -1218,7 +1352,7 @@ pattern as the stack's own `010_events_roles.sh`, so it can be dropped into
 |---|---|
 | `LEADSMAN_DATABASE_URL` | Postgres URL for the engine role. Required |
 | `LEADSMAN_MIGRATE_URL` | Owner-role URL, used by `migrate`. Falls back to the above |
-| `LEADSMAN_CONFIG` | Config path. Default `config/leadsman.json` |
+| `LEADSMAN_CONFIG` | Config path. Default `config/leadsman.json`. Unlike the others, an empty value is not treated as unset |
 | `LEADSMAN_RULES_DIR` | Extra directory of operator-supplied checks |
 | `LEADSMAN_WEATHERBIT_API_KEY` | Weatherbit key for the forecast checks. Overrides `forecast.apiKey`, and is the recommended place for it — see [Forecast](#forecast) |
 | `LEADSMAN_INSTANCE_NAME` | Names this edge device: every message leads `Alert from <name>: `, defaulting to `Leadsman`. Also the webhook payload's `instance` |
@@ -1256,12 +1390,14 @@ can repoint a destination — or switch its platform entirely — without rewrit
 config. That split is deliberate: the config says *what* to watch and which class of alert
 goes where, and is identical across installs; the addresses and secrets are properties of the
 host. An **empty** variable counts as unset, so a blank `VAR=` in a `.env` never overrides
-what the config sets and never fails validation.
+what the config sets and never fails validation. The exception is `LEADSMAN_CONFIG`,
+which the CLI reads as given: a blank one is an empty path, not the default, so leave it
+out rather than blank.
 
 ## Tests
 
 ```sh
-npm test        # smoke + providers — no database needed
+npm test        # smoke + providers + agronomy — no database needed
 npm run test:db # resolver, engine and per-family rule suites — requires a scratch Postgres
 npm run test:all
 ```
@@ -1273,6 +1409,7 @@ server, and whole fixtures end to end — because they catch different things:
 |---|---|---|
 | `test/smoke.js` | no | Config validation, check discovery, the `Rule` contract, param and scope coercion, CLI exit codes, and that every rule runs on its own defaults |
 | `test/providers.js` | no | Delivery providers and the forecast provider against fake HTTP, including the once-per-sounding request |
+| `test/agronomy.js` | no | The agronomic models against hand-worked published values — single-sine degree-days, chill hours, Utah and Dynamic chill, Gubler-Thomas, the TOM-CAST and Wallin tables — season arithmetic across DST, standard-time hour gating, and the seasonal rules over hourly rows, including a 09:00 day boundary |
 | `test/resolver.js` | yes | The shared measurement resolvers in `src/measurement.ts` and the device-scope filter, each against the smallest event store that can distinguish the behaviour |
 | `test/engine.js` | yes | The alert lifecycle, the runner's failure handling, the notifier, migration idempotency, and `statement_timeout` |
 | `test/gateway.js` | yes | The gateway and site checks and the `rx_info` helpers, including malformed rows and both key spellings |
@@ -1287,7 +1424,7 @@ deduplicates. A mock cannot exercise `WITH ORDINALITY`, lateral joins, or JSONB 
 operators, so the database-backed suites use a real server and skip cleanly without one.
 
 Four properties are worth calling out because getting them wrong is quiet rather than
-loud, and both now have dedicated tests:
+loud, and all four now have dedicated tests:
 
 - **A failing check resolves nothing.** If a query errors there is no evidence the
   breach ended, so open alerts are left untouched. Without this, a database hiccup reads

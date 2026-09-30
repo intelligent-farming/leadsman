@@ -1,0 +1,140 @@
+{
+  "//license": "SPDX-License-Identifier: AGPL-3.0-or-later; Copyright (C) 2026 Intelligent Farming Foundation",
+  "//": "Citrus. Agronomic entries are scoped by deviceNamePattern to placeholders (%citrus%) — rename devices to match or replace the pattern with deviceProfiles before trusting an alert. Thresholds are the published extension figures cited in each entry; they are starting points, not calibrations.",
+  "//months": "activeMonths are San Joaquin Valley / Southern California timing: freeze season December–February.",
+  "//enabled": "Enabled: checks whose threshold is a published figure the sensor measures directly — air, leaf and soil temperature, humidity, durations, rates, pH. Disabled: checks whose threshold depends on this soil or this probe (volumetric moisture, EC, N, the 'wet' cut-off of a leaf-wetness sensor) or that need the forecast block — each says what to set before enabling it.",
+  "schedule": "*/15 * * * *",
+  "timezone": "America/Los_Angeles",
+  "statementTimeoutMs": 15000,
+  "maxChecksPerRun": 64,
+  "checks": [
+    {
+      "//": "═══ FLEET HEALTH — every pack carries these, so the pack runs on its own. None needs crop tuning. ═══"
+    },
+    {
+      "rule": "device-silent",
+      "params": {
+        "silentMinutes": 180
+      }
+    },
+    {
+      "rule": "decode-failure"
+    },
+    {
+      "rule": "measurement-implausible"
+    },
+    {
+      "rule": "status-battery-low"
+    },
+    {
+      "//": "═══ FREEZE ═══"
+    },
+    {
+      "//": "FRUIT FREEZE. UC: round oranges begin to take fruit damage after 4 h at −2.2 °C (28 °F); mandarin fruit tolerates a brief −4.4 °C but begins to freeze after several hours at −3.3 °C. Eureka lemon and grapefruit are the most sensitive, but no UC source gives a lemon figure — for lemon blocks, raise max rather than trusting this one. Wood damage after 4 h: orange −4.4 °C, Meyer lemon −5.6 °C, mandarin −6.7 °C. Sources: UC IPM, \"Frost protection for citrus\", https://ipm.ucanr.edu/PMG/GARDEN/FRUIT/ENVIRON/citrusfrost.html ; UC Real Dirt, https://ucanr.edu/blog/real-dirt/article/frost-protection-citrus-1",
+      "rule": "measurement-dwell",
+      "as": "citrus-fruit-freeze",
+      "severity": "critical",
+      "activeMonths": [12, 1, 2],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.temperature", "temperature"],
+        "min": null,
+        "max": -2.2,
+        "mode": "longest",
+        "comparison": "atLeast",
+        "dwellHours": 4,
+        "lookbackHours": 24,
+        "maxGapHours": 2,
+        "minSamples": 2,
+        "clearDwellHours": 2.0,
+        "unit": "C",
+        "deviceNamePattern": "%citrus%"
+      }
+    },
+    {
+      "//": "START WIND MACHINES. FAO Frost Protection (Snyder, UC Davis): start at about 0 °C, and before the crop's critical temperature; lemon groves start 1–2 °C higher than oranges. Machines only help under an inversion, and should not run without one when the wet-bulb temperature is below −2.2 °C. Keep running for hours after sunrise after a damaging night. Sources: FAO, https://www.fao.org/4/y7223e/y7223e0d.htm ; Ventura UCCE, https://ucanr.edu/county/cooperative-extension-ventura-county/frost-control/freeze-damage",
+      "rule": "measurement-threshold",
+      "as": "citrus-wind-machine-start",
+      "severity": "critical",
+      "activeMonths": [12, 1, 2],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.temperature", "temperature"],
+        "min": 0,
+        "max": null,
+        "unit": "C",
+        "clearMargin": 1.5,
+        "lookbackHours": 6,
+        "deviceNamePattern": "%citrus%"
+      }
+    },
+    {
+      "//": "FROST TONIGHT. FAO Frost Protection (Snyder, UC Davis): start wind machines at about 0 °C, and in any case before the crop's critical temperature. Raised up to 14 h ahead so the decision is made the evening before. DISABLED: needs the top-level forecast block and a Weatherbit key (see README, Forecast).",
+      "rule": "forecast-threshold",
+      "as": "citrus-frost-forecast",
+      "enabled": false,
+      "severity": "critical",
+      "activeMonths": [12, 1, 2],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.temperature"],
+        "min": 0,
+        "max": null,
+        "withinHours": 14,
+        "minHours": 1,
+        "unit": "C"
+      }
+    },
+    {
+      "//": "═══ SOIL ═══ June drop (late May–early July) is increased by sudden heat at or after fruit set, but UC gives no temperature, so there is no heat check here. Source: UC IPM, \"Fruit drop of citrus\", https://ipm.ucanr.edu/home-and-landscape/fruit-drop-of-citrus/"
+    },
+    {
+      "//": "ROOT-ZONE SALINITY — orange (Maas & Grattan 1999; FAO 29 lists 1.7): Maas–Hoffman threshold ECe 1.3 dS/m, above which yield declines. DISABLED until converted to what the probe reads. Maas–Hoffman thresholds are saturated-paste ECe. A soil probe reports bulk EC (or pore EC), which is not ECe: FAO 29 gives soil-water EC ≈ 2 × ECe at field capacity, and bulk EC is lower than pore EC and moves with water content. Convert before enabling — take a saturated-paste lab sample beside the probe and scale this threshold by the probe/ECe ratio. Source: FAO Irrigation and Drainage Paper 29, ch. 2 and Annex 1 (Maas & Grattan 1999), https://www.fao.org/4/t0234e/t0234e02.htm , https://www.fao.org/4/y4263e/y4263e0e.htm",
+      "rule": "measurement-threshold",
+      "as": "citrus-orange-salinity-high",
+      "enabled": false,
+      "params": {
+        "paths": ["soil.ec"],
+        "min": null,
+        "max": 1.3,
+        "unit": " dS/m",
+        "clearMargin": 0.13,
+        "sustainMinutes": 1440,
+        "lookbackHours": 48,
+        "deviceNamePattern": "%orange%"
+      }
+    },
+    {
+      "//": "ROOT-ZONE SALINITY — lemon: Maas–Hoffman threshold ECe 1.5 dS/m, above which yield declines. DISABLED until converted to what the probe reads. Maas–Hoffman thresholds are saturated-paste ECe. A soil probe reports bulk EC (or pore EC), which is not ECe: FAO 29 gives soil-water EC ≈ 2 × ECe at field capacity, and bulk EC is lower than pore EC and moves with water content. Convert before enabling — take a saturated-paste lab sample beside the probe and scale this threshold by the probe/ECe ratio. Source: FAO Irrigation and Drainage Paper 29, ch. 2 and Annex 1 (Maas & Grattan 1999), https://www.fao.org/4/t0234e/t0234e02.htm , https://www.fao.org/4/y4263e/y4263e0e.htm",
+      "rule": "measurement-threshold",
+      "as": "citrus-lemon-salinity-high",
+      "enabled": false,
+      "params": {
+        "paths": ["soil.ec"],
+        "min": null,
+        "max": 1.5,
+        "unit": " dS/m",
+        "clearMargin": 0.15,
+        "sustainMinutes": 1440,
+        "lookbackHours": 48,
+        "deviceNamePattern": "%lemon%"
+      }
+    },
+    {
+      "//": "SOIL pH — citrus: outside 6.0–7.5. UF/IFAS: \"The optimum soil pH range for citrus is 6.0 to 6.5\", and deficiencies are more likely outside it; high pH reduces Ca, Mg, Fe, Zn and Mn availability, and Swingle citrumelo grows poorly on high-pH soil. No UC production figure was found, so the 7.5 ceiling is this pack's choice for California's more alkaline soils (NMSU, general: iron and zinc deficiency above 7.5) — set max to 6.5 to follow UF/IFAS exactly, or on Swingle rootstock. pH moves over seasons, not hours, so this is info and needs a day sustained. Sources: UF/IFAS SL456, https://ask.ifas.ufl.edu/publication/SS669 ; UF/IFAS SL458, https://ask.ifas.ufl.edu/publication/SS671 ; NMSU CR-676, https://pubs.nmsu.edu/_circulars/CR676/index.html",
+      "rule": "measurement-threshold",
+      "as": "citrus-ph-out-of-band",
+      "severity": "info",
+      "params": {
+        "paths": ["soil.pH"],
+        "min": 6.0,
+        "max": 7.5,
+        "unit": "",
+        "clearMargin": 0.1,
+        "sustainMinutes": 1440,
+        "lookbackHours": 48,
+        "deviceNamePattern": "%citrus%"
+      }
+    }
+  ]
+}

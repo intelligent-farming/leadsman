@@ -11,3 +11,12 @@ option) any later version. See the LICENSE file for the full text.
 
 Third-party components included in this repository retain their own
 licenses and copyright notices; see their respective files and headers.
+
+Vendored data
+-------------
+src/vocabulary.ts (the physical range of each measurement path) and the tables in
+docs/vocabulary.md are generated from definitions/vocabulary.schema.json and
+definitions/categories/ in lorawan-codec-normalization
+(https://github.com/intelligent-farming/lorawan-codec-normalization),
+Copyright (C) 2026 Intelligent Farming Foundation, licensed AGPL-3.0-or-later.
+Regenerate with scripts/sync-vocabulary.js and scripts/gen-vocabulary-doc.js.

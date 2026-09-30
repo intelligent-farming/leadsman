@@ -17,12 +17,13 @@
  *                  and possibly on the neighbour's block.
  *   dewPoint       °C. Condensation, leaf wetness onset, and the floor an overnight
  *                  radiative frost will actually fall to.
- *   thi            Temperature-humidity index. Livestock heat stress — the standard
- *                  classification for dairy cattle is comfort below 68, mild stress
- *                  68-72, moderate 72-80, severe above 80. Milk-yield loss in
- *                  high-producing cows begins around 68 (Zimbelman et al. 2009); 72 is
- *                  the older onset from Armstrong (1994), still common in extension
- *                  material and appropriate for lower-yielding herds.
+ *   thi            Temperature-humidity index. Livestock heat stress in dairy cattle.
+ *                  Armstrong (1994) classifies 72-79 as mild stress, 80-89 moderate
+ *                  and 90-98 severe; 72 is the onset still common in extension
+ *                  material and appropriate for lower-yielding herds. For
+ *                  high-producing cows Zimbelman et al. (2009) put the onset of
+ *                  milk-yield loss at 68. There are no built-in bands here — `min`
+ *                  and `max` are the operator's — so pick the source that fits the herd.
  *   absoluteHumidity  g/m³. Ventilation and drying calculations, where relative
  *                  humidity is actively misleading because it moves with temperature.
  *
@@ -73,9 +74,14 @@ function saturationVapourPressure(tempC: number): number {
  * delta-T within about half a degree of a bound as marginal rather than decided.
  */
 function wetBulb(tempC: number, r: number): number {
-  // Capped at the dry bulb: the wet bulb cannot physically exceed it, but Stull's
-  // fit overshoots by about 0.01 °C at saturation, which would report a delta-T of
-  // -0.01 — a physically impossible number in an alert a sprayer operator reads.
+  // At saturation the wet bulb IS the dry bulb, by definition. Stull's fit (published
+  // only to 99 % RH) does not know that: at 100 % it reads -0.13 °C at 0 °C, -0.06 at
+  // 10 °C, +0.01 at 20 °C and +0.08 at 30 °C against the dry bulb. So 100 % returns the
+  // dry bulb exactly, and anything else is capped at it — above it would report a
+  // negative delta-T, a physically impossible number in an alert a sprayer operator
+  // reads. Just below saturation the fit's cold-side bias remains (a delta-T of about
+  // 0.1 °C near 0 °C and 99 % RH), far inside the 2 °C spray bound.
+  if (r >= 100) return tempC;
   return Math.min(tempC, (
     tempC * Math.atan(0.151977 * Math.sqrt(r + 8.313659)) +
     Math.atan(tempC + r) -
@@ -100,7 +106,7 @@ const FORMULAS: Record<string, Formula> = {
   },
   dewPoint: {
     unit: 'C',
-    about: 'dew point from temperature and relative humidity (Magnus)',
+    about: 'dew point from temperature and relative humidity (Magnus form, Tetens coefficients)',
     compute: (t, rh) => {
       // Guard the log: a codec reporting exactly 0 % RH would otherwise give
       // -Infinity. Inputs outside 0-100 never reach here (see inputProblem).

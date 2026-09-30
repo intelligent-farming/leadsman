@@ -1,0 +1,353 @@
+{
+  "//license": "SPDX-License-Identifier: AGPL-3.0-or-later; Copyright (C) 2026 Intelligent Farming Foundation",
+  "//": "Soybean and winter wheat. Agronomic entries are scoped by deviceNamePattern to placeholders (%soy%, %wheat%) — rename devices to match or replace the pattern with deviceProfiles before trusting an alert. Thresholds are the published extension figures cited in each entry; they are starting points, not calibrations.",
+  "//months": "activeMonths are Midwest / Kansas timing. Shift them for your latitude and planting date.",
+  "//enabled": "Enabled: checks whose threshold is a published figure the sensor measures directly — air, leaf and soil temperature, humidity, durations, rates, pH. Disabled: checks whose threshold depends on this soil or this probe (volumetric moisture, EC, N, the 'wet' cut-off of a leaf-wetness sensor) or that need the forecast block — each says what to set before enabling it.",
+  "schedule": "*/15 * * * *",
+  "timezone": "America/Chicago",
+  "statementTimeoutMs": 15000,
+  "maxChecksPerRun": 64,
+  "checks": [
+    {
+      "//": "═══ FLEET HEALTH — every pack carries these, so the pack runs on its own. None needs crop tuning. ═══"
+    },
+    {
+      "rule": "device-silent",
+      "params": {
+        "silentMinutes": 180
+      }
+    },
+    {
+      "rule": "decode-failure"
+    },
+    {
+      "rule": "measurement-implausible"
+    },
+    {
+      "rule": "status-battery-low"
+    },
+    {
+      "//": "═══ SOYBEAN ═══"
+    },
+    {
+      "//": "FROST INJURY. Iowa State and NDSU: 0 to −2.2 °C (32–28 °F) damages leaves and terminal buds; severity is driven by how long it stays below 0 °C. In the fall the yield cost depends on stage — a killing freeze costs 75–80 % at R5, 20–40 % at R6 and 0–5 % at R7 — so the alert is the prompt to stage the field. Sources: ISU, \"Frost Damage to Soybeans\", https://crops.extension.iastate.edu/post/frost-damage-soybeans ; NDSU, \"Evaluating Frost Damage in Soybean\", https://www.ndsu.edu/agriculture/ag-hub/ag-topics/crop-production/crops/soybeans/evaluating-frost-damage-soybean",
+      "rule": "measurement-peak",
+      "as": "soy-frost-injury",
+      "activeMonths": [5, 6, 9, 10],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.temperature", "temperature"],
+        "direction": "min",
+        "threshold": 0,
+        "unit": "C",
+        "lookbackHours": 12,
+        "minSamples": 3,
+        "deviceNamePattern": "%soy%"
+      }
+    },
+    {
+      "//": "KILLING FREEZE. Below −2.2 °C (28 °F) for an extended time is lethal (ISU). The sources give no hour count; 2 h is the duration K-State uses for its freeze tables and is used here for the same reason.",
+      "rule": "measurement-dwell",
+      "as": "soy-killing-freeze",
+      "severity": "critical",
+      "activeMonths": [5, 6, 9, 10],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.temperature", "temperature"],
+        "min": null,
+        "max": -2.2,
+        "mode": "longest",
+        "comparison": "atLeast",
+        "dwellHours": 2,
+        "lookbackHours": 24,
+        "maxGapHours": 2,
+        "minSamples": 2,
+        "clearDwellHours": 1.0,
+        "unit": "C",
+        "deviceNamePattern": "%soy%"
+      }
+    },
+    {
+      "//": "WHITE MOLD (Sclerotinia) around flowering, R1–R3. Crop Protection Network: infection is favoured by daily maxima below 29 °C (85 °F) with frequent moisture — rain, fog, dew, high humidity — under a closing canopy; apothecia need a 30-day mean maximum below 20 °C, which no check here computes. No published RH figure exists: 90 % held 12 h is the conventional surface-wetness proxy, the same one the grape and olive entries use. The Sporecaster model (UW) is the better decision tool; this flags the weather it responds to. Sources: CPN, \"An Overview of White Mold\", https://cropprotectionnetwork.org/publications/an-overview-of-white-mold ; UW, Sporecaster, https://ipcm.wisc.edu/blog/2018/05/new-smartphone-app-sporecaster-the-soybean-white-mold-forecaster/",
+      "rule": "mold-risk",
+      "as": "soy-white-mold-risk",
+      "activeMonths": [7, 8],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.relativeHumidity"],
+        "humidityMin": 90,
+        "humidityMax": null,
+        "temperaturePaths": ["leaf.temperature", "air.temperature", "temperature"],
+        "temperatureMin": null,
+        "temperatureMax": 29,
+        "dwellHours": 12,
+        "lookbackHours": 36,
+        "maxGapHours": 2,
+        "minSamples": 4,
+        "clearDwellHours": 3.0,
+        "unit": "%",
+        "deviceNamePattern": "%soy%"
+      }
+    },
+    {
+      "//": "FLOODING. University of Minnesota: up to 48 h saturated has little effect, 4 days costs some yield, 6 days a lot, 7 days loses stand. DISABLED: 45 % is a placeholder — set min to the volumetric moisture this probe reads at saturation in this soil. Source: UMN, \"Flooded soybean\", https://extension.umn.edu/growing-soybean/flooded-soybean",
+      "rule": "measurement-dwell",
+      "as": "soy-flooded-4-days",
+      "enabled": false,
+      "activeMonths": [5, 6, 7],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["soil.moisture"],
+        "min": 45,
+        "max": null,
+        "mode": "longest",
+        "comparison": "atLeast",
+        "dwellHours": 96,
+        "lookbackHours": 144,
+        "maxGapHours": 3,
+        "minSamples": 24,
+        "clearDwellHours": 12,
+        "unit": "%",
+        "deviceNamePattern": "%soy%"
+      }
+    },
+    {
+      "//": "ROOT-ZONE SALINITY — soybean: Maas–Hoffman threshold ECe 5.0 dS/m, above which yield declines. DISABLED until converted to what the probe reads. Maas–Hoffman thresholds are saturated-paste ECe. A soil probe reports bulk EC (or pore EC), which is not ECe: FAO 29 gives soil-water EC ≈ 2 × ECe at field capacity, and bulk EC is lower than pore EC and moves with water content. Convert before enabling — take a saturated-paste lab sample beside the probe and scale this threshold by the probe/ECe ratio. Source: FAO Irrigation and Drainage Paper 29, ch. 2 and Annex 1 (Maas & Grattan 1999), https://www.fao.org/4/t0234e/t0234e02.htm , https://www.fao.org/4/y4263e/y4263e0e.htm",
+      "rule": "measurement-threshold",
+      "as": "soy-salinity-high",
+      "enabled": false,
+      "params": {
+        "paths": ["soil.ec"],
+        "min": null,
+        "max": 5.0,
+        "unit": " dS/m",
+        "clearMargin": 0.5,
+        "sustainMinutes": 1440,
+        "lookbackHours": 48,
+        "deviceNamePattern": "%soy%"
+      }
+    },
+    {
+      "//": "SOIL pH — soybean: outside 6.0–7.5. Iowa State: yield increases are unlikely at pH 6.0 or higher where the subsoil is calcareous, and at 6.5 or higher elsewhere — raise min to 6.5 on acid-subsoil fields. Above about 7.5, iron-deficiency chlorosis becomes the risk (Minnesota: soybeans grow adequately below pH 7.5; IDC is driven by carbonates and salts, so pH is only a proxy, and IDC-tolerant varieties reduce it). pH moves over seasons, not hours, so this is info and needs a day sustained. On Coastal Plain soils with a history of manganese deficiency, 6.0 is a ceiling, not a floor (SERA-6). Sources: Mallarino, Iowa State, https://www.agronext.iastate.edu/soilfertility/info/CAS%202019%20pH%20and%20lime%20article%20proceedings.pdf ; UMN Extension, https://extension.umn.edu/crop-specific-needs/managing-iron-deficiency-chlorosis-soybean",
+      "rule": "measurement-threshold",
+      "as": "soy-ph-out-of-band",
+      "severity": "info",
+      "params": {
+        "paths": ["soil.pH"],
+        "min": 6.0,
+        "max": 7.5,
+        "unit": "",
+        "clearMargin": 0.1,
+        "sustainMinutes": 1440,
+        "lookbackHours": 48,
+        "deviceNamePattern": "%soy%"
+      }
+    },
+    {
+      "//": "═══ WINTER WHEAT — spring freeze by stage ═══ K-State C646: the temperature that injures wheat when held for 2 hours rises as the crop develops — tillering −11 °C (12 °F), jointing −4 °C (24 °F), boot −2 °C (28 °F), heading and flowering −1 °C (30 °F), milk and dough −2 °C (28 °F). The °F figures are K-State's; the °C values are K-State's rounding (24 °F is −4.4 °C, 28 °F −2.2 °C), used as-is. Flowering is the most sensitive stage; wind and repeated cold nights make it worse. activeMonths approximate Kansas stage timing and overlap at the boundaries on purpose — a cold night in April is judged against both jointing and boot. Source: K-State C646, \"Spring Freeze Injury to Kansas Wheat\", https://bookstore.ksre.ksu.edu/pubs/spring-freeze-injury-to-kansas-wheat_C646.pdf"
+    },
+    {
+      "rule": "measurement-dwell",
+      "as": "wheat-freeze-tillering",
+      "severity": "critical",
+      "activeMonths": [2, 3],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.temperature", "temperature"],
+        "min": null,
+        "max": -11,
+        "mode": "longest",
+        "comparison": "atLeast",
+        "dwellHours": 2,
+        "lookbackHours": 24,
+        "maxGapHours": 2,
+        "minSamples": 2,
+        "clearDwellHours": 1.0,
+        "unit": "C",
+        "deviceNamePattern": "%wheat%"
+      }
+    },
+    {
+      "rule": "measurement-dwell",
+      "as": "wheat-freeze-jointing",
+      "severity": "critical",
+      "activeMonths": [3, 4],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.temperature", "temperature"],
+        "min": null,
+        "max": -4,
+        "mode": "longest",
+        "comparison": "atLeast",
+        "dwellHours": 2,
+        "lookbackHours": 24,
+        "maxGapHours": 2,
+        "minSamples": 2,
+        "clearDwellHours": 1.0,
+        "unit": "C",
+        "deviceNamePattern": "%wheat%"
+      }
+    },
+    {
+      "rule": "measurement-dwell",
+      "as": "wheat-freeze-boot",
+      "severity": "critical",
+      "activeMonths": [4],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.temperature", "temperature"],
+        "min": null,
+        "max": -2,
+        "mode": "longest",
+        "comparison": "atLeast",
+        "dwellHours": 2,
+        "lookbackHours": 24,
+        "maxGapHours": 2,
+        "minSamples": 2,
+        "clearDwellHours": 1.0,
+        "unit": "C",
+        "deviceNamePattern": "%wheat%"
+      }
+    },
+    {
+      "rule": "measurement-dwell",
+      "as": "wheat-freeze-heading-flowering",
+      "severity": "critical",
+      "activeMonths": [4, 5],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.temperature", "temperature"],
+        "min": null,
+        "max": -1,
+        "mode": "longest",
+        "comparison": "atLeast",
+        "dwellHours": 2,
+        "lookbackHours": 24,
+        "maxGapHours": 2,
+        "minSamples": 2,
+        "clearDwellHours": 1.0,
+        "unit": "C",
+        "deviceNamePattern": "%wheat%"
+      }
+    },
+    {
+      "rule": "measurement-dwell",
+      "as": "wheat-freeze-grain-fill",
+      "severity": "critical",
+      "activeMonths": [5, 6],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.temperature", "temperature"],
+        "min": null,
+        "max": -2,
+        "mode": "longest",
+        "comparison": "atLeast",
+        "dwellHours": 2,
+        "lookbackHours": 24,
+        "maxGapHours": 2,
+        "minSamples": 2,
+        "clearDwellHours": 1.0,
+        "unit": "C",
+        "deviceNamePattern": "%wheat%"
+      }
+    },
+    {
+      "//": "FUSARIUM HEAD BLIGHT (scab) in the week before and through flowering. APS and Purdue: RH above 90 % at 15–30 °C before, during and after flowering; the US FHB risk tool counts hours with RH > 90 % and 9–30 °C (48–86 °F) over the pre-flowering window. Mode total counts those hours the way the tool does; the 48 h target over 7 days is this pack's choice, not a published cut-off — the tool is a statistical model over the same inputs and is the better decision aid. Sources: APS, \"Fusarium Head Blight\", https://www.apsnet.org/edcenter/pdlessons/Pages/Fusarium.aspx ; UMD, FHB risk assessment tool, https://extension.umd.edu/resource/fusarium-head-blight-risk-assessment-tool",
+      "rule": "measurement-dwell",
+      "as": "wheat-fusarium-head-blight-risk",
+      "activeMonths": [4, 5, 6],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.relativeHumidity"],
+        "min": 90,
+        "max": null,
+        "mode": "total",
+        "comparison": "atLeast",
+        "dwellHours": 48,
+        "lookbackHours": 168,
+        "maxGapHours": 2,
+        "minSamples": 12,
+        "clearDwellHours": 12,
+        "gatePaths": ["air.temperature", "temperature"],
+        "gateMin": 9,
+        "gateMax": 30,
+        "unit": "%",
+        "deviceNamePattern": "%wheat%"
+      }
+    },
+    {
+      "//": "VERNALIZATION SHORTFALL. Texas A&M AgriLife: winter wheat vernalizes at 32–45 °F (0–7.2 °C) — \"below freezing do not count\" — needing about 500–1000 hours by variety, counted from when the seed imbibes. Counted here from October 1 (set since to the field's planting date as YYYY-MM-DD where known) and judged from February 15 against the low end, 500 h. The band and the 500 h come from the same source and should be changed together. It errs toward alerting: physiologically, vernalization is also effective at 7–12 °C (Porter & Gawith 1999: optimum 4.9 °C, upper limit 15.7 °C; Ohio State: 40 days at 52 °F against 70 days at 34 °F; K-State calls it \"a cool requirement, not a cold one\"), which this band leaves out. Sources: Texas A&M AgriLife, https://agrilife.org/agwest/files/2020/05/wheat_vernalization_2020.pdf ; OSU, https://agcrops.osu.edu/newsletter/corn-newsletter/2020-04/vernalization-requirements-winter-wheat ; K-State, https://www.agronomy.k-state.edu/documents/eupdates/eupdate020306.pdf",
+      "rule": "chill-accumulation",
+      "as": "wheat-vernalization-short",
+      "severity": "info",
+      "activeMonths": [2, 3],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["air.temperature", "temperature"],
+        "model": "hours",
+        "hoursMin": 0,
+        "hoursMax": 7.2,
+        "since": "10-01",
+        "requirement": 500,
+        "comparison": "short",
+        "byDate": "02-15",
+        "unitLabel": "vernalization hours",
+        "deviceNamePattern": "%wheat%"
+      }
+    },
+    {
+      "//": "WATERLOGGING. NDSU: wheat yield is reduced after as little as 48 h saturated once growing, and plants die after 5–7 days submerged above 18 °C; dormant wheat tolerates longer. DISABLED: set min to the saturation reading of this probe in this soil. Source: NDSU, \"Flooding impacts winter wheat\", https://www.ag.ndsu.edu/news/newsreleases/2009/april-20-2009/flooding-impacts-winter-wheat/",
+      "rule": "measurement-dwell",
+      "as": "wheat-flooded-48h",
+      "enabled": false,
+      "activeMonths": [3, 4, 5, 6],
+      "resolveOutOfSeason": true,
+      "params": {
+        "paths": ["soil.moisture"],
+        "min": 45,
+        "max": null,
+        "mode": "longest",
+        "comparison": "atLeast",
+        "dwellHours": 48,
+        "lookbackHours": 96,
+        "maxGapHours": 3,
+        "minSamples": 12,
+        "clearDwellHours": 12,
+        "unit": "%",
+        "deviceNamePattern": "%wheat%"
+      }
+    },
+    {
+      "//": "ROOT-ZONE SALINITY — wheat: Maas–Hoffman threshold ECe 6.0 dS/m, above which yield declines. DISABLED until converted to what the probe reads. Maas–Hoffman thresholds are saturated-paste ECe. A soil probe reports bulk EC (or pore EC), which is not ECe: FAO 29 gives soil-water EC ≈ 2 × ECe at field capacity, and bulk EC is lower than pore EC and moves with water content. Convert before enabling — take a saturated-paste lab sample beside the probe and scale this threshold by the probe/ECe ratio. Source: FAO Irrigation and Drainage Paper 29, ch. 2 and Annex 1 (Maas & Grattan 1999), https://www.fao.org/4/t0234e/t0234e02.htm , https://www.fao.org/4/y4263e/y4263e0e.htm",
+      "rule": "measurement-threshold",
+      "as": "wheat-salinity-high",
+      "enabled": false,
+      "params": {
+        "paths": ["soil.ec"],
+        "min": null,
+        "max": 6.0,
+        "unit": " dS/m",
+        "clearMargin": 0.6,
+        "sustainMinutes": 1440,
+        "lookbackHours": 48,
+        "deviceNamePattern": "%wheat%"
+      }
+    },
+    {
+      "//": "SOIL pH — wheat: outside 5.8–6.5. pH moves over seasons, not hours, so this is info and needs a day sustained; it stays open until the field is limed or acidified. Source: Wisconsin A2809, https://cropsandsoils.extension.wisc.edu/nutrient-application-guidelines-for-field-vegetable-and-fruit-crops-in-wisconsin-a2809/soil-ph-and-lime-requirement/",
+      "rule": "measurement-threshold",
+      "as": "wheat-ph-out-of-band",
+      "severity": "info",
+      "params": {
+        "paths": ["soil.pH"],
+        "min": 5.8,
+        "max": 6.5,
+        "unit": "",
+        "clearMargin": 0.1,
+        "sustainMinutes": 1440,
+        "lookbackHours": 48,
+        "deviceNamePattern": "%wheat%"
+      }
+    }
+  ]
+}
