@@ -36,6 +36,7 @@
 
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { MESSAGING_PROVIDERS } from './types';
 import type {
   CheckConfig,
   ChirpStackConfig,
@@ -47,6 +48,7 @@ import type {
   NotifyConfig,
   NotifyDestination,
   NotifyProvider,
+  Routing,
   Severity,
   SuppressRule,
 } from './types';
@@ -237,6 +239,17 @@ export function parseConfig(raw: unknown): LeadsmanConfig {
     if (entry.notifyTo !== undefined && typeof entry.notifyTo !== 'string') {
       throw new ConfigError(`${at}.notifyTo must be a destination name string`);
     }
+    if (entry.label !== undefined) {
+      if (typeof entry.label !== 'string' || entry.label.trim().length === 0) {
+        throw new ConfigError(`${at}.label must be a non-empty string`);
+      }
+      if (entry.label.length > 120 || /[\u0000-\u001f\u007f]/.test(entry.label)) {
+        throw new ConfigError(`${at}.label must be at most 120 characters, without control characters`);
+      }
+    }
+    if (entry.routing !== undefined && entry.routing !== 'fact' && entry.routing !== 'situation') {
+      throw new ConfigError(`${at}.routing must be "fact" or "situation" (got ${JSON.stringify(entry.routing)})`);
+    }
 
     if (entry.resolveOutOfSeason !== undefined && typeof entry.resolveOutOfSeason !== 'boolean') {
       throw new ConfigError(`${at}.resolveOutOfSeason must be a boolean`);
@@ -252,6 +265,8 @@ export function parseConfig(raw: unknown): LeadsmanConfig {
       rule,
       as: kind,
       notifyTo: entry.notifyTo as string | undefined,
+      label: typeof entry.label === 'string' ? entry.label.trim() : undefined,
+      routing: entry.routing as Routing | undefined,
       enabled: entry.enabled !== false, // absent means enabled
       severity: entry.severity as Severity | undefined,
       activeMonths,
@@ -605,12 +620,28 @@ export function parseConfig(raw: unknown): LeadsmanConfig {
         ? null
         : knownTarget(rawNotify.defaultDestination, 'config.notify.defaultDestination');
 
+    // An alert nothing more specific routes goes direct: to the one messaging
+    // destination, else defaultDestination (see directDestination in notify.ts).
+    const messagingNames = Object.entries(destinations)
+      .filter(([, d]) => (MESSAGING_PROVIDERS as readonly string[]).includes(d.provider ?? 'webhook'))
+      .map(([name]) => name);
+    const bothRouted = routing !== undefined && 'fact' in routing && 'situation' in routing;
+    if (messagingNames.length > 1 && rawNotify.defaultDestination === undefined && !bothRouted) {
+      throw new ConfigError(
+        `config.notify has ${messagingNames.length} messaging destinations ` +
+          `[${messagingNames.join(', ')}] and no defaultDestination — a check without notifyTo ` +
+          'goes direct to the attached messaging service, and there is more than one. Set ' +
+          'notify.defaultDestination to the one to use, or route both classes in notify.routing',
+      );
+    }
+
     // A destinations block with nothing pointing at it delivers nothing, silently. Refuse.
-    if (!routing && !bySeverity && defaultDestination === null) {
+    if (!routing && !bySeverity && defaultDestination === null && messagingNames.length === 0) {
       throw new ConfigError(
         'config.notify.destinations is set but nothing routes to it — add notify.routing ' +
-          '(e.g. {"fact":"sms","situation":"agent"}), notify.defaultDestination, or per-check ' +
-          'notifyTo, otherwise no alert would ever be delivered',
+          '(e.g. {"fact":"sms","situation":"agent"}), notify.defaultDestination, a messaging ' +
+          'destination for alerts to go to directly, or per-check notifyTo, otherwise no alert ' +
+          'would ever be delivered',
       );
     }
 

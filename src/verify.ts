@@ -95,6 +95,13 @@ export async function lintConfig(
         message: 'has no effect without activeMonths — the check is never out of season',
       });
     }
+    if (check.routing !== undefined && check.notifyTo !== undefined) {
+      problems.push({
+        severity: 'warning',
+        where: `checks.${kind}.routing`,
+        message: `has no effect while notifyTo is set — notifyTo "${check.notifyTo}" names the destination outright`,
+      });
+    }
     if (check.activeHoursStandardTime && !check.activeHours) {
       problems.push({
         severity: 'warning',

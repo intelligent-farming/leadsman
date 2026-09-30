@@ -120,10 +120,12 @@ the environment — so it is safe to commit and review in a diff, unless you put
 |---|---|
 | `rule` | Which check script to run |
 | `as` | Instance name, and the alert `kind`. Defaults to `rule`. Required when the same rule is listed twice, enabled or not |
+| `label` | A human name for the check — "North block frost". Shown in place of `as` in delivered messages and sent as `label` in the webhook payload. Display only: `as` stays the identity, so a label can be reworded without re-raising anything |
 | `enabled` | Defaults to `true`. Set `false` to keep an entry documented but inactive |
 | `severity` | Overrides the check's default. A check may still escalate an individual finding |
 | `params` | Merged over the check's `defaultParams`. Unknown keys are an error in `lint` and `verify` |
-| `notifyTo` | Destination name for this check's alerts, overriding routing — see [Routing](#routing) |
+| `notifyTo` | Destination name for this check's alerts, overriding routing — see [Routing](#routing). Absent: routing decides, and an alert with no route goes direct to the attached messaging service |
+| `routing` | `"fact"` (deliver as it stands) or `"situation"` (send for interpretation — an AI double-check, through `notify.routing.situation`). Overrides the rule's default class — see [Routing](#routing) |
 | `activeMonths` / `activeHours` | Months (1–12) or local hours (0–23) the check runs in — see [Seasonal and diurnal gating](#seasonal-and-diurnal-gating) |
 | `activeHoursStandardTime` | Read `activeHours` on the zone's standard time all year, for rules stated in standard time |
 | `resolveOutOfSeason` | `true` resolves open alerts while `activeMonths` gates the check out |
@@ -462,13 +464,20 @@ family: a Makerfabs AgroSense light sensor operates normally at 2.9 V, while a
 pipe-pressure node runs 3.6–4.0 V. One fleet-wide threshold either cries wolf on the
 first or stays silent until the second is dead.
 
-Every device-subject check therefore accepts two optional filters (the gateway checks
-take `gateways` and `ignoreGateways` instead):
+Every device-subject check therefore accepts three optional filters, combined with AND
+(the gateway checks take `gateways` and `ignoreGateways` instead):
 
 | Param | Effect |
 |---|---|
 | `deviceProfiles` | Exact ChirpStack `device_profile_name` values. Empty = all profiles |
 | `deviceNamePattern` | SQL `LIKE` against `device_name`, e.g. `%pump%`. null = all devices |
+| `devEuis` | Exact DevEUIs (16 hex digits, any case). Empty = all devices. The way to segment a check by field or location when device names do not say where a device is |
+
+```json
+{ "rule": "measurement-threshold", "as": "frost-north-block", "label": "North block frost",
+  "params": { "paths": ["air.temperature"], "min": 1.5, "unit": "C",
+              "devEuis": ["a840411234567890", "a840411234567891"] } }
+```
 
 ```json
 { "rule": "battery-low", "as": "battery-low-light",
@@ -892,10 +901,13 @@ A webhook receiver gets `leadsman.alert/2`:
 }
 ```
 
-`/2` is `/1` plus the three `subject*` fields and nothing else. Every `/1` field keeps its
-name and meaning, and `devEui` is still the DevEUI for a device alert — so a receiver
-written against `/1` handles device alerts unchanged and sees `null` where the subject is
-a gateway, the site, or the engine. `instance` is omitted entirely when unset.
+`/2` is `/1` plus the three `subject*` fields, and two additive ones: `routing` — the
+class the alert was routed under, `"fact"` or `"situation"`, so one receiver taking both
+can tell an alert to act on from one to interpret — and `label`, the check's display
+label, omitted when the check has none. Every `/1` field keeps its name and meaning, and
+`devEui` is still the DevEUI for a device alert — so a receiver written against `/1`
+handles device alerts unchanged and sees `null` where the subject is a gateway, the site,
+or the engine. `instance` is omitted entirely when unset.
 
 ### Naming the edge device
 
@@ -932,11 +944,19 @@ Which destination an alert goes to is decided by, highest precedence first:
 
 1. the check's `notifyTo` — this deployment says so explicitly
 2. `notify.bySeverity[severity]` — blanket escalation; use sparingly
-3. `notify.routing[class]` — the rule's own `fact` / `situation` classification
-4. `notify.defaultDestination`
+3. `notify.routing[class]` — where configured, for the alert's `fact` / `situation` class:
+   the check's `routing`, else the rule's own classification
+4. **direct** — the attached messaging service: the one Twilio / Telegram / Signal / Slack
+   destination, or `notify.defaultDestination` when there are several (or none)
 
 A `null` at any level means *record only*: the alert is stored and deliberately not sent, and
 the chain stops there rather than falling through.
+
+So a check with no `notifyTo` goes straight to the phone unless its class has a route: a
+deployment with one SMS destination and `"routing": {"situation": "agent"}` texts every
+fact and sends every situation to the agent. With more than one messaging destination,
+`defaultDestination` says which one "direct" means; `parseConfig` refuses a config where
+that is ambiguous and some alert could need it.
 
 `fact` versus `situation` is not severity. Severity says how bad; the class says whether a
 reader has to work out what the alert means. `pipe-pressure-low` is critical but its summary
@@ -977,11 +997,20 @@ class because it is still ambiguous on its own — and with suppression on, the 
 the answer is "it was the gateway" are held back rather than sent for interpretation.
 
 The generic rules (`measurement-threshold` and friends) serve many meanings at once, so they
-default to `fact` and you name the exceptions per check:
+default to `fact` and you name the exceptions per check — by class, which leaves the
+destination to `notify.routing`:
+
+```json
+{ "rule": "measurement-threshold", "as": "frost-risk", "routing": "situation" }
+```
+
+or by destination, when this one check's alerts belong somewhere specific:
 
 ```json
 { "rule": "measurement-threshold", "as": "pipe-pressure-low", "notifyTo": "agent" }
 ```
+
+`notifyTo` outranks `routing`, so lint warns when a check sets both.
 
 ### Changing platform without touching the config
 

@@ -17,8 +17,10 @@
  *
  * `deviceProfiles` and `deviceNamePattern` narrow a check to part of the fleet.
  * Profile matching is exact (against ChirpStack's `device_profile_name`); the name
- * pattern is a SQL `LIKE`, so `%pump%` works. Both are optional and default to
- * matching everything, which keeps existing configs behaving identically.
+ * pattern is a SQL `LIKE`, so `%pump%` works. `devEuis` names the devices outright —
+ * the way to segment a check by field or location when device names do not encode it.
+ * All three are optional, combine with AND, and default to matching everything, which
+ * keeps existing configs behaving identically.
  */
 
 import type { SoundingContext } from './types';
@@ -28,9 +30,11 @@ export interface DeviceScope {
   profiles: string[];
   /** SQL LIKE pattern against `device_name`. null means every device. */
   namePattern: string | null;
+  /** Exact DevEUIs, lower-case hex. Empty means every device. */
+  devEuis: string[];
 }
 
-export const ANY_DEVICE: DeviceScope = { profiles: [], namePattern: null };
+export const ANY_DEVICE: DeviceScope = { profiles: [], namePattern: null, devEuis: [] };
 
 /** Parameters every check exposes so scoping is configured identically everywhere. */
 export const SCOPE_PARAMS = {
@@ -44,6 +48,11 @@ export const SCOPE_PARAMS = {
    * null means every device.
    */
   deviceNamePattern: null as string | null,
+  /**
+   * Restrict to these devices, by DevEUI (16 hex digits, any case). Empty or null means
+   * every device. Use this to segment a check by field or location.
+   */
+  devEuis: [] as string[],
 };
 
 export function resolveScope(params: Record<string, unknown>): DeviceScope {
@@ -70,7 +79,21 @@ export function resolveScope(params: Record<string, unknown>): DeviceScope {
     throw new Error('deviceNamePattern must be a string or null');
   }
 
-  return { profiles, namePattern };
+  const rawEuis = params.devEuis;
+  let devEuis: string[] = [];
+  if (Array.isArray(rawEuis)) {
+    devEuis = rawEuis.map((e, i) => {
+      if (typeof e !== 'string' || !/^[0-9a-fA-F]{16}$/.test(e)) {
+        throw new Error(`devEuis[${i}] must be a DevEUI — 16 hex digits (got ${JSON.stringify(e)})`);
+      }
+      // ChirpStack stores DevEUIs as lower-case hex; match that, whatever case was typed.
+      return e.toLowerCase();
+    });
+  } else if (rawEuis !== null && rawEuis !== undefined) {
+    throw new Error('devEuis must be an array of DevEUI strings, or null');
+  }
+
+  return { profiles, namePattern, devEuis };
 }
 
 /**
@@ -88,11 +111,16 @@ export function scopeClause(
 ): { sql: string; values: unknown[] } {
   const p = alias ? `${alias}.` : '';
   const i = startIndex;
+  // The two list filters travel in ONE jsonb parameter, {"p": profiles, "d": DevEUIs},
+  // so the clause still binds exactly two values. Every caller numbers its own
+  // parameters after these two; a third would shift them all.
+  const list = (key: string) => `ARRAY(SELECT jsonb_array_elements_text($${i}::jsonb -> '${key}'))`;
   return {
     sql:
-      `AND (cardinality($${i}::text[]) = 0 OR ${p}device_profile_name = ANY($${i}::text[])) ` +
+      `AND (jsonb_array_length($${i}::jsonb -> 'p') = 0 OR ${p}device_profile_name = ANY(${list('p')})) ` +
+      `AND (jsonb_array_length($${i}::jsonb -> 'd') = 0 OR ${p}dev_eui = ANY(${list('d')})) ` +
       `AND ($${i + 1}::text IS NULL OR ${p}device_name LIKE $${i + 1}::text)`,
-    values: [scope.profiles, scope.namePattern],
+    values: [JSON.stringify({ p: scope.profiles, d: scope.devEuis }), scope.namePattern],
   };
 }
 
@@ -101,6 +129,7 @@ export function scopeLabel(scope: DeviceScope): string | null {
   const parts: string[] = [];
   if (scope.profiles.length > 0) parts.push(`profiles: ${scope.profiles.join(', ')}`);
   if (scope.namePattern) parts.push(`name like ${scope.namePattern}`);
+  if (scope.devEuis.length > 0) parts.push(`devices: ${scope.devEuis.join(', ')}`);
   return parts.length > 0 ? parts.join('; ') : null;
 }
 

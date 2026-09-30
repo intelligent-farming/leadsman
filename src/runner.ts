@@ -95,7 +95,8 @@ export async function runSounding(options: RunSoundingOptions): Promise<Sounding
     if (!rule) continue;
     routes.set(check.as ?? check.rule, {
       notifyTo: check.notifyTo,
-      routing: rule.defaultRouting,
+      routing: check.routing ?? rule.defaultRouting,
+      label: check.label,
     });
   }
 
@@ -230,7 +231,7 @@ export async function runSounding(options: RunSoundingOptions): Promise<Sounding
       // Routing is resolved at delivery time, but only here are the config entry and
       // the rule in scope together. RaisedAlert carries `kind`, so a kind-keyed map is
       // all notify needs to look this up later.
-      routes.set(kind, { notifyTo: check.notifyTo, routing: rule.defaultRouting });
+      routes.set(kind, { notifyTo: check.notifyTo, routing: check.routing ?? rule.defaultRouting, label: check.label });
 
       if (dryRun) {
         const result: CheckResult = {

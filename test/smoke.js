@@ -2406,3 +2406,49 @@ test('forecast-threshold honours minHours, so one overshot hour is not an event'
   };
   assert.deepEqual(await rule.run(ctx), []);
 });
+
+// ── devEuis scope, and per-check routing ─────────────────────────────────────
+
+test('devEuis scope: validated, lower-cased, and bound with the other list filter', () => {
+  const s = scope.resolveScope({ devEuis: ['A840411234567890', 'a840411234567891'] });
+  assert.deepEqual(s.devEuis, ['a840411234567890', 'a840411234567891']);
+  assert.deepEqual(scope.resolveScope({}).devEuis, []);
+  assert.throws(() => scope.resolveScope({ devEuis: ['a84041'] }), /16 hex digits/);
+  assert.throws(() => scope.resolveScope({ devEuis: 'a840411234567890' }), /array/);
+  const sc = scope.scopeClause(s, 3, 'e');
+  assert.equal(sc.values.length, 2, 'still two bound values, so no caller renumbers');
+  assert.deepEqual(JSON.parse(sc.values[0]), { p: [], d: ['a840411234567890', 'a840411234567891'] });
+  assert.match(sc.sql, /e\.dev_eui = ANY/);
+  assert.match(scope.scopeLabel(s), /devices: a840411234567890/);
+});
+
+test('every device-scoped rule accepts devEuis', () => {
+  for (const [id, rule] of loadRules()) {
+    if ('deviceNamePattern' in rule.defaultParams) {
+      assert.ok('devEuis' in rule.defaultParams, `${id} takes deviceNamePattern but not devEuis`);
+    }
+  }
+});
+
+test('a check routing override picks the class route; with none configured it goes direct', () => {
+  const cfg = {
+    destinations: { sms: { provider: 'telegram', chatId: '1' }, agent: { webhookUrl: 'https://agent.test/h' } },
+    routing: { situation: 'agent' },
+  };
+  // A fact rule set to "situation" is sent for interpretation...
+  assert.equal(resolveDestination({ severity: 'warning' }, { routing: 'situation' }, cfg), 'agent');
+  // ...and a fact, with no fact route, goes straight to the messaging destination.
+  assert.equal(resolveDestination({ severity: 'warning' }, { routing: 'fact' }, cfg), 'sms');
+  // Several messaging destinations: direct means defaultDestination.
+  const two = { ...cfg, destinations: { ...cfg.destinations, ops: { provider: 'slack', channel: 'C1' } }, defaultDestination: 'ops' };
+  assert.equal(resolveDestination({ severity: 'warning' }, { routing: 'fact' }, two), 'ops');
+});
+
+test('lint warns when routing is set alongside notifyTo, which outranks it', async () => {
+  const cfg = parseConfig({
+    checks: [{ rule: 'device-silent', routing: 'fact', notifyTo: 'agent' }],
+    notify: { destinations: { agent: { webhookUrl: 'https://agent.test/h' } }, defaultDestination: 'agent' },
+  });
+  const problems = await lintConfig(cfg, loadRules());
+  assert.ok(problems.some((p) => p.where === 'checks.device-silent.routing'), JSON.stringify(problems));
+});

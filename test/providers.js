@@ -1271,3 +1271,80 @@ test('forecast-threshold: the hour in progress is excluded at afterHours 0', asy
   const skipped = await forecastRun([-1, 10, 10], { min: 1.5, max: null, afterHours: 2 }, 1);
   assert.deepEqual(skipped, []);
 });
+
+// ── per-check label and routing, and direct delivery ─────────────────────────
+
+test('a check label replaces the as name in the message, and travels in the payload', async () => {
+  assert.equal(
+    renderMessage(alert(), 'North Barn', 'Pump 3 pressure'),
+    'Alert from North Barn: [CRITICAL] Pump 3 pressure: pipe-dry pressure.gauge 4kPa is below min 20kPa',
+  );
+  assert.equal(renderMessage(alert(), 'North Barn', ''), renderMessage(alert(), 'North Barn'), 'blank label is no label');
+
+  const hook = await capture(ok201);
+  const out = await notifyRaised(
+    [alert()],
+    { destinations: { agent: { webhookUrl: `http://127.0.0.1:${hook.port}/h` } }, routing: { situation: 'agent' } },
+    { markNotified: async () => {} },
+    quietLog,
+    new Map([['pipe-pressure-low', { routing: 'situation', label: 'Pump 3 pressure' }]]),
+  );
+  hook.close();
+  assert.equal(out.delivered, 1);
+  const body = JSON.parse(hook.seen[0].body);
+  assert.equal(body.label, 'Pump 3 pressure');
+  assert.equal(body.routing, 'situation');
+  assert.equal(body.kind, 'pipe-pressure-low', 'the as name is still the identity');
+});
+
+test('with no notifyTo and no route for its class, an alert goes direct to the one messaging destination', async () => {
+  const api = await capture(ok201);
+  const out = await notifyRaised(
+    [alert()],
+    {
+      destinations: {
+        sms: { provider: 'twilio', to: ['+15125550123'], timeoutMs: 5000 },
+        agent: { webhookUrl: 'http://127.0.0.1:9/never' },
+      },
+      routing: { situation: 'agent' },
+      messaging: {
+        twilio: {
+          accountSid: 'AC123', apiKeySid: 'SK456', apiKeySecret: 'keysecret', from: '+15125550000',
+          baseUrl: `http://127.0.0.1:${api.port}`,
+        },
+      },
+    },
+    { markNotified: async () => {} },
+    quietLog,
+    new Map([['pipe-pressure-low', { routing: 'fact' }]]),
+  );
+  api.close();
+  assert.equal(out.delivered, 1);
+  assert.match(api.seen[0].url, /Messages\.json$/);
+});
+
+test('parseConfig: a lone messaging destination needs no routing; several need a defaultDestination', () => {
+  withEnv({ ...TWILIO_ENV, LEADSMAN_SLACK_BOT_TOKEN: 'xoxb-test' }, () => {
+    // One messaging destination and nothing else: every alert goes there.
+    const one = parseConfig({ checks: [], notify: { destinations: { sms: { provider: 'twilio', to: ['+15125550123'] } } } });
+    assert.ok(one.notify.destinations.sms);
+
+    const two = { sms: { provider: 'twilio', to: ['+15125550123'] }, ops: { provider: 'slack', channel: 'C123' } };
+    assert.throws(
+      () => parseConfig({ checks: [], notify: { destinations: two, routing: { situation: 'ops' } } }),
+      /2 messaging destinations \[sms, ops\] and no defaultDestination/,
+    );
+    // Either names the direct one, or routes both classes so direct is never reached.
+    parseConfig({ checks: [], notify: { destinations: two, defaultDestination: 'sms' } });
+    parseConfig({ checks: [], notify: { destinations: two, routing: { fact: 'sms', situation: 'ops' } } });
+  });
+});
+
+test('parseConfig: label and routing are validated per check', () => {
+  const cfg = parseConfig({ checks: [{ rule: 'device-silent', label: '  North block  ', routing: 'situation' }] });
+  assert.equal(cfg.checks[0].label, 'North block');
+  assert.equal(cfg.checks[0].routing, 'situation');
+  assert.throws(() => parseConfig({ checks: [{ rule: 'device-silent', label: '' }] }), /label must be a non-empty string/);
+  assert.throws(() => parseConfig({ checks: [{ rule: 'device-silent', label: 'a\nb' }] }), /control characters/);
+  assert.throws(() => parseConfig({ checks: [{ rule: 'device-silent', routing: 'ai' }] }), /routing must be "fact" or "situation"/);
+});

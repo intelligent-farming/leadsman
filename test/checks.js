@@ -37,6 +37,27 @@ if (!h.available) {
     }));
   };
 
+  // ── devEuis scope ────────────────────────────────────────────────────────
+
+  test('devEuis segments a check to named devices, in any case, alongside the other filters', async () => {
+    // Two frost sensors, both cold; the north field is one of them.
+    for (const [devEui, deviceName] of [['a840410000000001', 'frost-north'], ['a840410000000002', 'frost-south']]) {
+      await h.uplink(env.db, { devEui, deviceName, minutesAgo: 5, object: { air: { temperature: 0.5 } } });
+    }
+    const frost = { paths: ['air.temperature'], min: 1.5, unit: 'C' };
+    const all = await run('measurement-threshold', frost);
+    assert.deepEqual(all.map((f) => f.devEui).sort(), ['a840410000000001', 'a840410000000002']);
+
+    const north = await run('measurement-threshold', { ...frost, devEuis: ['A840410000000001'] });
+    assert.deepEqual(north.map((f) => f.devEui), ['a840410000000001']);
+
+    // ANDed with the name filter: a DevEUI outside the pattern is still excluded.
+    assert.deepEqual(
+      await run('measurement-threshold', { ...frost, devEuis: ['a840410000000001'], deviceNamePattern: '%south%' }),
+      [],
+    );
+  });
+
   // ── geofence-breach (H13, M21) ────────────────────────────────────────────
 
   // 41.8–41.9 N, 93.7–93.5 W: the integration fixture's box. At this latitude 1° of

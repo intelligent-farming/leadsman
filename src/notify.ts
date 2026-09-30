@@ -60,6 +60,7 @@ import type {
   NotifyDestination,
   Routing,
 } from './types';
+import { MESSAGING_PROVIDERS } from './types';
 
 export interface NotifyOutcome {
   attempted: number;
@@ -73,8 +74,25 @@ export interface NotifyOutcome {
 export interface AlertRoute {
   /** Explicit destination from the check's config entry. Highest precedence. */
   notifyTo?: string;
-  /** The rule's own classification — see the Routing type. */
+  /** The alert's class — the check's `routing`, else the rule's own. See the Routing type. */
   routing: Routing;
+  /** The check's display label, when it has one. */
+  label?: string;
+}
+
+/**
+ * Where an alert goes when nothing more specific says: straight to the messaging service
+ * attached to this deployment. That is the one Twilio / Telegram / Signal / Slack
+ * destination, when there is exactly one; with several (or none — a webhook-only
+ * deployment), `notify.defaultDestination`; with neither, record-only. parseConfig
+ * refuses a config where this is ambiguous and an alert could need it.
+ */
+export function directDestination(config: Pick<NotifyConfig, 'destinations' | 'defaultDestination'>): string | null {
+  const messaging = Object.entries(config.destinations)
+    .filter(([, d]) => (MESSAGING_PROVIDERS as readonly string[]).includes(d.provider ?? 'webhook'))
+    .map(([name]) => name);
+  if (messaging.length === 1) return messaging[0];
+  return config.defaultDestination ?? null;
 }
 
 /**
@@ -84,8 +102,10 @@ export interface AlertRoute {
  *
  *   1. the check's `notifyTo`          — this deployment says so explicitly
  *   2. `notify.bySeverity[severity]`   — blanket escalation, use sparingly
- *   3. `notify.routing[rule class]`    — the fact/situation default
- *   4. `notify.defaultDestination`     — catch-all
+ *   3. `notify.routing[class]`         — the fact/situation route, where configured; the
+ *                                        class is the check's `routing`, else the rule's
+ *   4. direct                          — the attached messaging service (see
+ *                                        directDestination), else defaultDestination
  *
  * Four levels rather than more: every extra level is another place to look when an alert
  * turns up somewhere unexpected. A `null` at any level is a decision, not a miss — it stops
@@ -108,11 +128,11 @@ export function resolveDestination(
     return routing[route.routing] ?? null;
   }
 
-  return config.defaultDestination ?? null;
+  return directDestination(config);
 }
 
 /** Body posted per alert. Flat and small — a receiver can map it straight to a template. */
-function payload(alert: RaisedAlert, instanceName?: string): Record<string, unknown> {
+function payload(alert: RaisedAlert, instanceName?: string, route?: AlertRoute): Record<string, unknown> {
   return {
     // /2 adds the three subject fields to /1 and changes nothing else. Every /1 field
     // keeps its name and meaning, and devEui is still the DevEUI for a device alert, so a
@@ -126,6 +146,11 @@ function payload(alert: RaisedAlert, instanceName?: string): Record<string, unkn
     id: alert.id,
     rule: alert.ruleId,
     kind: alert.kind,
+    // Additive, like `instance`: the check's display label, omitted when it has none, and
+    // the routing class the alert was delivered under — so one receiver taking both
+    // classes can tell an alert to act on from one to interpret.
+    ...(route?.label ? { label: route.label } : {}),
+    ...(route ? { routing: route.routing } : {}),
     subjectKind: alert.subjectKind,
     subjectId: alert.subjectId,
     subjectName: alert.subjectName,
@@ -190,6 +215,7 @@ export async function notifyRaised(
     for (const alert of group) {
       await deliver(
         alert, dest, name, store, log, outcome, config.messaging, config.instanceName,
+        routes?.get(alert.kind),
       );
     }
   }
@@ -221,13 +247,14 @@ function warnIfUnsigned(dest: NotifyDestination, name: string, log: Logger): voi
  * quote when asking about it. Typically lands near 100 characters, inside a single SMS
  * segment.
  */
-export function renderMessage(alert: RaisedAlert, instanceName?: string): string {
+export function renderMessage(alert: RaisedAlert, instanceName?: string, label?: string): string {
   // The sender leads the line, and it is the *only* field that differs between two devices
   // running the same check — "[CRITICAL] battery-low: node-3 3.15V" says nothing about which
   // barn to walk to. Unnamed deployments fall back to "Leadsman" so the sender is never blank
   // and there is exactly one message format to read, named or not.
   const from = instanceName?.trim() || 'Leadsman';
-  return `Alert from ${from}: [${alert.severity.toUpperCase()}] ${alert.kind}: ${alert.summary}`;
+  // A check's label, where it has one, reads better on a phone than its `as` name.
+  return `Alert from ${from}: [${alert.severity.toUpperCase()}] ${label?.trim() || alert.kind}: ${alert.summary}`;
 }
 
 interface SendResult {
@@ -243,11 +270,12 @@ async function sendWebhook(
   dest: NotifyDestination,
   instanceName: string | undefined,
   signal: AbortSignal,
+  route?: AlertRoute,
 ): Promise<SendResult> {
   if (!dest.webhookUrl) return { ok: false, detail: 'no webhookUrl configured' };
   // Serialize once: the signature covers these exact bytes, so re-stringifying for the
   // request body could produce a different string and a signature that never validates.
-  const body = JSON.stringify(payload(alert, instanceName));
+  const body = JSON.stringify(payload(alert, instanceName, route));
   const headers: Record<string, string> = { 'content-type': 'application/json' };
   const auth = dest.webhookAuth ?? 'bearer';
 
@@ -283,8 +311,9 @@ async function sendTwilio(
   creds: NonNullable<MessagingCredentials['twilio']>,
   instanceName: string | undefined,
   signal: AbortSignal,
+  route?: AlertRoute,
 ): Promise<SendResult> {
-  const text = renderMessage(alert, instanceName);
+  const text = renderMessage(alert, instanceName, route?.label);
   const url =
     `${creds.baseUrl ?? 'https://api.twilio.com'}/2010-04-01/Accounts/` +
     `${encodeURIComponent(creds.accountSid)}/Messages.json`;
@@ -328,6 +357,7 @@ async function sendTelegram(
   creds: NonNullable<MessagingCredentials['telegram']>,
   instanceName: string | undefined,
   signal: AbortSignal,
+  route?: AlertRoute,
 ): Promise<SendResult> {
   const url = `${creds.baseUrl ?? 'https://api.telegram.org'}/bot${creds.botToken}/sendMessage`;
   const res = await fetch(url, {
@@ -335,7 +365,7 @@ async function sendTelegram(
     headers: { 'content-type': 'application/json' },
     // No parse_mode: alert summaries contain characters Markdown would choke on (underscores
     // in paths, > in transitions), and a formatting error would reject the whole message.
-    body: JSON.stringify({ chat_id: dest.chatId, text: renderMessage(alert, instanceName) }),
+    body: JSON.stringify({ chat_id: dest.chatId, text: renderMessage(alert, instanceName, route?.label) }),
     signal,
   });
   // Telegram answers in an envelope: {"ok":false,"description":"..."}. It usually pairs that
@@ -380,6 +410,7 @@ async function sendSlack(
   creds: NonNullable<MessagingCredentials['slack']>,
   instanceName: string | undefined,
   signal: AbortSignal,
+  route?: AlertRoute,
 ): Promise<SendResult> {
   const res = await fetch(`${creds.baseUrl ?? 'https://slack.com'}/api/chat.postMessage`, {
     method: 'POST',
@@ -389,7 +420,7 @@ async function sendSlack(
     },
     body: JSON.stringify({
       channel: dest.channel,
-      text: escapeSlackText(renderMessage(alert, instanceName)),
+      text: escapeSlackText(renderMessage(alert, instanceName, route?.label)),
     }),
     signal,
   });
@@ -420,12 +451,13 @@ async function sendSignal(
   creds: NonNullable<MessagingCredentials['signal']>,
   instanceName: string | undefined,
   signal: AbortSignal,
+  route?: AlertRoute,
 ): Promise<SendResult> {
   const res = await fetch(`${creds.baseUrl}/v2/send`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
-      message: renderMessage(alert, instanceName),
+      message: renderMessage(alert, instanceName, route?.label),
       number: creds.from,
       recipients: dest.to ?? [],
     }),
@@ -458,6 +490,7 @@ async function deliver(
   outcome: NotifyOutcome,
   messaging?: MessagingCredentials,
   instanceName?: string,
+  route?: AlertRoute,
 ): Promise<void> {
   outcome.attempted += 1;
   const controller = new AbortController();
@@ -470,25 +503,25 @@ async function deliver(
     if (provider === 'twilio') {
       const creds = messaging?.twilio;
       result = creds
-        ? await sendTwilio(alert, dest, creds, instanceName, controller.signal)
+        ? await sendTwilio(alert, dest, creds, instanceName, controller.signal, route)
         : { ok: false, detail: 'twilio credentials not configured' };
     } else if (provider === 'telegram') {
       const creds = messaging?.telegram;
       result = creds
-        ? await sendTelegram(alert, dest, creds, instanceName, controller.signal)
+        ? await sendTelegram(alert, dest, creds, instanceName, controller.signal, route)
         : { ok: false, detail: 'telegram credentials not configured' };
     } else if (provider === 'signal') {
       const creds = messaging?.signal;
       result = creds
-        ? await sendSignal(alert, dest, creds, instanceName, controller.signal)
+        ? await sendSignal(alert, dest, creds, instanceName, controller.signal, route)
         : { ok: false, detail: 'signal credentials not configured' };
     } else if (provider === 'slack') {
       const creds = messaging?.slack;
       result = creds
-        ? await sendSlack(alert, dest, creds, instanceName, controller.signal)
+        ? await sendSlack(alert, dest, creds, instanceName, controller.signal, route)
         : { ok: false, detail: 'slack credentials not configured' };
     } else {
-      result = await sendWebhook(alert, dest, instanceName, controller.signal);
+      result = await sendWebhook(alert, dest, instanceName, controller.signal, route);
     }
 
     if (!result.ok) {

@@ -33,6 +33,12 @@ export type Severity = 'info' | 'warning' | 'critical';
 export type Routing = 'fact' | 'situation';
 
 /**
+ * Providers that message a person directly, as opposed to a webhook into another system.
+ * An alert nothing more specific routes goes to the one of these a deployment has.
+ */
+export const MESSAGING_PROVIDERS = ['twilio', 'telegram', 'signal', 'slack'] as const;
+
+/**
  * What an alert is about.
  *
  * Checks started out device-only, and for most of them that is still the right unit: a
@@ -389,8 +395,24 @@ export interface CheckConfig {
    * (e.g. measurement-threshold for both soil moisture and air temperature).
    */
   as?: string;
+  /**
+   * A human name for this check — "North block frost", "Pump 3 pressure" — shown in
+   * place of the `as` name in delivered messages and carried in the alert payload as
+   * `label`. Display only: `as` stays the identity alerts are keyed on, so a label can
+   * be reworded without closing and re-raising anything. Absent means `as`.
+   */
+  label?: string;
   enabled?: boolean;
   severity?: Severity;
+  /**
+   * The routing class for this check's alerts, overriding the rule's `defaultRouting`:
+   * "fact" delivers the alert as it stands, "situation" sends it for interpretation —
+   * usually to an agent destination, through `notify.routing.situation`. This is how a
+   * deployment says that its `frost-risk` measurement-threshold wants an AI double-check
+   * while its `pipe-pressure-low` goes straight to a phone. `notifyTo`, if also set,
+   * still wins: it names the destination outright.
+   */
+  routing?: Routing;
   /**
    * Destination name from `notify.destinations`, or a `Routing` value resolved through
    * `notify.routing`. Overrides the rule's `defaultRouting`. This is where a deployment
