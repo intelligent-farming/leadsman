@@ -21,10 +21,12 @@ number, or gives a range the check needs narrowed, the entry states the choice t
 made or leaves the alert out.
 
 Where a disease's wetness requirement depends on temperature (brown rot, peacock spot),
-the curve is tiled into several `mold-risk` bands, each held to the longest requirement
-anywhere inside it — so no band alerts on less wetness than the source needs. The cost
-is that a wet spell whose temperature drifts across a band edge is split, and may not
-reach either band's dwell.
+the entry carries the published curve as a `mold-risk` `curve` of bands, each held to
+the longest requirement anywhere inside it, and counts a wet period by rate summation —
+each wet hour adds 1 / (hours needed at that temperature), and the alert raises at
+100 %. No band alerts on less wetness than the source needs, and a night whose
+temperature drifts across a band edge stays one run. Olive peacock spot also bridges dry
+spells of up to 12 h (`maxDryHours`); brown rot, with no data on dry breaks, does not.
 
 ## Using a pack
 
@@ -69,12 +71,12 @@ Disabled, with what to set in the entry's comment:
 
 | File | Crops | Timezone | Checks (enabled) |
 |---|---|---|---|
-| `permanent-almond.example.json` | Almond | America/Los_Angeles | 20 (16) |
+| `permanent-almond.example.json` | Almond | America/Los_Angeles | 16 (12) |
 | `permanent-walnut-pistachio.example.json` | Walnut, pistachio | America/Los_Angeles | 13 (11) |
 | `permanent-grape.example.json` | Wine grape | America/Los_Angeles | 16 (13) |
 | `permanent-citrus.example.json` | Orange, mandarin, lemon | America/Los_Angeles | 10 (7) |
-| `permanent-olive.example.json` | Olive | America/Los_Angeles | 15 (14) |
-| `permanent-stone-fruit.example.json` | Peach, nectarine, sweet cherry, apricot | America/Los_Angeles | 30 (26) |
+| `permanent-olive.example.json` | Olive | America/Los_Angeles | 11 (10) |
+| `permanent-stone-fruit.example.json` | Peach, nectarine, sweet cherry, apricot | America/Los_Angeles | 18 (14) |
 | `row-corn.example.json` | Field corn, popcorn, stored grain | America/Chicago | 20 (14) |
 | `row-soy-wheat.example.json` | Soybean, winter wheat | America/Chicago | 20 (16) |
 | `row-cotton-alfalfa.example.json` | Cotton, alfalfa | America/Chicago | 14 (11) |
@@ -86,12 +88,12 @@ What each pack covers:
 
 | Pack | Freeze / frost | Disease | Heat | Soil and water | Other |
 |---|---|---|---|---|---|
-| Almond | By stage: pink bud, full bloom, 30-min crop-loss dwell, small nut | Brown rot (five temperature bands), shot hole | – | Hull-split deficit, salinity | Navel orangeworm flights; chill portions short and met |
+| Almond | By stage: pink bud, full bloom, 30-min crop-loss dwell, small nut | Brown rot (five-band infection curve), shot hole | – | Hull-split deficit, salinity | Navel orangeworm flights; chill portions short and met |
 | Walnut / pistachio | – | Walnut blight (two wetness bands), Alternaria late blight | Walnut sunburn | Pistachio salinity | Codling moth spray timing; walnut and pistachio chill portions; pistachio chill hours |
 | Grape | By stage: swollen bud, budburst, leaf-out | Gubler-Thomas powdery mildew index, downy mildew 10:10:24 rain, botrytis | Heatwave (3 days above 40 °C; 3 days at 35 °C disabled) | Salinity, pH | Winkler region boundaries |
 | Citrus | 4-hour fruit freeze, wind-machine start | – | – | Orange and lemon salinity, pH | – |
-| Olive | Fruit, small-wood and tree freeze | Peacock spot (four temperature bands, plus UC's prolonged 48 h), anthracnose | – | pH | – |
-| Stone fruit | 10 % and 90 % kill at bloom, per species | Brown rot, per species (five temperature bands each) | – | Peach salinity | Per-variety chill portions |
+| Olive | Fruit, small-wood and tree freeze | Peacock spot (five-band infection curve, bridging 12 h dry spells), anthracnose | – | pH | – |
+| Stone fruit | 10 % and 90 % kill at bloom, per species | Brown rot, per species (five-band infection curve) | – | Peach salinity | Per-variety chill portions |
 | Corn | Seedling freeze dwell, leaf frost, fall killing freeze | – | Silking heat, pollen kill | Planting soil temperature, dry root zone, saturation (cool and warm), N | GDD staging from planting; grain warming trend, summer ceiling, winter cooling |
 | Soy / wheat | Soy frost and killing freeze; wheat by stage from tillering to grain fill | White mold, Fusarium head blight | – | Flooding, salinity, pH | Wheat vernalization shortfall |
 | Cotton / alfalfa | – | – | Boll-shed heat, hot nights | Planting soil temperature, salinity, pH | Cool-spell DD60; alfalfa weevil scouting by degree-days |

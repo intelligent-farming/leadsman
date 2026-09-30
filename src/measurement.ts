@@ -872,6 +872,103 @@ export async function bandDwell(
 }
 
 /**
+ * Every reading at a device's winning path in the window, in time order, each carrying
+ * the gate value from its own uplink — the raw material `bandDwell` reduces in SQL, for
+ * a caller whose run logic SQL cannot express (a wetness requirement that changes with
+ * the temperature of each reading, or a run that may bridge a dry spell).
+ *
+ * Paths and gate paths resolve exactly as in `bandDwell`: the highest-priority path the
+ * device reports anywhere in the window wins, and the gate is the first gate path
+ * present on the same uplink. `gate` is null on a reading whose uplink carried none.
+ */
+export interface GatedReading {
+  time: Date;
+  value: number;
+  gate: number | null;
+}
+
+export interface GatedSeries {
+  devEui: string;
+  deviceName: string | null;
+  matchedPath: string;
+  readings: GatedReading[];
+}
+
+export async function gatedSeries(
+  ctx: SoundingContext,
+  paths: string[][],
+  gatePaths: string[][],
+  lookbackHours: number,
+  scope: DeviceScope = ANY_DEVICE,
+): Promise<GatedSeries[]> {
+  const sc = scopeClause(scope, 4, 'e');
+  const rows = await ctx.query<{
+    dev_eui: string;
+    device_name: string | null;
+    matched_path: string;
+    time: string | Date;
+    value: string;
+    gate_value: string | null;
+  }>(
+    `WITH ${CANDIDATES},
+     gate_candidates AS (
+       SELECT ord, ARRAY(SELECT jsonb_array_elements_text(p)) AS path
+         FROM jsonb_array_elements($3::jsonb) WITH ORDINALITY AS t(p, ord)
+     ),
+     scoped AS (
+       SELECT e.dev_eui, e.device_name, e.time, e.object
+         FROM event_up e
+        WHERE e.time > ${hoursAgo(2)}
+          AND e.object IS NOT NULL
+          ${sc.sql}
+     ),
+     samples AS (
+       SELECT s.dev_eui,
+              s.device_name,
+              s.time,
+              c.ord,
+              array_to_string(c.path, '.') AS matched_path,
+              (s.object #>> c.path)::numeric AS value,
+              (SELECT (s.object #>> g.path)::numeric
+                 FROM gate_candidates g
+                WHERE s.object #>> g.path IS NOT NULL
+                  AND s.object #>> g.path ${NUMERIC}
+                ORDER BY g.ord
+                LIMIT 1) AS gate_value
+         FROM scoped s
+         CROSS JOIN candidates c
+        WHERE s.object #>> c.path IS NOT NULL
+          AND s.object #>> c.path ${NUMERIC}
+     ),
+     winner AS (
+       SELECT DISTINCT ON (dev_eui) dev_eui, ord
+         FROM samples ORDER BY dev_eui, ord
+     )
+     SELECT s.dev_eui, s.device_name, s.matched_path, s.time, s.value, s.gate_value
+       FROM samples s
+       JOIN winner w ON w.dev_eui = s.dev_eui AND w.ord = s.ord
+      ORDER BY s.dev_eui, s.time`,
+    [pathsJson(paths), lookbackHours, pathsJson(gatePaths), ...sc.values],
+  );
+
+  const byDevice = new Map<string, GatedSeries>();
+  for (const r of rows) {
+    let s = byDevice.get(r.dev_eui);
+    if (!s) {
+      s = { devEui: r.dev_eui, deviceName: r.device_name, matchedPath: r.matched_path, readings: [] };
+      byDevice.set(r.dev_eui, s);
+    }
+    if (r.device_name) s.deviceName = r.device_name;
+    s.readings.push({
+      time: new Date(r.time),
+      value: Number(r.value),
+      gate: r.gate_value === null ? null : Number(r.gate_value),
+    });
+  }
+  return [...byDevice.values()];
+}
+
+/**
  * Least-squares slope over the window, plus how well the line actually fits.
  *
  * `windowStats` gives `first` and `last`, and `measurement-rate` divides their

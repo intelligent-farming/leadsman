@@ -526,6 +526,17 @@ Three properties are worth knowing before you tune it:
   in-band reading is zero hours rather than one interval. Every rounding is toward not
   raising, which is the right direction for a check that spends tokens by default.
 
+Published infection data are usually a **curve**: brown rot needs about ten hours of
+wetness at 5 °C and three at 18 °C. `curve` takes it as a list of
+`{temperatureMin, temperatureMax, dwellHours}` bands, in place of the single band, and
+measures the run by rate summation — each wet hour adds 1 / (hours needed at that
+reading's temperature), and the alert raises when the sum reaches 1 (`clearFraction` is
+its hysteresis). At a steady temperature that is exactly the band's hours; on a night
+that cools through two bands, the run stays whole instead of being split at the edge.
+`maxDryHours` lets a run survive a dry spell up to that long — the count pauses rather
+than resetting — for pathogens whose infection is known to survive one, such as olive
+peacock spot. It defaults to 0, and both need the temperature gate.
+
 Give each crop its own entry with its own numbers and its own scope — the gate for
 peacock spot on olives (10–20 °C, twelve hours) is not the gate for botrytis on grapes
 (15–28 °C, four hours), and one entry spanning both would raise an alert neither an agent nor
@@ -1415,6 +1426,7 @@ server, and whole fixtures end to end — because they catch different things:
 | `test/gateway.js` | yes | The gateway and site checks and the `rx_info` helpers, including malformed rows and both key spellings |
 | `test/network.js` | yes | The checks that read `event_status`, `event_join`, `event_log` and `event_ack`, and the host checks |
 | `test/checks.js` | yes | Counters, geofences and decode-failure against real SQL |
+| `test/seasonal.js` | yes | The seasonal and infection-model checks end to end against real SQL — degree-days, chill and vernalization hours, Wallin and TOM-CAST, the Smith Period on 09:00 days, and `mold-risk` infection curves across a band edge and a bridged dry spell |
 | `test/integration.js` | yes | 32 device faults and 2 gateway faults, plus 11 healthy devices and 2 healthy gateways, end to end |
 | `test/makerfabs.js` | yes | The shipped per-device config, against payload shapes from each codec's `vectors.json` |
 

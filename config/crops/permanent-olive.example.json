@@ -30,9 +30,9 @@
       "//": "═══ DISEASE ═══"
     },
     {
-      "//": "PEACOCK SPOT (Venturia oleaginea). Minimum leaf-wetness periods for infection, Obanor et al. 2011 (Plant Pathology 60:190): 18, 12, 12, 12 and 24 h at 5, 10, 15, 20 and 25 °C — tested in 6-h steps, so each true minimum may be up to 6 h shorter. Viruega et al. 2011 (Plant Disease 95:1139) independently puts the optimum at 15.5 °C with an 11.9 h minimum. UC IPM gives infection across 1.7–26.7 °C (35–80 °F) and \"as little as 14 hours\" near 24 °C (75 °F), so the 20–24 °C band uses 14 h and 24–26.7 °C uses Obanor's 24 h (the two sources disagree there). Each band's dwellHours is the longest requirement in it. Below 5 °C no infection data were found; the prolonged entry (UC IPM's ~48 h for significant disease, across the whole range) covers it. Caveats: the data are free-water hours and RH ≥ 90 % is a proxy; Viruega found dry breaks of up to 78 h did not stop infection, but mold-risk needs one unbroken run, so interrupted wetness is under-reported. Sources: Obanor et al. 2011 figures as reproduced in https://pmc.ncbi.nlm.nih.gov/articles/PMC8231239/ ; UC IPM, https://ipm.ucanr.edu/agriculture/olive/peacock-spot/",
+      "//": "PEACOCK SPOT (Venturia oleaginea). Minimum leaf-wetness periods for infection, Obanor et al. 2011 (Plant Pathology 60:190): 18, 12, 12, 12 and 24 h at 5, 10, 15, 20 and 25 °C — tested in 6-h steps, so each true minimum may be up to 6 h shorter. Viruega et al. 2011 (Plant Disease 95:1139) independently puts the optimum at 15.5 °C with an 11.9 h minimum. UC IPM gives infection across 1.7–26.7 °C (35–80 °F) and \"as little as 14 hours\" near 24 °C (75 °F), so the 20–24 °C band uses 14 h and 24–26.7 °C uses Obanor's 24 h (the two sources disagree there). The entry carries this curve as bands, each holding the longest requirement in it, and counts a wet period by rate summation (each wet hour adds 1 / hours needed at that temperature; the alert raises at 100 %), so a night drifting across a band edge stays one run. Below 5 °C no infection data were found, so the 1.7–5 °C band uses UC IPM's ~48 h for significant disease. Caveats: the data are free-water hours and RH ≥ 90 % is a proxy; Viruega found dry breaks of up to 78 h after wetting did not reduce disease incidence, so a dry spell of up to 12 h (maxDryHours) pauses the count instead of ending it — this pack's conservative reading of that finding; the dry time itself earns nothing. Sources: Obanor et al. 2011 figures as reproduced in https://pmc.ncbi.nlm.nih.gov/articles/PMC8231239/ ; UC IPM, https://ipm.ucanr.edu/agriculture/olive/peacock-spot/",
       "rule": "mold-risk",
-      "as": "olive-peacock-spot-cool",
+      "as": "olive-peacock-spot",
       "activeMonths": [10, 11, 12, 1, 2, 3],
       "resolveOutOfSeason": true,
       "params": {
@@ -40,99 +40,40 @@
         "humidityMin": 90,
         "humidityMax": null,
         "temperaturePaths": ["leaf.temperature", "air.temperature", "temperature"],
-        "temperatureMin": 5,
-        "temperatureMax": 10,
-        "dwellHours": 18,
-        "lookbackHours": 36,
-        "maxGapHours": 2,
-        "minSamples": 4,
-        "clearDwellHours": 3,
-        "unit": "%",
-        "deviceNamePattern": "%olive%"
-      }
-    },
-    {
-      "rule": "mold-risk",
-      "as": "olive-peacock-spot-mild",
-      "activeMonths": [10, 11, 12, 1, 2, 3],
-      "resolveOutOfSeason": true,
-      "params": {
-        "paths": ["air.relativeHumidity"],
-        "humidityMin": 90,
-        "humidityMax": null,
-        "temperaturePaths": ["leaf.temperature", "air.temperature", "temperature"],
-        "temperatureMin": 10,
-        "temperatureMax": 20,
-        "dwellHours": 12,
-        "lookbackHours": 36,
-        "maxGapHours": 2,
-        "minSamples": 4,
-        "clearDwellHours": 3,
-        "unit": "%",
-        "deviceNamePattern": "%olive%"
-      }
-    },
-    {
-      "rule": "mold-risk",
-      "as": "olive-peacock-spot-warm",
-      "activeMonths": [10, 11, 12, 1, 2, 3],
-      "resolveOutOfSeason": true,
-      "params": {
-        "paths": ["air.relativeHumidity"],
-        "humidityMin": 90,
-        "humidityMax": null,
-        "temperaturePaths": ["leaf.temperature", "air.temperature", "temperature"],
-        "temperatureMin": 20,
-        "temperatureMax": 24,
-        "dwellHours": 14,
-        "lookbackHours": 36,
-        "maxGapHours": 2,
-        "minSamples": 4,
-        "clearDwellHours": 3,
-        "unit": "%",
-        "deviceNamePattern": "%olive%"
-      }
-    },
-    {
-      "rule": "mold-risk",
-      "as": "olive-peacock-spot-hot",
-      "activeMonths": [10, 11, 12, 1, 2, 3],
-      "resolveOutOfSeason": true,
-      "params": {
-        "paths": ["air.relativeHumidity"],
-        "humidityMin": 90,
-        "humidityMax": null,
-        "temperaturePaths": ["leaf.temperature", "air.temperature", "temperature"],
-        "temperatureMin": 24,
-        "temperatureMax": 26.7,
-        "dwellHours": 24,
-        "lookbackHours": 36,
-        "maxGapHours": 2,
-        "minSamples": 4,
-        "clearDwellHours": 3,
-        "unit": "%",
-        "deviceNamePattern": "%olive%"
-      }
-    },
-    {
-      "rule": "mold-risk",
-      "as": "olive-peacock-spot-prolonged",
-      "activeMonths": [10, 11, 12, 1, 2, 3],
-      "resolveOutOfSeason": true,
-      "params": {
-        "paths": ["air.relativeHumidity"],
-        "humidityMin": 90,
-        "humidityMax": null,
-        "temperaturePaths": ["leaf.temperature", "air.temperature", "temperature"],
-        "temperatureMin": 1.7,
-        "temperatureMax": 26.7,
-        "dwellHours": 48,
+        "curve": [
+          {
+            "temperatureMin": 1.7,
+            "temperatureMax": 5,
+            "dwellHours": 48
+          },
+          {
+            "temperatureMin": 5,
+            "temperatureMax": 10,
+            "dwellHours": 18
+          },
+          {
+            "temperatureMin": 10,
+            "temperatureMax": 20,
+            "dwellHours": 12
+          },
+          {
+            "temperatureMin": 20,
+            "temperatureMax": 24,
+            "dwellHours": 14
+          },
+          {
+            "temperatureMin": 24,
+            "temperatureMax": 26.7,
+            "dwellHours": 24
+          }
+        ],
         "lookbackHours": 72,
         "maxGapHours": 2,
         "minSamples": 4,
-        "clearDwellHours": 3,
         "unit": "%",
-        "deviceNamePattern": "%olive%"
+        "deviceNamePattern": "%olive%",
+        "maxDryHours": 12,
+        "clearFraction": 0.25
       }
     },
     {

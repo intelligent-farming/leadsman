@@ -120,9 +120,9 @@
       "//": "═══ WET BLOOM ═══"
     },
     {
-      "//": "BROWN ROT BLOSSOM BLIGHT (Monilinia laxa — UC IPM names it the main blossom-blight species in California; M. fructicola is rare here). How long flowers must stay wet to be infected depends on temperature, so the curve is tiled into five bands, and each band's dwellHours is the LONGEST requirement anywhere in it — no band alerts on less wetness than the model needs. The hours are the 40 %-incidence contour of the Tamm et al. 1995 model (M. laxa on sweet-cherry blossoms, controlled wetness at 5–20 °C): 10.2 h at 5 °C, 5.8 h at 8 °C, 3.4 h at 12 °C, 2.3–2.8 h across 15–22 °C, 4.9 h at 25 °C (above 20 °C is the paper's own extrapolation). Wilcox 1989 (M. fructicola, sour cherry) agrees at 16–20 °C (28–72 % blight after 5 h) and needs far longer below 12 °C. Caveats for the agronomist: the data are free-water hours at a high spore load (the authors call it a worst case, and say wetness was under-measured by up to 4 h); they are cherry data — no almond, apricot or peach blossom curve was found; RH ≥ 90 % stands in for surface wetness; and mold-risk needs one unbroken run inside one band, so a wet period whose temperature drifts across a band edge can go unreported. Flowers are susceptible from pink bud to petal fall. Where a leaf.wetness sensor is installed, copy the entries with paths [\"leaf.wetness\"] and that sensor's wet cut-off as humidityMin. Sources: Tamm, Minder & Flückiger 1995, Phytopathology 85:401, https://www.apsnet.org/publications/phytopathology/backissues/documents/1995articles/phyto85n04_401.pdf ; Wilcox 1989, Phytopathology 79:530, https://www.apsnet.org/publications/phytopathology/backissues/documents/1989articles/phyto79n05_530.pdf ; UC IPM almond (species, timing), https://ipm.ucanr.edu/agriculture/almond/brown-rot-blossom-blight/",
+      "//": "BROWN ROT BLOSSOM BLIGHT (Monilinia laxa — UC IPM names it the main blossom-blight species in California; M. fructicola is rare here). How long flowers must stay wet to be infected depends on temperature, so the entry carries the curve itself as five bands, each holding the LONGEST requirement anywhere in it, and counts a wet period by rate summation: each wet hour adds 1 / (hours needed at that temperature), and the alert raises at 100 %. A night that drifts across a band edge stays one run, and no band alerts on less wetness than the model needs. The hours are the 40 %-incidence contour of the Tamm et al. 1995 model (M. laxa on sweet-cherry blossoms, controlled wetness at 5–20 °C): 10.2 h at 5 °C, 5.8 h at 8 °C, 3.4 h at 12 °C, 2.3–2.8 h across 15–22 °C, 4.9 h at 25 °C (above 20 °C is the paper's own extrapolation). Wilcox 1989 (M. fructicola, sour cherry) agrees at 16–20 °C (28–72 % blight after 5 h) and needs far longer below 12 °C. Caveats for the agronomist: the data are free-water hours at a high spore load (the authors call it a worst case, and say wetness was under-measured by up to 4 h); they are cherry data — no almond, apricot or peach blossom curve was found; RH ≥ 90 % stands in for surface wetness; and a dry reading ends the run — no brown-rot data were found on whether infection survives a dry break, so maxDryHours is 0. Flowers are susceptible from pink bud to petal fall. Where a leaf.wetness sensor is installed, copy the entry with paths [\"leaf.wetness\"] and that sensor's wet cut-off as humidityMin. Sources: Tamm, Minder & Flückiger 1995, Phytopathology 85:401, https://www.apsnet.org/publications/phytopathology/backissues/documents/1995articles/phyto85n04_401.pdf ; Wilcox 1989, Phytopathology 79:530, https://www.apsnet.org/publications/phytopathology/backissues/documents/1989articles/phyto79n05_530.pdf ; UC IPM almond (species, timing), https://ipm.ucanr.edu/agriculture/almond/brown-rot-blossom-blight/",
       "rule": "mold-risk",
-      "as": "almond-brown-rot-cold",
+      "as": "almond-brown-rot",
       "activeMonths": [2, 3],
       "resolveOutOfSeason": true,
       "params": {
@@ -130,99 +130,40 @@
         "humidityMin": 90,
         "humidityMax": null,
         "temperaturePaths": ["leaf.temperature", "air.temperature", "temperature"],
-        "temperatureMin": 5,
-        "temperatureMax": 8,
-        "dwellHours": 10.5,
+        "curve": [
+          {
+            "temperatureMin": 5,
+            "temperatureMax": 8,
+            "dwellHours": 10.5
+          },
+          {
+            "temperatureMin": 8,
+            "temperatureMax": 12,
+            "dwellHours": 6
+          },
+          {
+            "temperatureMin": 12,
+            "temperatureMax": 16,
+            "dwellHours": 3.5
+          },
+          {
+            "temperatureMin": 16,
+            "temperatureMax": 22,
+            "dwellHours": 3
+          },
+          {
+            "temperatureMin": 22,
+            "temperatureMax": 25,
+            "dwellHours": 5
+          }
+        ],
         "lookbackHours": 24,
         "maxGapHours": 2,
         "minSamples": 4,
-        "clearDwellHours": 2.62,
         "unit": "%",
-        "deviceNamePattern": "%almond%"
-      }
-    },
-    {
-      "rule": "mold-risk",
-      "as": "almond-brown-rot-cool",
-      "activeMonths": [2, 3],
-      "resolveOutOfSeason": true,
-      "params": {
-        "paths": ["air.relativeHumidity"],
-        "humidityMin": 90,
-        "humidityMax": null,
-        "temperaturePaths": ["leaf.temperature", "air.temperature", "temperature"],
-        "temperatureMin": 8,
-        "temperatureMax": 12,
-        "dwellHours": 6,
-        "lookbackHours": 24,
-        "maxGapHours": 2,
-        "minSamples": 4,
-        "clearDwellHours": 1.5,
-        "unit": "%",
-        "deviceNamePattern": "%almond%"
-      }
-    },
-    {
-      "rule": "mold-risk",
-      "as": "almond-brown-rot-mild",
-      "activeMonths": [2, 3],
-      "resolveOutOfSeason": true,
-      "params": {
-        "paths": ["air.relativeHumidity"],
-        "humidityMin": 90,
-        "humidityMax": null,
-        "temperaturePaths": ["leaf.temperature", "air.temperature", "temperature"],
-        "temperatureMin": 12,
-        "temperatureMax": 16,
-        "dwellHours": 3.5,
-        "lookbackHours": 24,
-        "maxGapHours": 2,
-        "minSamples": 4,
-        "clearDwellHours": 0.88,
-        "unit": "%",
-        "deviceNamePattern": "%almond%"
-      }
-    },
-    {
-      "rule": "mold-risk",
-      "as": "almond-brown-rot-warm",
-      "activeMonths": [2, 3],
-      "resolveOutOfSeason": true,
-      "params": {
-        "paths": ["air.relativeHumidity"],
-        "humidityMin": 90,
-        "humidityMax": null,
-        "temperaturePaths": ["leaf.temperature", "air.temperature", "temperature"],
-        "temperatureMin": 16,
-        "temperatureMax": 22,
-        "dwellHours": 3,
-        "lookbackHours": 24,
-        "maxGapHours": 2,
-        "minSamples": 4,
-        "clearDwellHours": 0.75,
-        "unit": "%",
-        "deviceNamePattern": "%almond%"
-      }
-    },
-    {
-      "rule": "mold-risk",
-      "as": "almond-brown-rot-hot",
-      "activeMonths": [2, 3],
-      "resolveOutOfSeason": true,
-      "params": {
-        "paths": ["air.relativeHumidity"],
-        "humidityMin": 90,
-        "humidityMax": null,
-        "temperaturePaths": ["leaf.temperature", "air.temperature", "temperature"],
-        "temperatureMin": 22,
-        "temperatureMax": 25,
-        "dwellHours": 5,
-        "lookbackHours": 24,
-        "maxGapHours": 2,
-        "minSamples": 4,
-        "clearDwellHours": 1.25,
-        "unit": "%",
-        "deviceNamePattern": "%almond%"
+        "deviceNamePattern": "%almond%",
+        "maxDryHours": 0,
+        "clearFraction": 0.25
       }
     },
     {

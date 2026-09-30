@@ -385,3 +385,132 @@ export function wallinSv(humidHours: number, meanTempDuringHumidity: number): nu
   while (sv < bounds.length && humidHours > bounds[sv]) sv += 1;
   return sv;
 }
+
+// ── wetness × temperature infection curves ───────────────────────────────────
+
+/** One band of an infection curve: wetness needed, in hours, at temperatures in [min, max] °C. */
+export interface CurveBand {
+  min: number;
+  max: number;
+  dwellHours: number;
+}
+
+/**
+ * Hours of wetness a reading at `t` °C needs for infection, or null outside the curve.
+ * A temperature on the edge between two bands takes the longer requirement, so a
+ * reading on a boundary never counts as the more infectious band.
+ */
+export function curveRequirement(curve: CurveBand[], t: number): number | null {
+  let need: number | null = null;
+  for (const b of curve) if (t >= b.min && t <= b.max) need = need === null ? b.dwellHours : Math.max(need, b.dwellHours);
+  return need;
+}
+
+export interface InfectionReading {
+  time: Date;
+  /** The wetness measurement: relative humidity or leaf wetness. */
+  value: number;
+  /** Temperature from the same uplink, °C; null when that uplink carried none. */
+  temperature: number | null;
+}
+
+export interface InfectionRun {
+  /** Fraction of the infection requirement met: 1 means the curve says infection. */
+  progress: number;
+  /** Hours credited as wet — excludes any dry spells bridged. */
+  wetHours: number;
+  /** Dry hours inside the run that were bridged rather than ending it. */
+  bridgedDryHours: number;
+  samples: number;
+  startedAt: Date;
+  endedAt: Date;
+  minTemperature: number;
+  maxTemperature: number;
+  minValue: number;
+  maxValue: number;
+}
+
+/**
+ * The most advanced infection run in a series of readings, by rate summation.
+ *
+ * A reading is wet when its value is inside `band` and its temperature is on the curve.
+ * Between two consecutive wet readings, the interval counts at the rate of the earlier
+ * reading: each hour adds 1 / (hours needed at that temperature) of an infection, and a
+ * run infects when the sum reaches 1. At a steady temperature that is exactly "wet for
+ * the band's hours"; when the temperature drifts through the night the requirement
+ * follows it, instead of the run being split at a band edge. Because every band holds
+ * the longest requirement inside it, the sum never reaches 1 sooner than the curve does.
+ *
+ * A dry reading ends the run unless `maxDryHours` is set: then a dry spell up to that
+ * long (from the last wet reading to the next) pauses the count rather than resetting
+ * it — infection by peacock spot survives dry breaks of days — and the dry time earns
+ * nothing. A reporting gap longer than `maxGapHours` always ends the run: silence is not
+ * evidence of wetness or of drying.
+ */
+export function bestInfectionRun(
+  readings: InfectionReading[],
+  band: { min: number | null; max: number | null },
+  curve: CurveBand[],
+  maxGapHours: number,
+  maxDryHours = 0,
+): InfectionRun | null {
+  const inBand = (v: number) => (band.min === null || v >= band.min) && (band.max === null || v <= band.max);
+  const hours = (a: Date, b: Date) => (b.getTime() - a.getTime()) / 3_600_000;
+
+  let best: InfectionRun | null = null;
+  let run: InfectionRun | null = null;
+  /** The last wet reading of the current run, and its requirement. */
+  let lastWet: { time: Date; need: number } | null = null;
+  let prevTime: Date | null = null;
+  let prevWet = false;
+
+  const close = () => {
+    if (run && (!best || run.progress > best.progress || (run.progress === best.progress && run.endedAt >= best.endedAt))) {
+      best = run;
+    }
+    run = null;
+    lastWet = null;
+  };
+
+  for (const r of readings) {
+    if (prevTime && hours(prevTime, r.time) > maxGapHours) close();
+    const need = r.temperature === null ? null : curveRequirement(curve, r.temperature);
+    const wet = need !== null && inBand(r.value);
+
+    if (wet) {
+      // A dry spell is measured from the last wet reading to the next, so check it on
+      // the way out of the spell too — its last dry reading can fall inside the limit
+      // while the spell itself does not.
+      if (run && lastWet && !prevWet && hours(lastWet.time, r.time) > maxDryHours) close();
+      if (run && lastWet) {
+        if (prevWet) {
+          const dt = hours(lastWet.time, r.time);
+          run.progress += dt / lastWet.need;
+          run.wetHours += dt;
+        } else {
+          run.bridgedDryHours += hours(lastWet.time, r.time);
+        }
+        run.samples += 1;
+        run.endedAt = r.time;
+        run.minTemperature = Math.min(run.minTemperature, r.temperature!);
+        run.maxTemperature = Math.max(run.maxTemperature, r.temperature!);
+        run.minValue = Math.min(run.minValue, r.value);
+        run.maxValue = Math.max(run.maxValue, r.value);
+      } else {
+        run = {
+          progress: 0, wetHours: 0, bridgedDryHours: 0, samples: 1,
+          startedAt: r.time, endedAt: r.time,
+          minTemperature: r.temperature!, maxTemperature: r.temperature!,
+          minValue: r.value, maxValue: r.value,
+        };
+      }
+      lastWet = { time: r.time, need };
+    } else if (run && lastWet && hours(lastWet.time, r.time) > maxDryHours) {
+      close();
+    }
+    prevWet = wet;
+    prevTime = r.time;
+  }
+  close();
+  return best;
+}

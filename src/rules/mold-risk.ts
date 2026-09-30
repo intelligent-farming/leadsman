@@ -26,6 +26,27 @@
  *     "params": { "humidityMin": 90, "temperatureMin": 15, "temperatureMax": 25,
  *                 "dwellHours": 4, "deviceNamePattern": "%vineyard%" } }
  *
+ * ## Infection curves
+ *
+ * Published infection data are a curve, not a band: brown rot needs ~10 h of wetness at
+ * 5 °C but ~3 h at 18 °C. `curve` takes that curve as a list of bands,
+ *
+ *   "curve": [ { "temperatureMin": 5,  "temperatureMax": 8,  "dwellHours": 10.5 },
+ *              { "temperatureMin": 8,  "temperatureMax": 12, "dwellHours": 6 }, … ]
+ *
+ * each holding the longest requirement inside it, and replaces temperatureMin/Max and
+ * dwellHours. The run is then measured by rate summation (see `bestInfectionRun`): each
+ * wet hour adds 1 / (hours needed at that reading's temperature), and the alert raises
+ * when the sum reaches 1. A night that cools from 14 °C to 11 °C stays one run, with its
+ * requirement following the temperature, rather than splitting at a band edge — which
+ * one entry per band cannot avoid.
+ *
+ * `maxDryHours` lets a run survive a dry spell up to that long: the count pauses rather
+ * than resetting. Olive peacock spot infects through dry breaks of days (Viruega et al.
+ * 2011); most pathogens have no such data, so it defaults to 0 — any dry reading ends
+ * the run, as it always has. Both need the temperature gate. Either one moves the run
+ * logic from SQL to TypeScript over the window's raw readings.
+ *
  * Point `paths` at `leaf.wetness` instead where the block has wetness sensors: it is
  * the direct measurement of the thing the model is about, and relative humidity is
  * only a proxy for it. Give a wetness instance its own band — 85 % RH and 85 % on a
@@ -48,8 +69,9 @@
  * the Routing section of the README.
  */
 
-import { int, num, optNum, round } from '../params';
-import { bandDwell, pathsLabel, resolvePaths, type Band } from '../measurement';
+import { int, num, optNum, ParamError, round } from '../params';
+import { bandDwell, gatedSeries, pathsLabel, resolvePaths, type Band } from '../measurement';
+import { bestInfectionRun, type CurveBand } from '../models';
 import { resolveScope, SCOPE_PARAMS } from '../scope';
 import type { Finding, Rule } from '../types';
 
@@ -71,6 +93,36 @@ function optionalPaths(params: Record<string, unknown>, key: string): string[][]
   if (raw === null || raw === undefined) return null;
   if (Array.isArray(raw) && raw.length === 0) return null;
   return resolvePaths(params, key);
+}
+
+/** Parse and check `curve`: bands in ascending order, touching allowed, never overlapping. */
+function parseCurve(raw: unknown): CurveBand[] | null {
+  if (raw === null || raw === undefined) return null;
+  if (!Array.isArray(raw) || raw.length === 0) {
+    throw new ParamError('param "curve" must be a non-empty list of {temperatureMin, temperatureMax, dwellHours}, or null');
+  }
+  const bands = raw.map((b, i) => {
+    const at = `curve[${i}]`;
+    const o = (typeof b === 'object' && b !== null ? b : {}) as Record<string, unknown>;
+    const n = (k: string) => {
+      const v = o[k];
+      if (typeof v !== 'number' || !Number.isFinite(v)) throw new ParamError(`${at}.${k} must be a number`);
+      return v;
+    };
+    const band = { min: n('temperatureMin'), max: n('temperatureMax'), dwellHours: n('dwellHours') };
+    if (band.min >= band.max) throw new ParamError(`${at}.temperatureMin must be below temperatureMax`);
+    if (!(band.dwellHours > 0)) throw new ParamError(`${at}.dwellHours must be positive`);
+    return band;
+  });
+  for (let i = 1; i < bands.length; i++) {
+    if (bands[i].min < bands[i - 1].max) {
+      throw new ParamError(
+        `curve[${i}] starts at ${bands[i].min} °C, inside curve[${i - 1}] (to ${bands[i - 1].max} °C) — ` +
+          'list bands in ascending order without overlap; bands may touch',
+      );
+    }
+  }
+  return bands;
 }
 
 const rule: Rule = {
@@ -129,6 +181,21 @@ const rule: Rule = {
      * re-raise — and re-invoke the agent — every sounding.
      */
     clearDwellHours: 2,
+    /**
+     * An infection curve — [{temperatureMin, temperatureMax, dwellHours}, …] in ascending
+     * order — replacing temperatureMin/Max and dwellHours. null: a single band.
+     */
+    curve: null,
+    /**
+     * A dry spell up to this many hours pauses a run instead of ending it. 0: any dry
+     * reading ends the run. Only where the pathogen's data support it.
+     */
+    maxDryHours: 0,
+    /**
+     * Hysteresis for a curve: an open alert stays open until the run falls this fraction
+     * below the requirement. The curve's counterpart of clearDwellHours.
+     */
+    clearFraction: 0.25,
     /** Shown in the alert summary. The vocabulary unit for both humidity paths is %. */
     unit: '%',
     /** Narrow this check to part of the fleet — see src/scope.ts. */
@@ -155,6 +222,9 @@ const rule: Rule = {
     const minSamples = int(ctx.params, 'minSamples');
     const clearDwellHours = optNum(ctx.params, 'clearDwellHours') ?? 0;
     const unit = typeof ctx.params.unit === 'string' ? ctx.params.unit : '';
+    const curve = parseCurve(ctx.params.curve);
+    const maxDryHours = num(ctx.params, 'maxDryHours');
+    const clearFraction = num(ctx.params, 'clearFraction');
 
     if (band.min === null && band.max === null) {
       throw new Error(
@@ -197,6 +267,27 @@ const rule: Rule = {
       throw new Error(
         `clearDwellHours (${clearDwellHours}) must be less than dwellHours (${dwellHours})`,
       );
+    }
+
+    if (maxDryHours < 0) throw new Error('maxDryHours must not be negative');
+    if (curve || maxDryHours > 0) {
+      if (!gatePaths) {
+        throw new Error('curve and maxDryHours need the temperature gate — set temperaturePaths');
+      }
+      const effective: CurveBand[] = curve ?? [
+        { min: gateBand.min ?? -Infinity, max: gateBand.max ?? Infinity, dwellHours },
+      ];
+      const longest = Math.max(...effective.map((b) => b.dwellHours));
+      if (longest + maxDryHours >= lookbackHours) {
+        throw new Error(
+          `lookbackHours (${lookbackHours}) must exceed the longest requirement (${longest} h)` +
+            (maxDryHours > 0 ? ` plus maxDryHours (${maxDryHours})` : '') +
+            ' — otherwise the run could never fit in the window',
+        );
+      }
+      if (!(clearFraction >= 0 && clearFraction < 1)) throw new Error('clearFraction must be at least 0 and below 1');
+      return curveFindings(ctx, paths, band, gatePaths, effective, curve !== null, lookbackHours, maxGapHours,
+        maxDryHours, minSamples, clearFraction, unit);
     }
 
     const scope = resolveScope(ctx.params);
@@ -274,5 +365,76 @@ const rule: Rule = {
     return findings;
   },
 };
+
+async function curveFindings(
+  ctx: Parameters<Rule['run']>[0],
+  paths: string[][],
+  band: Band,
+  gatePaths: string[][],
+  curve: CurveBand[],
+  isCurve: boolean,
+  lookbackHours: number,
+  maxGapHours: number,
+  maxDryHours: number,
+  minSamples: number,
+  clearFraction: number,
+  unit: string,
+): Promise<Finding[]> {
+  const series = await gatedSeries(ctx, paths, gatePaths, lookbackHours, resolveScope(ctx.params));
+  if (series.length === 0) {
+    ctx.log.debug('no device reports any candidate path', { paths: pathsLabel(paths) });
+    return [];
+  }
+  const blind = series.filter((s) => s.readings.every((r) => r.gate === null)).map((s) => s.devEui);
+  if (blind.length > 0) {
+    ctx.log.warn(
+      'devices report humidity but no temperature on the same uplink — the gate ' +
+        'excludes them entirely and they can never raise this check',
+      { devices: blind.join(', '), temperaturePaths: pathsLabel(gatePaths) },
+    );
+  }
+
+  const humidityBand = bandLabel(band, unit);
+  const findings: Finding[] = [];
+  for (const s of series) {
+    const run = bestInfectionRun(
+      s.readings.map((r) => ({ time: r.time, value: r.value, temperature: r.gate })),
+      band, curve, maxGapHours, maxDryHours,
+    );
+    if (!run || run.samples < minSamples) continue;
+    const required = ctx.openDevEuis.has(s.devEui) ? 1 - clearFraction : 1;
+    if (run.progress + 1e-9 < required) continue;
+
+    const name = s.deviceName ?? s.devEui;
+    const last = s.readings[s.readings.length - 1].time;
+    const ongoing = run.endedAt.getTime() === last.getTime();
+    const bridged = run.bridgedDryHours > 0 ? `, bridging ${round(run.bridgedDryHours, 1)}h dry` : '';
+    findings.push({
+      devEui: s.devEui,
+      deviceName: s.deviceName,
+      summary:
+        `${name} ${s.matchedPath} held ${humidityBand} for ${round(run.wetHours, 1)}h at ` +
+        `${round(run.minTemperature, 1)}–${round(run.maxTemperature, 1)}C${bridged} — ` +
+        `${Math.round(run.progress * 100)}% of the infection requirement at those temperatures, ` +
+        `${ongoing ? 'ongoing' : 'ended'} mold infection window`,
+      detail: {
+        measurement: s.matchedPath,
+        dwellHours: round(run.wetHours, 2),
+        progress: round(run.progress, 3),
+        humidityBand,
+        curve: isCurve ? curve.map((b) => ({ temperatureMin: b.min, temperatureMax: b.max, dwellHours: b.dwellHours })) : null,
+        requiredHours: isCurve ? null : curve[0].dwellHours,
+        bridgedDryHours: round(run.bridgedDryHours, 2),
+        peak: run.maxValue,
+        temperatureRange: [round(run.minTemperature, 1), round(run.maxTemperature, 1)],
+        ongoing,
+        samples: run.samples,
+        startedAt: run.startedAt.toISOString(),
+        endedAt: run.endedAt.toISOString(),
+      },
+    });
+  }
+  return findings;
+}
 
 export default rule;

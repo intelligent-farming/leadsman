@@ -613,3 +613,94 @@ test('activeHoursStandardTime is validated and linted', async () => {
   const problems = await lintConfig(cfg, loadRules());
   assert.ok(problems.some((p) => /activeHoursStandardTime/.test(p.where)), JSON.stringify(problems));
 });
+
+// ── mold-risk infection curves ───────────────────────────────────────────────
+
+const BROWN_ROT = [
+  { min: 5, max: 8, dwellHours: 10.5 }, { min: 8, max: 12, dwellHours: 6 }, { min: 12, max: 16, dwellHours: 3.5 },
+  { min: 16, max: 22, dwellHours: 3 }, { min: 22, max: 25, dwellHours: 5 },
+];
+/** Hourly readings from 00:00 on May 10: [rh, temperature] per hour, null to skip an hour. */
+const readingsOf = (list) => list.flatMap((x, h) => (x === null ? [] : [{
+  time: new Date(Date.UTC(2026, 4, 10, h)), value: x[0], temperature: x[1],
+}]));
+const WET = { min: 90, max: null };
+
+test('curveRequirement: the band a temperature is in, the longer one on an edge, null off the curve', () => {
+  assert.equal(m.curveRequirement(BROWN_ROT, 18), 3);
+  assert.equal(m.curveRequirement(BROWN_ROT, 12), 6, 'on the 8–12 / 12–16 edge, the longer requirement');
+  assert.equal(m.curveRequirement(BROWN_ROT, 4), null);
+  assert.equal(m.curveRequirement(BROWN_ROT, 26), null);
+});
+
+test('bestInfectionRun: at a steady temperature it is exactly the band\'s hours', () => {
+  const r = m.bestInfectionRun(readingsOf([[95, 18], [95, 18], [95, 18], [95, 18]]), WET, BROWN_ROT, 2);
+  assert.equal(r.wetHours, 3);
+  assert.equal(r.progress, 1);
+});
+
+test('bestInfectionRun: a night drifting across a band edge stays one run', () => {
+  // Two hours at 14 °C (2/3.5), the hour into 11 °C still at 14's rate (1/3.5), then an
+  // hour at 11 °C (1/6): 1.024 — infection. One entry per band sees 2 h at 12–16 and 1 h
+  // at 8–12, and neither reaches its dwell.
+  const r = m.bestInfectionRun(readingsOf([[95, 14], [95, 14], [95, 14], [95, 11], [95, 11]]), WET, BROWN_ROT, 2);
+  assert.ok(Math.abs(r.progress - (3 / 3.5 + 1 / 6)) < 1e-9, `progress ${r.progress}`);
+  assert.equal(r.minTemperature, 11);
+  assert.equal(r.maxTemperature, 14);
+});
+
+test('bestInfectionRun: a dry spell ends the run, unless maxDryHours bridges it', () => {
+  const olive = [{ min: 10, max: 20, dwellHours: 12 }];
+  // 8 h wet, dry at hours 9–10, 8 h wet again: 16 wet hours with a 3 h dry break.
+  const list = [...Array(9).fill([95, 15]), [60, 15], [60, 15], ...Array(9).fill([95, 15])];
+  const strict = m.bestInfectionRun(readingsOf(list), WET, olive, 2, 0);
+  assert.equal(strict.wetHours, 8);
+  assert.ok(strict.progress < 1);
+  const bridged = m.bestInfectionRun(readingsOf(list), WET, olive, 2, 4);
+  assert.equal(bridged.wetHours, 16);
+  assert.equal(bridged.bridgedDryHours, 3);
+  assert.ok(bridged.progress >= 1);
+  // A longer break than allowed still ends it.
+  assert.equal(m.bestInfectionRun(readingsOf(list), WET, olive, 2, 2).wetHours, 8);
+});
+
+test('bestInfectionRun: a reporting gap ends the run, and off-curve readings are dry', () => {
+  const gap = m.bestInfectionRun(readingsOf([[95, 18], [95, 18], null, null, null, [95, 18], [95, 18]]), WET, BROWN_ROT, 2);
+  assert.equal(gap.wetHours, 1);
+  const cold = m.bestInfectionRun(readingsOf([[95, 3], [95, 3], [95, 3]]), WET, BROWN_ROT, 2);
+  assert.equal(cold, null);
+});
+
+test('mold-risk with a curve raises on a drifting night that per-band entries miss', async () => {
+  const rule = loadRules().get('mold-risk');
+  const now = new Date('2026-05-10T05:00:00Z');
+  const temps = [14, 14, 14, 11, 11];
+  const rows = temps.map((t, h) => ({
+    dev_eui: 'aa', device_name: 'almond-1', matched_path: 'air.relativeHumidity',
+    time: new Date(Date.UTC(2026, 4, 10, h)).toISOString(), value: '95', gate_value: String(t),
+  }));
+  const curve = BROWN_ROT.map((b) => ({ temperatureMin: b.min, temperatureMax: b.max, dwellHours: b.dwellHours }));
+  const params = { curve, lookbackHours: 24, minSamples: 4 };
+  const [f] = await rule.run(ctx(rule, params, now, { relativeHumidity: rows }));
+  assert.ok(f.detail.progress >= 1, JSON.stringify(f.detail));
+  assert.deepEqual(f.detail.temperatureRange, [11, 14]);
+  assert.match(f.summary, /102% of the infection requirement/);
+  // Open alert, hysteresis: 80 % of the requirement still holds it; a fresh alert needs 100 %.
+  const shortRows = rows.slice(0, 4);
+  assert.deepEqual(await rule.run(ctx(rule, params, now, { relativeHumidity: shortRows })), []);
+  const held = await rule.run(ctx(rule, params, now, { relativeHumidity: shortRows }, { openDevEuis: new Set(['aa']) }));
+  assert.equal(held.length, 1);
+});
+
+test('mold-risk validates its curve', async () => {
+  const rule = loadRules().get('mold-risk');
+  const run = (p) => rule.run(ctx(rule, p, NOW, {}));
+  await assert.rejects(() => run({ curve: [] }), /non-empty list/);
+  await assert.rejects(() => run({ curve: [{ temperatureMin: 10, temperatureMax: 5, dwellHours: 3 }] }), /below temperatureMax/);
+  await assert.rejects(() => run({ curve: [
+    { temperatureMin: 5, temperatureMax: 12, dwellHours: 6 }, { temperatureMin: 10, temperatureMax: 16, dwellHours: 3 },
+  ] }), /without overlap/);
+  await assert.rejects(() => run({ curve: [{ temperatureMin: 5, temperatureMax: 12, dwellHours: 30 }] }), /lookbackHours/);
+  await assert.rejects(() => run({ curve: [{ temperatureMin: 5, temperatureMax: 12, dwellHours: 6 }], temperaturePaths: null }), /temperature gate/);
+  await assert.rejects(() => run({ maxDryHours: 20 }), /plus maxDryHours/);
+});
